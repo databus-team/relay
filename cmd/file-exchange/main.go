@@ -30,13 +30,12 @@ var (
 	watchOnce = watchCmd.Flag("once", "Run watch loop only once instead of daemon mode").Bool()
 
 	// Push command
-	pushCmd = kingpin.Command("push", "Push file to remote project")
-	pushProject = pushCmd.Flag("project", "Target project ID").Short('p').Required().String()
+	pushCmd = kingpin.Command("push", "Push file to remote directory")
+	pushDest = pushCmd.Flag("dest", "Destination directory on remote").Short('d').Required().String()
 	pushSrc = pushCmd.Arg("source", "Source file to push").Required().String()
 
 	// Exec command
 	execCmd = kingpin.Command("exec", "Execute command locally")
-	execProject = execCmd.Flag("project", "Target project ID").Short('p').Required().String()
 	execCmdStr = execCmd.Arg("command", "Command to execute").Required().String()
 )
 
@@ -102,12 +101,6 @@ func runPush() {
 		os.Exit(1)
 	}
 
-	project, err := cfg.GetProjectByID(*pushProject)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Project error: %v\n", err)
-		os.Exit(1)
-	}
-
 	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
@@ -116,7 +109,7 @@ func runPush() {
 
 	ctx := context.Background()
 	src := *pushSrc
-	dest := project.WatchDir + "/" + filepath.Base(src)
+	dest := *pushDest + "/" + filepath.Base(src)
 
 	info, err := os.Stat(src)
 	if err != nil {
@@ -125,28 +118,15 @@ func runPush() {
 	}
 
 	if info.IsDir() {
-		pushDirToProject(ctx, b, src, project.WatchDir)
+		pushDir(ctx, b, src, *pushDest)
 	} else {
-		pushFileToProject(ctx, b, src, dest)
+		pushFile(ctx, b, src, dest)
 	}
 
 	fmt.Println("Push completed successfully")
 }
 
 func runExec() {
-	// Verify project exists (for validation feedback)
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
-		os.Exit(1)
-	}
-
-	_, err = cfg.GetProjectByID(*execProject)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Project error: %v\n", err)
-		os.Exit(1)
-	}
-
 	// Execute command locally in current working directory
 	cmd := exec.Command("sh", "-c", *execCmdStr)
 	cmd.Stdout = os.Stdout
@@ -162,7 +142,7 @@ func runExec() {
 	}
 }
 
-func pushFileToProject(ctx context.Context, b backend.FileTransferBackend, src, dest string) {
+func pushFile(ctx context.Context, b backend.FileTransferBackend, src, dest string) {
 	data, err := os.ReadFile(src)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to read source file: %v\n", err)
@@ -177,7 +157,7 @@ func pushFileToProject(ctx context.Context, b backend.FileTransferBackend, src, 
 	fmt.Printf("Pushed: %s -> %s\n", src, dest)
 }
 
-func pushDirToProject(ctx context.Context, b backend.FileTransferBackend, src, dest string) {
+func pushDir(ctx context.Context, b backend.FileTransferBackend, src, dest string) {
 	entries, err := os.ReadDir(src)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to read source directory: %v\n", err)
@@ -193,9 +173,9 @@ func pushDirToProject(ctx context.Context, b backend.FileTransferBackend, src, d
 		destPath := dest + entry.Name()
 
 		if entry.IsDir() {
-			pushDirToProject(ctx, b, srcPath, destPath)
+			pushDir(ctx, b, srcPath, destPath)
 		} else {
-			pushFileToProject(ctx, b, srcPath, destPath)
+			pushFile(ctx, b, srcPath, destPath)
 		}
 	}
 }

@@ -70,37 +70,32 @@ func (w *Watcher) RunOnce(ctx context.Context) error {
 func (w *Watcher) runOnce(ctx context.Context) error {
 	g := &errgroup.Group{}
 
-	for _, project := range w.cfg.Projects {
+	for _, watchCfg := range w.cfg.Watch {
 		g.Go(func() error {
-			return w.processProject(ctx, project)
+			return w.processWatch(ctx, watchCfg)
 		})
 	}
 
 	return g.Wait()
 }
 
-func (w *Watcher) processProject(ctx context.Context, project config.ProjectConfig) error {
-	watchDir := project.WatchDir
-	pattern := project.FileMatch
-
-	files, err := w.backend.ListDir(ctx, watchDir)
+func (w *Watcher) processWatch(ctx context.Context, watchCfg config.WatchConfig) error {
+	files, err := w.backend.ListDir(ctx, watchCfg.WatchDir)
 	if err != nil {
-		return fmt.Errorf("failed to list directory %s: %w", watchDir, err)
+		return fmt.Errorf("failed to list directory %s: %w", watchCfg.WatchDir, err)
 	}
-
-	log.Println("Found", len(files), "files in", watchDir)
 
 	for _, file := range files {
 		if file.IsDir {
 			continue
 		}
 
-		matched := matchPattern(file.Name, pattern)
-		if !matched {
+		// Check if file matches any of the paths patterns
+		if !w.matchAnyPattern(file.Name, watchCfg.Paths) {
 			continue
 		}
 
-		filePath := watchDir + "/" + file.Name
+		filePath := watchCfg.WatchDir + "/" + file.Name
 		if w.processed[filePath] {
 			continue
 		}
@@ -108,24 +103,22 @@ func (w *Watcher) processProject(ctx context.Context, project config.ProjectConf
 		w.processed[filePath] = true
 		w.jobResults = make(map[string]bool)
 
-		if err := w.executeJobs(ctx, project.Jobs, filePath, file.Name, watchDir); err != nil {
+		if err := w.executeJobs(ctx, watchCfg.Jobs, filePath, file.Name, watchCfg.WatchDir); err != nil {
 			log.Printf("Job failed for %s: %v (file left untouched)", filePath, err)
 			delete(w.processed, filePath)
-			continue
-		}
-
-		for _, job := range project.Jobs {
-			if job.Type == "file_delete" && !job.KeepFile {
-				if err := w.backend.Delete(ctx, filePath); err != nil {
-					log.Printf("Failed to delete file %s: %v", filePath, err)
-				} else {
-					log.Printf("Deleted file: %s", filePath)
-				}
-			}
 		}
 	}
 
 	return nil
+}
+
+func (w *Watcher) matchAnyPattern(filename string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if matchPattern(filename, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, filePath, fileName, watchDir string) error {
@@ -160,13 +153,13 @@ func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, file
 			log.Printf("Exec job %s completed successfully", job.ID)
 
 		case "file_delete":
-			path := substituteVariables(job.Path, vars)
-			if err := w.backend.Delete(ctx, path); err != nil {
+			delPath := substituteVariables(job.Path, vars)
+			if err := w.backend.Delete(ctx, delPath); err != nil {
 				w.jobResults[job.ID] = false
 				return fmt.Errorf("file_delete job %s failed: %w", job.ID, err)
 			}
 			w.jobResults[job.ID] = true
-			log.Printf("File delete job %s completed: %s", job.ID, path)
+			log.Printf("File delete job %s completed: %s", job.ID, delPath)
 
 		default:
 			return fmt.Errorf("unknown job type: %s", job.Type)
@@ -188,8 +181,9 @@ func (w *Watcher) runLocalCommand(cmd, cwd string) error {
 }
 
 func (w *Watcher) evaluateCondition(cond string) (bool, error) {
+	// Format: jobs.<job_id>.<state> where state is "success" or "failure"
 	parts := strings.Split(cond, ".")
-	if len(parts) != 2 {
+	if len(parts) < 3 {
 		return false, fmt.Errorf("invalid condition format: %s", cond)
 	}
 
@@ -197,13 +191,22 @@ func (w *Watcher) evaluateCondition(cond string) (bool, error) {
 		return false, fmt.Errorf("invalid condition prefix: %s", parts[0])
 	}
 
-	jobID := parts[1]
+	jobID := strings.Join(parts[1:len(parts)-1], ".")
+	state := parts[len(parts)-1]
+
 	result, ok := w.jobResults[jobID]
 	if !ok {
 		return false, fmt.Errorf("job not found: %s", jobID)
 	}
 
-	return result, nil
+	if state == "success" {
+		return result, nil
+	}
+	if state == "failure" {
+		return !result, nil
+	}
+
+	return false, fmt.Errorf("invalid state: %s (expected success or failure)", state)
 }
 
 func (w *Watcher) buildVariables(filePath, fileName, watchDir string) map[string]string {
@@ -217,10 +220,6 @@ func (w *Watcher) buildVariables(filePath, fileName, watchDir string) map[string
 }
 
 func matchPattern(filename, pattern string) bool {
-	if pattern == "" {
-		return true
-	}
-
 	matched, _ := path.Match(pattern, filename)
 	return matched
 }

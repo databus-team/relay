@@ -10,20 +10,18 @@ import (
 )
 
 type Config struct {
-	Name     string           `yaml:"name"`
-	Version  int              `yaml:"version"`
-	Backend  BackendConfig    `yaml:"backend"`
-	Auth     *AuthConfig      `yaml:"auth,omitempty"`
-	Projects []ProjectConfig  `yaml:"projects"`
-	Interval int              `yaml:"interval_seconds"`
+	Name     string        `yaml:"name"`
+	Version  int           `yaml:"version"`
+	Backend  BackendConfig `yaml:"backend"`
+	Auth     *AuthConfig   `yaml:"auth,omitempty"`
+	Watch    []WatchConfig `yaml:"watch"`
+	Interval int           `yaml:"interval_seconds"`
 }
 
-type ProjectConfig struct {
-	ID       string        `yaml:"id"`
-	Name     string        `yaml:"name"`
-	WatchDir string       `yaml:"watch_dir"`
-	FileMatch string      `yaml:"file_match"`
-	Jobs     []JobConfig  `yaml:"jobs"`
+type WatchConfig struct {
+	WatchDir string     `yaml:"watch_dir"`
+	Paths    []string   `yaml:"paths"`
+	Jobs     []JobConfig `yaml:"jobs"`
 }
 
 type BackendConfig struct {
@@ -65,7 +63,6 @@ func Load(path string) (*Config, error) {
 	}
 
 	// Only expand $VAR and ${VAR} patterns, not {var} patterns
-	// to avoid conflict with our built-in variables
 	data = []byte(os.ExpandEnv(string(data)))
 
 	var cfg Config
@@ -82,17 +79,4 @@ func Load(path string) (*Config, error) {
 
 func (c *Config) GetBackendType() string {
 	return c.Backend.Type
-}
-
-func (c *Config) GetProjectByID(projectID string) (*ProjectConfig, error) {
-	for i := range c.Projects {
-		if c.Projects[i].ID == projectID {
-			return &c.Projects[i], nil
-		}
-	}
-	return nil, fmt.Errorf("project not found: %s", projectID)
-}
-
-func (c *Config) ListProjects() []ProjectConfig {
-	return c.Projects
 }

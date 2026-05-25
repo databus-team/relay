@@ -1,19 +1,16 @@
 name: file-exchange
 version: 1
 
-# Backend configuration (used for all projects)
 backend:
   type: local
   config:
     base_dir: /path/to/remote/storage
 
-# Project configurations
-# Each project has its own watch directory and action jobs
-projects:
-  - id: web-app
-    name: Web Application
-    watch_dir: projects/web-app/patches
-    file_match: "*.patch"
+# Watch configurations
+# Each watch monitors a directory for files matching paths, then executes jobs
+watch:
+  - watch_dir: projects/web-app/patches
+    paths: ["*.patch"]
     jobs:
       - id: apply
         type: exec
@@ -23,10 +20,15 @@ projects:
         path: "{file_remote_path}"
         if: jobs.apply.success
 
-  - id: api-service
-    name: API Service
-    watch_dir: projects/api-service/patches
-    file_match: "*.patch"
+  - watch_dir: projects/web-app/deploy
+    paths: ["deploy-*.yaml"]
+    jobs:
+      - id: deploy
+        type: exec
+        cmd: ./deploy.sh {file_name}
+
+  - watch_dir: projects/api-service/patches
+    paths: ["*.patch"]
     jobs:
       - id: apply
         type: exec
