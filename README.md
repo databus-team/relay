@@ -81,6 +81,8 @@ interval_seconds: 60
 
 ### Watch Mode (Daemon)
 
+Watch mode is a persistent process that polls remote directories and executes actions.
+
 ```bash
 file-exchange watch --config ~/.file-exchange/config.yaml
 ```
@@ -91,11 +93,26 @@ file-exchange watch --config ~/.file-exchange/config.yaml
 file-exchange watch --config ~/.file-exchange/config.yaml --once
 ```
 
-### Push Mode (Coming Soon)
+### Push Mode (One-shot CLI)
+
+Push mode is a one-shot CLI command that uploads files to the remote server and exits.
 
 ```bash
-file-exchange push --config ~/.file-exchange/config.yaml
+# Push a single file
+file-exchange push <source> <dest>
+
+# Push a directory (recursive)
+file-exchange push /local/path/ /remote/path/
 ```
+
+Examples:
+
+```bash
+# Push a patch file
+file-exchange push ./my.patch patches/my.patch
+
+# Push entire directory
+file-exchange push ./build/ release/v1.0/
 
 ## Backends
 

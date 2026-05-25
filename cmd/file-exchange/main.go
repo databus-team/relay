@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/alecthomas/kingpin/v2"
@@ -27,6 +29,9 @@ var (
 	watchOnce = watchCmd.Flag("once", "Run watch loop only once instead of daemon mode").Bool()
 
 	pushCmd = kingpin.Command("push", "Push files to remote server")
+
+	pushSrc = pushCmd.Arg("source", "Source file or directory to push").Required().String()
+	pushDest = pushCmd.Arg("dest", "Destination path on remote server").Required().String()
 )
 
 func main() {
@@ -36,8 +41,7 @@ func main() {
 	case watchCmd.FullCommand():
 		runWatch()
 	case pushCmd.FullCommand():
-		fmt.Println("push command not yet implemented")
-		os.Exit(1)
+		runPush()
 	case "help":
 		app.Usage(os.Args)
 	default:
@@ -106,4 +110,76 @@ func validateConfig(cfg *config.Config) error {
 	}
 
 	return nil
+}
+
+func runPush() {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
+	src := *pushSrc
+	dest := *pushDest
+
+	// Check if source is a directory
+	info, err := os.Stat(src)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to stat source: %v\n", err)
+		os.Exit(1)
+	}
+
+	if info.IsDir() {
+		pushDir(ctx, b, src, dest)
+	} else {
+		pushFile(ctx, b, src, dest)
+	}
+
+	fmt.Println("Push completed successfully")
+}
+
+func pushFile(ctx context.Context, b backend.FileTransferBackend, src, dest string) {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read source file: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := b.Write(ctx, dest, data); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to write to remote: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Pushed file: %s -> %s\n", src, dest)
+}
+
+func pushDir(ctx context.Context, b backend.FileTransferBackend, src, dest string) {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read source directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Ensure dest ends with /
+	if dest != "" && !strings.HasSuffix(dest, "/") {
+		dest += "/"
+	}
+
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		destPath := dest + entry.Name()
+
+		if entry.IsDir() {
+			pushDir(ctx, b, srcPath, destPath)
+		} else {
+			pushFile(ctx, b, srcPath, destPath)
+		}
+	}
 }
