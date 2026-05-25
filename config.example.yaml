@@ -1,36 +1,32 @@
 name: file-exchange
 version: 1
 
-# Default backend
+# Backend configuration (used for all projects)
 backend:
   type: local
   config:
-    base_dir: /tmp/file-exchange
+    base_dir: /path/to/remote/storage
 
-# Device configurations
-devices:
-  - id: dev-server-01
-    name: Development Server 1
-    backend:
-      type: local
-      config:
-        base_dir: /tmp/file-exchange
-    projects:
-      - id: web-app
-        name: Web Application
-        watch_dir: projects/web-app/patches
+# Project configurations
+# Each project has its own watch directory and action jobs
+projects:
+  - id: web-app
+    name: Web Application
+    watch_dir: projects/web-app/patches
+    file_match: "*.patch"
+    jobs:
+      - id: apply
+        type: exec
+        cmd: git am --3way {file_path}
+      - id: cleanup
+        type: file_delete
+        path: "{file_remote_path}"
+        if: jobs.apply.success
 
-      - id: api-service
-        name: API Service
-        watch_dir: projects/api-service/patches
-
-# Watcher configurations (by project)
-watchers:
-  - name: Apply Web App Patch
-    device: dev-server-01
-    project: web-app
-    on:
-      file_match: "*.patch"
+  - id: api-service
+    name: API Service
+    watch_dir: projects/api-service/patches
+    file_match: "*.patch"
     jobs:
       - id: apply
         type: exec
