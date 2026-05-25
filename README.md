@@ -2,11 +2,11 @@
 
 Generic File Exchange Command Execution System
 
-A Go-based tool for managing multiple remote devices and projects. Push files to remote watch directories, execute local commands, and watch remote directories for automated processing.
+A Go-based tool for managing multiple projects on a remote device. Push files to remote watch directories, execute local commands, and watch remote directories for automated processing.
 
 ## Features
 
-- **Project-based**: One device, multiple projects with isolated watch directories
+- **Project-based**: Multiple projects with isolated watch directories on one device
 - **Push Mode**: Upload files to remote project's watch directory
 - **Exec Mode**: Execute commands locally (in current working directory)
 - **Watch Mode**: Daemon to monitor remote directories and trigger actions
@@ -30,27 +30,24 @@ backend:
   config:
     base_dir: /path/to/remote/storage
 
-devices:
-  - id: dev-server-01
-    name: Development Server
-    backend:
-      type: local
-      config:
-        base_dir: /path/to/remote/storage
-    projects:
-      - id: web-app
-        name: Web Application
-        watch_dir: projects/web-app/patches
-      - id: api-service
-        name: API Service
-        watch_dir: projects/api-service/patches
+projects:
+  - id: web-app
+    name: Web Application
+    watch_dir: projects/web-app/patches
+    file_match: "*.patch"
+    jobs:
+      - id: apply
+        type: exec
+        cmd: git am --3way {file_path}
+      - id: cleanup
+        type: file_delete
+        path: "{file_remote_path}"
+        if: jobs.apply.success
 
-watchers:
-  - name: Apply Patch
-    device: dev-server-01
-    project: web-app
-    on:
-      file_match: "*.patch"
+  - id: api-service
+    name: API Service
+    watch_dir: projects/api-service/patches
+    file_match: "*.patch"
     jobs:
       - id: apply
         type: exec
@@ -90,6 +87,8 @@ file-exchange exec -p api-service "make test"
 
 ### Watch - Daemon Mode
 
+Watch all projects defined in config:
+
 ```bash
 # Start watcher daemon
 file-exchange watch
@@ -98,15 +97,19 @@ file-exchange watch
 file-exchange watch --once
 ```
 
-## Project ID Lookup
+## Project Configuration
 
-Project IDs are globally unique across all devices. The system finds the project by ID automatically:
+Each project includes:
 
-```bash
-file-exchange push -p web-app ./patch.patch
-```
+| Field | Description |
+|-------|-------------|
+| `id` | Unique project identifier |
+| `name` | Display name |
+| `watch_dir` | Remote directory to monitor |
+| `file_match` | Glob pattern for files to watch |
+| `jobs` | Actions to execute when file detected |
 
-## Watcher Actions
+## Job Types
 
 ### exec
 

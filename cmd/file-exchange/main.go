@@ -108,13 +108,7 @@ func runPush() {
 		os.Exit(1)
 	}
 
-	device, err := cfg.GetDevice(project.DeviceID)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Device error: %v\n", err)
-		os.Exit(1)
-	}
-
-	b, err := backend.NewBackend(device.Backend.Type, device.Backend.Config)
+	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
 		os.Exit(1)

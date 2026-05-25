@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
@@ -11,15 +12,13 @@ import (
 
 	"github.com/user/file-exchange/internal/backend"
 	"github.com/user/file-exchange/internal/config"
-	"github.com/user/file-exchange/internal/exchange"
 	"golang.org/x/sync/errgroup"
 )
 
 type Watcher struct {
-	cfg        *config.Config
-	backend    backend.FileTransferBackend
-	exchanger  *exchange.FileExchange
-	processed  map[string]bool
+	cfg       *config.Config
+	backend   backend.FileTransferBackend
+	processed map[string]bool
 	jobResults map[string]bool
 }
 
@@ -34,14 +33,10 @@ func New(cfg *config.Config) (*Watcher, error) {
 		return nil, fmt.Errorf("failed to create backend: %w", err)
 	}
 
-	commandDir := cfg.GetCommandDir()
-	ex := exchange.NewFileExchange(b, commandDir)
-
 	return &Watcher{
-		cfg:        cfg,
-		backend:    b,
-		exchanger:  ex,
-		processed:  make(map[string]bool),
+		cfg:       cfg,
+		backend:   b,
+		processed: make(map[string]bool),
 		jobResults: make(map[string]bool),
 	}, nil
 }
@@ -75,33 +70,25 @@ func (w *Watcher) RunOnce(ctx context.Context) error {
 func (w *Watcher) runOnce(ctx context.Context) error {
 	g := &errgroup.Group{}
 
-	for i, watcherCfg := range w.cfg.Watchers {
-		watchDir := watcherCfg.On.WatchDir
-		if watchDir == "" {
-			watchDir = w.cfg.GetWatchDir(i)
-		}
-
+	for _, project := range w.cfg.Projects {
 		g.Go(func() error {
-			return w.processWatcher(ctx, watcherCfg, watchDir)
+			return w.processProject(ctx, project)
 		})
 	}
 
 	return g.Wait()
 }
 
-func (w *Watcher) processWatcher(ctx context.Context, watcherCfg config.WatcherConfig, watchDir string) error {
+func (w *Watcher) processProject(ctx context.Context, project config.ProjectConfig) error {
+	watchDir := project.WatchDir
+	pattern := project.FileMatch
+
 	files, err := w.backend.ListDir(ctx, watchDir)
 	if err != nil {
 		return fmt.Errorf("failed to list directory %s: %w", watchDir, err)
 	}
 
 	log.Println("Found", len(files), "files in", watchDir)
-	for _, f := range files {
-		log.Println(" - ", f.Name, "isDir:", f.IsDir)
-	}
-
-	pattern := watcherCfg.On.FileMatch
-	log.Println("Pattern:", pattern)
 
 	for _, file := range files {
 		if file.IsDir {
@@ -109,7 +96,6 @@ func (w *Watcher) processWatcher(ctx context.Context, watcherCfg config.WatcherC
 		}
 
 		matched := matchPattern(file.Name, pattern)
-		log.Println("Checking", file.Name, "against pattern", pattern, "-> matched:", matched)
 		if !matched {
 			continue
 		}
@@ -122,13 +108,13 @@ func (w *Watcher) processWatcher(ctx context.Context, watcherCfg config.WatcherC
 		w.processed[filePath] = true
 		w.jobResults = make(map[string]bool)
 
-		if err := w.executeJobs(ctx, watcherCfg.Jobs, filePath, file.Name, watchDir); err != nil {
+		if err := w.executeJobs(ctx, project.Jobs, filePath, file.Name, watchDir); err != nil {
 			log.Printf("Job failed for %s: %v (file left untouched)", filePath, err)
 			delete(w.processed, filePath)
 			continue
 		}
 
-		for _, job := range watcherCfg.Jobs {
+		for _, job := range project.Jobs {
 			if job.Type == "file_delete" && !job.KeepFile {
 				if err := w.backend.Delete(ctx, filePath); err != nil {
 					log.Printf("Failed to delete file %s: %v", filePath, err)
@@ -159,21 +145,15 @@ func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, file
 
 		switch job.Type {
 		case "exec":
-			if !w.backend.SupportsExec() {
-				return fmt.Errorf("exec action not supported by backend")
-			}
 			cmd := substituteVariables(job.Cmd, vars)
-			cwd := substituteVariables(job.Cwd, vars)
+			cwd := job.Cwd
+			if cwd != "" {
+				cwd = substituteVariables(cwd, vars)
+			}
 
-			result, err := w.exchanger.ExecuteCommand(ctx, cmd, cwd, 300)
-			if err != nil {
+			if err := w.runLocalCommand(cmd, cwd); err != nil {
 				w.jobResults[job.ID] = false
 				return fmt.Errorf("exec job %s failed: %w", job.ID, err)
-			}
-
-			if result.ExitCode != 0 {
-				w.jobResults[job.ID] = false
-				return fmt.Errorf("exec job %s failed with exit code %d: %s", job.ID, result.ExitCode, result.Stderr)
 			}
 
 			w.jobResults[job.ID] = true
@@ -194,6 +174,17 @@ func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, file
 	}
 
 	return nil
+}
+
+func (w *Watcher) runLocalCommand(cmd, cwd string) error {
+	execCmd := exec.Command("sh", "-c", cmd)
+	if cwd != "" {
+		execCmd.Dir = cwd
+	}
+	execCmd.Stdout = log.Writer()
+	execCmd.Stderr = log.Writer()
+
+	return execCmd.Run()
 }
 
 func (w *Watcher) evaluateCondition(cond string) (bool, error) {
@@ -217,11 +208,11 @@ func (w *Watcher) evaluateCondition(cond string) (bool, error) {
 
 func (w *Watcher) buildVariables(filePath, fileName, watchDir string) map[string]string {
 	return map[string]string{
-		"file_path":      filePath,
-		"file_name":      fileName,
-		"file_dir":       filepath.Dir(filePath),
+		"file_path":        filePath,
+		"file_name":        fileName,
+		"file_dir":         filepath.Dir(filePath),
 		"file_remote_path": filePath,
-		"timestamp":      time.Now().Format(time.RFC3339),
+		"timestamp":        time.Now().Format(time.RFC3339),
 	}
 }
 
