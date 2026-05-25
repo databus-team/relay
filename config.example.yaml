@@ -6,7 +6,6 @@ backend:
   type: local
   config:
     base_dir: /tmp/file-exchange
-    command_dir: commands
 
 # Device configurations
 devices:
@@ -16,19 +15,14 @@ devices:
       type: local
       config:
         base_dir: /tmp/file-exchange
-        command_dir: commands
     projects:
       - id: web-app
         name: Web Application
         watch_dir: projects/web-app/patches
-        command_dir: projects/web-app/commands
-        remote_dir: /repo/web-app
 
       - id: api-service
         name: API Service
         watch_dir: projects/api-service/patches
-        command_dir: projects/api-service/commands
-        remote_dir: /repo/api-service
 
 # Watcher configurations (by project)
 watchers:
@@ -41,22 +35,6 @@ watchers:
       - id: apply
         type: exec
         cmd: git am --3way {file_path}
-        cwd: /repo/web-app
-      - id: cleanup
-        type: file_delete
-        path: "{file_remote_path}"
-        if: jobs.apply.success
-
-  - name: Apply API Patch
-    device: dev-server-01
-    project: api-service
-    on:
-      file_match: "*.patch"
-    jobs:
-      - id: apply
-        type: exec
-        cmd: git am --3way {file_path}
-        cwd: /repo/api-service
       - id: cleanup
         type: file_delete
         path: "{file_remote_path}"

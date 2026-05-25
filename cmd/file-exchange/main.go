@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -12,7 +13,6 @@ import (
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/user/file-exchange/internal/backend"
 	"github.com/user/file-exchange/internal/config"
-	"github.com/user/file-exchange/internal/exchange"
 	"github.com/user/file-exchange/internal/watcher"
 )
 
@@ -35,10 +35,9 @@ var (
 	pushSrc = pushCmd.Arg("source", "Source file to push").Required().String()
 
 	// Exec command
-	execCmd = kingpin.Command("exec", "Execute command on remote project")
+	execCmd = kingpin.Command("exec", "Execute command locally")
 	execProject = execCmd.Flag("project", "Target project ID").Short('p').Required().String()
 	execCmdStr = execCmd.Arg("command", "Command to execute").Required().String()
-	execCwd = execCmd.Flag("cwd", "Working directory").String()
 )
 
 func main() {
@@ -141,62 +140,31 @@ func runPush() {
 }
 
 func runExec() {
+	// Verify project exists (for validation feedback)
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 
-	project, err := cfg.GetProjectByID(*execProject)
+	_, err = cfg.GetProjectByID(*execProject)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Project error: %v\n", err)
 		os.Exit(1)
 	}
 
-	device, err := cfg.GetDevice(project.DeviceID)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Device error: %v\n", err)
-		os.Exit(1)
-	}
+	// Execute command locally in current working directory
+	cmd := exec.Command("sh", "-c", *execCmdStr)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
 
-	b, err := backend.NewBackend(device.Backend.Type, device.Backend.Config)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
-		os.Exit(1)
-	}
-
-	if !b.SupportsExec() {
-		fmt.Fprintf(os.Stderr, "Project %q does not support exec action\n", *execProject)
-		os.Exit(1)
-	}
-
-	ctx := context.Background()
-	cmd := *execCmdStr
-	cwd := *execCwd
-	if cwd == "" {
-		cwd = project.RemoteDir
-	}
-
-	commandDir := project.CommandDir
-	if commandDir == "" {
-		commandDir = b.GetCommandDir()
-	}
-
-	ex := exchange.NewFileExchange(b, commandDir)
-	result, err := ex.ExecuteCommand(ctx, cmd, cwd, 300)
-	if err != nil {
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			os.Exit(exitErr.ExitCode())
+		}
 		fmt.Fprintf(os.Stderr, "Exec failed: %v\n", err)
 		os.Exit(1)
-	}
-
-	if result.ExitCode != 0 {
-		fmt.Fprintf(os.Stderr, "Command exited with code %d:\n%s\n", result.ExitCode, result.Stderr)
-		os.Exit(1)
-	}
-
-	fmt.Print(result.Stdout)
-	if result.Stderr != "" {
-		fmt.Fprintf(os.Stderr, "\nStderr:\n%s\n", result.Stderr)
 	}
 }
 

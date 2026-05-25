@@ -30,8 +30,6 @@ type ProjectConfig struct {
 	ID          string `yaml:"id"`
 	Name        string `yaml:"name"`
 	WatchDir    string `yaml:"watch_dir"`
-	CommandDir  string `yaml:"command_dir"`
-	RemoteDir   string `yaml:"remote_dir"`
 	DeviceID    string `yaml:"-"` // populated at runtime from parent device
 }
 
