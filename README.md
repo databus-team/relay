@@ -2,16 +2,17 @@
 
 Generic File Exchange Command Execution System
 
-A Go-based bidirectional file exchange system where a single node can push files to or pull files from a remote server, with configurable trigger actions (shell scripts) executed on the receiving end.
+A Go-based bidirectional file exchange system with device management. Push files or execute commands on remote devices through a simple CLI, while a watcher daemon can process files automatically.
 
 ## Features
 
-- **Backend Abstraction**: Support for multiple backends (local filesystem, fs-mcp, JumpServer)
-- **Watcher Mode**: Poll remote directories for files matching glob patterns
-- **Action Types**: Execute shell commands or delete files
-- **Variable Substitution**: Use built-in variables like `{file_path}`, `{file_name}`, `{file_dir}`, `{timestamp}`
+- **Device Management**: Configure multiple remote devices with path mappings
+- **Push Mode**: One-shot CLI to upload files to remote devices
+- **Exec Mode**: Execute commands on remote devices via file exchange protocol
+- **Watch Mode**: Daemon process to monitor and process files automatically
+- **Backend Abstraction**: Support for local, fs-mcp, and JumpServer backends
+- **Variable Substitution**: Use built-in variables like `{file_path}`, `{file_name}`
 - **Conditional Execution**: Control job execution with `if` conditions
-- **File Exchange Protocol**: JSON-based command exchange via `cmd-{uuid}.json` / `result-{uuid}.json`
 
 ## Installation
 
@@ -31,14 +32,10 @@ go install ./cmd/file-exchange
 
 ## Configuration
 
-1. Copy the example configuration:
-
 ```bash
 mkdir -p ~/.file-exchange
 cp config.example.yaml ~/.file-exchange/config.yaml
 ```
-
-2. Edit `~/.file-exchange/config.yaml` with your settings.
 
 ### Configuration Reference
 
@@ -46,73 +43,80 @@ cp config.example.yaml ~/.file-exchange/config.yaml
 name: file-exchange
 version: 1
 
+# Default backend (used if device not specified)
 backend:
-  type: local  # local, fs-mcp, or jumpserver
+  type: local
   config:
     base_dir: /tmp/file-exchange
     command_dir: commands
 
-auth:
-  method: proxy  # required for fs-mcp/jumpserver
-  login_url: https://example.com/login
-  token_cookie_name: session_token
-  proxy_port: 8080
-  token_cache_file: ~/.file-exchange/token.json
+# Device configurations
+devices:
+  - id: dev-server-01
+    name: Development Server 1
+    backend:
+      type: local
+      config:
+        base_dir: /tmp/file-exchange
+        command_dir: commands
+    paths:
+      watch_dir: patches      # where watcher monitors files
+      remote_dir: /remote     # base remote directory
+      command_dir: commands   # where cmd-{uuid}.json files go
 
+# Watcher configurations (by device)
 watchers:
   - name: Apply Patch
+    device: dev-server-01     # which device to watch
     on:
       file_match: "*.patch"
-      watch_dir: patches
     jobs:
       - id: apply
         type: exec
         cmd: git am --3way {file_path}
-        cwd: /path/to/repo
+        cwd: /repo
       - id: cleanup
         type: file_delete
         path: "{file_remote_path}"
-        if: jobs.apply.success  # optional condition
+        if: jobs.apply.success
 
 interval_seconds: 60
 ```
 
 ## Usage
 
-### Watch Mode (Daemon)
-
-Watch mode is a persistent process that polls remote directories and executes actions.
+### Push - Upload Files
 
 ```bash
-file-exchange watch --config ~/.file-exchange/config.yaml
+# Push a file to device's watch directory
+file-exchange push -d <device_id> <source_file>
+
+# Examples:
+file-exchange push -d dev-server-01 ./my.patch
+file-exchange push -d prod-server-01 ./build.tar.gz
 ```
 
-### Watch Mode (Single Iteration)
+### Exec - Run Remote Commands
 
 ```bash
-file-exchange watch --config ~/.file-exchange/config.yaml --once
+# Execute command on remote device
+file-exchange exec -d <device_id> "<command>"
+file-exchange exec -d <device_id> --cwd /path/to/dir "<command>"
+
+# Examples:
+file-exchange exec -d dev-server-01 "ls -la"
+file-exchange exec -d prod-server-01 --cwd /app "docker-compose up"
 ```
 
-### Push Mode (One-shot CLI)
-
-Push mode is a one-shot CLI command that uploads files to the remote server and exits.
+### Watch - Daemon Mode
 
 ```bash
-# Push a single file
-file-exchange push <source> <dest>
+# Start watcher daemon
+file-exchange watch
 
-# Push a directory (recursive)
-file-exchange push /local/path/ /remote/path/
+# Run single iteration
+file-exchange watch --once
 ```
-
-Examples:
-
-```bash
-# Push a patch file
-file-exchange push ./my.patch patches/my.patch
-
-# Push entire directory
-file-exchange push ./build/ release/v1.0/
 
 ## Backends
 
@@ -158,11 +162,18 @@ backend:
 
 **Note**: JumpServer backend does not support `exec` action type (file operations only).
 
-## Action Types
+## File Exchange Protocol
+
+For `exec` action and `exec` command, the system uses a file-based protocol:
+
+1. Write `cmd-{uuid}.json` to command directory
+2. Remote responder executes the command
+3. Responder writes `result-{uuid}.json` with output
+4. Original node reads result and deletes both files
+
+## Action Types (Watch Mode)
 
 ### exec
-
-Execute a shell command via the file exchange protocol.
 
 ```yaml
 - id: apply
@@ -172,8 +183,6 @@ Execute a shell command via the file exchange protocol.
 ```
 
 ### file_delete
-
-Delete a remote file.
 
 ```yaml
 - id: cleanup
@@ -188,12 +197,10 @@ Delete a remote file.
 | `{file_path}` | Full path to the watched file |
 | `{file_name}` | Filename without directory |
 | `{file_dir}` | Directory containing the file |
-| `{file_remote_path}` | Same as file_path (remote path) |
+| `{file_remote_path}` | Remote path |
 | `{timestamp}` | Current time in RFC3339 format |
 
 ## Conditional Execution
-
-Use `if` conditions to control job execution based on previous job results:
 
 ```yaml
 - id: cleanup
@@ -202,39 +209,12 @@ Use `if` conditions to control job execution based on previous job results:
   if: jobs.apply.success  # run only if 'apply' succeeded
 ```
 
-Supported conditions:
-- `jobs.<id>.success` - previous job completed successfully
-- `jobs.<id>.failure` - previous job failed
-
-## Shell Responder
-
-For air-gap machines, deploy the shell responder script:
-
-```bash
-# On the air-gap machine
-./command-responder.sh
-```
-
-The responder polls the `command_dir` for `cmd-*.json` files, executes the command, and writes `result-*.json` files.
-
 ## Development
 
-### Build
-
 ```bash
-make build
-```
-
-### Test
-
-```bash
-make test
-```
-
-### Format
-
-```bash
-make fmt
+make build      # Build binary
+make test       # Run tests
+make fmt        # Format code
 ```
 
 ## License

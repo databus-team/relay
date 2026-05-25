@@ -12,6 +12,7 @@ import (
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/user/file-exchange/internal/backend"
 	"github.com/user/file-exchange/internal/config"
+	"github.com/user/file-exchange/internal/exchange"
 	"github.com/user/file-exchange/internal/watcher"
 )
 
@@ -24,14 +25,20 @@ var (
 
 	configPath = kingpin.Flag("config", "Path to config file").Short('c').Default("~/.file-exchange/config.yaml").String()
 
+	// Watch command
 	watchCmd = kingpin.Command("watch", "Watch remote directory and execute actions")
-
 	watchOnce = watchCmd.Flag("once", "Run watch loop only once instead of daemon mode").Bool()
 
-	pushCmd = kingpin.Command("push", "Push files to remote server")
+	// Push command
+	pushCmd = kingpin.Command("push", "Push file to remote device")
+	pushDevice = pushCmd.Flag("device", "Target device ID").Short('d').Required().String()
+	pushSrc = pushCmd.Arg("source", "Source file to push").Required().String()
 
-	pushSrc = pushCmd.Arg("source", "Source file or directory to push").Required().String()
-	pushDest = pushCmd.Arg("dest", "Destination path on remote server").Required().String()
+	// Exec command
+	execCmd = kingpin.Command("exec", "Execute command on remote device")
+	execDevice = execCmd.Flag("device", "Target device ID").Short('d').Required().String()
+	execCmdStr = execCmd.Arg("command", "Command to execute").Required().String()
+	execCwd = execCmd.Flag("cwd", "Working directory").String()
 )
 
 func main() {
@@ -42,6 +49,8 @@ func main() {
 		runWatch()
 	case pushCmd.FullCommand():
 		runPush()
+	case execCmd.FullCommand():
+		runExec()
 	case "help":
 		app.Usage(os.Args)
 	default:
@@ -53,12 +62,6 @@ func runWatch() {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Validate backend and job compatibility
-	if err := validateConfig(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "Config validation failed: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -93,25 +96,6 @@ func runWatch() {
 	}
 }
 
-func validateConfig(cfg *config.Config) error {
-	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
-	if err != nil {
-		return fmt.Errorf("failed to create backend: %w", err)
-	}
-
-	supportsExec := b.SupportsExec()
-
-	for _, wc := range cfg.Watchers {
-		for _, job := range wc.Jobs {
-			if job.Type == "exec" && !supportsExec {
-				return fmt.Errorf("backend type %q does not support exec action; use fs-mcp or local backend", cfg.Backend.Type)
-			}
-		}
-	}
-
-	return nil
-}
-
 func runPush() {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -119,7 +103,13 @@ func runPush() {
 		os.Exit(1)
 	}
 
-	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	device, err := cfg.GetDevice(*pushDevice)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Device error: %v\n", err)
+		os.Exit(1)
+	}
+
+	b, err := backend.NewBackend(device.Backend.Type, device.Backend.Config)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
 		os.Exit(1)
@@ -127,9 +117,8 @@ func runPush() {
 
 	ctx := context.Background()
 	src := *pushSrc
-	dest := *pushDest
+	dest := device.Paths.WatchDir + "/" + filepath.Base(src)
 
-	// Check if source is a directory
 	info, err := os.Stat(src)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to stat source: %v\n", err)
@@ -137,15 +126,15 @@ func runPush() {
 	}
 
 	if info.IsDir() {
-		pushDir(ctx, b, src, dest)
+		pushDirToDevice(ctx, b, src, device.Paths.WatchDir)
 	} else {
-		pushFile(ctx, b, src, dest)
+		pushFileToDevice(ctx, b, src, dest)
 	}
 
 	fmt.Println("Push completed successfully")
 }
 
-func pushFile(ctx context.Context, b backend.FileTransferBackend, src, dest string) {
+func pushFileToDevice(ctx context.Context, b backend.FileTransferBackend, src, dest string) {
 	data, err := os.ReadFile(src)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to read source file: %v\n", err)
@@ -157,17 +146,16 @@ func pushFile(ctx context.Context, b backend.FileTransferBackend, src, dest stri
 		os.Exit(1)
 	}
 
-	fmt.Printf("Pushed file: %s -> %s\n", src, dest)
+	fmt.Printf("Pushed: %s -> %s\n", src, dest)
 }
 
-func pushDir(ctx context.Context, b backend.FileTransferBackend, src, dest string) {
+func pushDirToDevice(ctx context.Context, b backend.FileTransferBackend, src, dest string) {
 	entries, err := os.ReadDir(src)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to read source directory: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Ensure dest ends with /
 	if dest != "" && !strings.HasSuffix(dest, "/") {
 		dest += "/"
 	}
@@ -177,9 +165,58 @@ func pushDir(ctx context.Context, b backend.FileTransferBackend, src, dest strin
 		destPath := dest + entry.Name()
 
 		if entry.IsDir() {
-			pushDir(ctx, b, srcPath, destPath)
+			pushDirToDevice(ctx, b, srcPath, destPath)
 		} else {
-			pushFile(ctx, b, srcPath, destPath)
+			pushFileToDevice(ctx, b, srcPath, destPath)
 		}
+	}
+}
+
+func runExec() {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	device, err := cfg.GetDevice(*execDevice)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Device error: %v\n", err)
+		os.Exit(1)
+	}
+
+	b, err := backend.NewBackend(device.Backend.Type, device.Backend.Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
+		os.Exit(1)
+	}
+
+	if !b.SupportsExec() {
+		fmt.Fprintf(os.Stderr, "Device %q does not support exec action\n", *execDevice)
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
+	cmd := *execCmdStr
+	cwd := *execCwd
+	if cwd == "" {
+		cwd = "/"
+	}
+
+	ex := exchange.NewFileExchange(b, b.GetCommandDir())
+	result, err := ex.ExecuteCommand(ctx, cmd, cwd, 300)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Exec failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	if result.ExitCode != 0 {
+		fmt.Fprintf(os.Stderr, "Command exited with code %d:\n%s\n", result.ExitCode, result.Stderr)
+		os.Exit(1)
+	}
+
+	fmt.Print(result.Stdout)
+	if result.Stderr != "" {
+		fmt.Fprintf(os.Stderr, "\nStderr:\n%s\n", result.Stderr)
 	}
 }
