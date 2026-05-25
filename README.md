@@ -2,14 +2,15 @@
 
 Generic File Exchange Command Execution System
 
-A Go-based tool for managing multiple projects on a remote device. Push files to remote watch directories, execute local commands, and watch remote directories for automated processing.
+A Go-based tool for monitoring remote directories and executing actions when files matching patterns are detected.
 
 ## Features
 
-- **Project-based**: Multiple projects with isolated watch directories on one device
-- **Push Mode**: Upload files to remote project's watch directory
-- **Exec Mode**: Execute commands locally (in current working directory)
-- **Watch Mode**: Daemon to monitor remote directories and trigger actions
+- **Watch Mode**: Monitor multiple remote directories, trigger actions on matching files
+- **Multiple Paths**: One watch supports multiple file patterns
+- **Multiple Jobs**: Each watch supports multiple jobs to execute
+- **Push Mode**: Upload files to remote directories
+- **Exec Mode**: Execute commands locally
 
 ## Installation
 
@@ -30,11 +31,10 @@ backend:
   config:
     base_dir: /path/to/remote/storage
 
-projects:
-  - id: web-app
-    name: Web Application
-    watch_dir: projects/web-app/patches
-    file_match: "*.patch"
+# Watch configurations
+watch:
+  - watch_dir: projects/app/patches
+    paths: ["*.patch"]
     jobs:
       - id: apply
         type: exec
@@ -44,50 +44,19 @@ projects:
         path: "{file_remote_path}"
         if: jobs.apply.success
 
-  - id: api-service
-    name: API Service
-    watch_dir: projects/api-service/patches
-    file_match: "*.patch"
+  - watch_dir: projects/app/deploy
+    paths: ["deploy-*.yaml", "deploy-*.yml"]
     jobs:
-      - id: apply
+      - id: deploy
         type: exec
-        cmd: git am --3way {file_path}
-      - id: cleanup
-        type: file_delete
-        path: "{file_remote_path}"
-        if: jobs.apply.success
+        cmd: ./deploy.sh {file_name}
 
 interval_seconds: 60
 ```
 
 ## Usage
 
-### Push - Upload Files
-
-```bash
-# Push file to project's watch directory
-file-exchange push -p <project_id> <source_file>
-
-# Examples:
-file-exchange push -p web-app ./my.patch
-file-exchange push -p api-service ./build.tar.gz
-```
-
-### Exec - Local Commands
-
-Commands execute locally in the current working directory.
-
-```bash
-file-exchange exec -p <project_id> "<command>"
-
-# Examples:
-file-exchange exec -p web-app "npm run build"
-file-exchange exec -p api-service "make test"
-```
-
 ### Watch - Daemon Mode
-
-Watch all projects defined in config:
 
 ```bash
 # Start watcher daemon
@@ -97,17 +66,25 @@ file-exchange watch
 file-exchange watch --once
 ```
 
-## Project Configuration
+### Push - Upload Files
 
-Each project includes:
+```bash
+file-exchange push -d projects/app/patches ./my.patch
+```
+
+### Exec - Local Commands
+
+```bash
+file-exchange exec "npm run build"
+```
+
+## Config Structure
 
 | Field | Description |
 |-------|-------------|
-| `id` | Unique project identifier |
-| `name` | Display name |
 | `watch_dir` | Remote directory to monitor |
-| `file_match` | Glob pattern for files to watch |
-| `jobs` | Actions to execute when file detected |
+| `paths` | Array of glob patterns to match files |
+| `jobs` | Actions to execute when file matches |
 
 ## Job Types
 
@@ -119,6 +96,7 @@ Execute a shell command when file is detected.
 - id: apply
   type: exec
   cmd: git am --3way {file_path}
+  cwd: /path/to/repo  # optional working directory
 ```
 
 ### file_delete
@@ -147,8 +125,12 @@ Delete the detected file.
 - id: cleanup
   type: file_delete
   path: "{file_remote_path}"
-  if: jobs.apply.success
+  if: jobs.apply.success  # only execute if 'apply' succeeded
 ```
+
+Supported conditions:
+- `jobs.<id>.success` - job completed successfully
+- `jobs.<id>.failure` - job failed
 
 ## Development
 
