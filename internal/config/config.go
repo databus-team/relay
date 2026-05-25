@@ -19,9 +19,10 @@ type Config struct {
 }
 
 type WatchConfig struct {
-	WatchDir string     `yaml:"watch_dir"`
-	Paths    []string   `yaml:"paths"`
-	Jobs     []JobConfig `yaml:"jobs"`
+	ID       string        `yaml:"id"`
+	WatchDir string        `yaml:"watch_dir"`
+	Paths    []string      `yaml:"paths"`
+	Jobs     []JobConfig   `yaml:"jobs"`
 }
 
 type BackendConfig struct {
@@ -79,4 +80,13 @@ func Load(path string) (*Config, error) {
 
 func (c *Config) GetBackendType() string {
 	return c.Backend.Type
+}
+
+func (c *Config) GetWatchByID(id string) (*WatchConfig, error) {
+	for i := range c.Watch {
+		if c.Watch[i].ID == id {
+			return &c.Watch[i], nil
+		}
+	}
+	return nil, fmt.Errorf("watch not found: %s", id)
 }

@@ -6,10 +6,9 @@ backend:
   config:
     base_dir: /path/to/remote/storage
 
-# Watch configurations
-# Each watch monitors a directory for files matching paths, then executes jobs
 watch:
-  - watch_dir: projects/web-app/patches
+  - id: web-app-patches
+    watch_dir: projects/web-app/patches
     paths: ["*.patch"]
     jobs:
       - id: apply
@@ -20,14 +19,16 @@ watch:
         path: "{file_remote_path}"
         if: jobs.apply.success
 
-  - watch_dir: projects/web-app/deploy
+  - id: web-app-deploy
+    watch_dir: projects/web-app/deploy
     paths: ["deploy-*.yaml"]
     jobs:
       - id: deploy
         type: exec
         cmd: ./deploy.sh {file_name}
 
-  - watch_dir: projects/api-service/patches
+  - id: api-service-patches
+    watch_dir: projects/api-service/patches
     paths: ["*.patch"]
     jobs:
       - id: apply
