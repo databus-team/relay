@@ -1,24 +1,55 @@
 name: file-exchange
 version: 1
 
+# Default backend (used by watcher if device not specified)
 backend:
   type: local
   config:
     base_dir: /tmp/file-exchange
     command_dir: commands
 
+# Device configurations
+devices:
+  - id: dev-server-01
+    name: Development Server 1
+    backend:
+      type: local
+      config:
+        base_dir: /tmp/file-exchange
+        command_dir: commands
+    paths:
+      watch_dir: patches
+      remote_dir: /remote
+      command_dir: commands
+
+  - id: prod-server-01
+    name: Production Server 1
+    backend:
+      type: fs-mcp
+      config:
+        url: http://localhost:3000/mcp
+        headers:
+          Cookie: "session=xxx"
+        command_dir: /commands
+    paths:
+      watch_dir: /patches
+      remote_dir: /prod
+      command_dir: /commands
+
+# Watcher configurations (by device)
 watchers:
   - name: Apply Patch
+    device: dev-server-01
     on:
       file_match: "*.patch"
-      watch_dir: patches
     jobs:
       - id: apply
         type: exec
-        cmd: "echo Applying patch {file_name}"
-        cwd: /tmp
+        cmd: git am --3way {file_path}
+        cwd: /repo
       - id: cleanup
         type: file_delete
         path: "{file_remote_path}"
+        if: jobs.apply.success
 
 interval_seconds: 60

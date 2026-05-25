@@ -14,8 +14,22 @@ type Config struct {
 	Version  int             `yaml:"version"`
 	Backend  BackendConfig   `yaml:"backend"`
 	Auth     *AuthConfig     `yaml:"auth,omitempty"`
+	Devices  []DeviceConfig  `yaml:"devices"`
 	Watchers []WatcherConfig `yaml:"watchers"`
 	Interval int             `yaml:"interval_seconds"`
+}
+
+type DeviceConfig struct {
+	ID      string        `yaml:"id"`
+	Name    string        `yaml:"name"`
+	Backend BackendConfig `yaml:"backend"`
+	Paths   DevicePaths   `yaml:"paths"`
+}
+
+type DevicePaths struct {
+	WatchDir  string `yaml:"watch_dir"`
+	RemoteDir string `yaml:"remote_dir"`
+	CommandDir string `yaml:"command_dir"`
 }
 
 type BackendConfig struct {
@@ -32,9 +46,10 @@ type AuthConfig struct {
 }
 
 type WatcherConfig struct {
-	Name string       `yaml:"name"`
-	On   OnConfig     `yaml:"on"`
-	Jobs []JobConfig  `yaml:"jobs"`
+	Name   string        `yaml:"name"`
+	Device string        `yaml:"device"` // device ID to watch
+	On     OnConfig      `yaml:"on"`
+	Jobs   []JobConfig   `yaml:"jobs"`
 }
 
 type OnConfig struct {
@@ -102,4 +117,33 @@ func (c *Config) GetCommandDir() string {
 		return dir
 	}
 	return "/commands"
+}
+
+func (c *Config) GetDevice(deviceID string) (*DeviceConfig, error) {
+	for i := range c.Devices {
+		if c.Devices[i].ID == deviceID {
+			return &c.Devices[i], nil
+		}
+	}
+	return nil, fmt.Errorf("device not found: %s", deviceID)
+}
+
+func (c *Config) GetDeviceBackend(deviceID string) (BackendConfig, error) {
+	device, err := c.GetDevice(deviceID)
+	if err != nil {
+		return BackendConfig{}, err
+	}
+	return device.Backend, nil
+}
+
+func (c *Config) GetDevicePaths(deviceID string) (*DevicePaths, error) {
+	device, err := c.GetDevice(deviceID)
+	if err != nil {
+		return nil, err
+	}
+	return &device.Paths, nil
+}
+
+func (c *Config) ListDevices() []DeviceConfig {
+	return c.Devices
 }
