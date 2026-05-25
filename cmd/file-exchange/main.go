@@ -30,8 +30,8 @@ var (
 	watchOnce = watchCmd.Flag("once", "Run watch loop only once instead of daemon mode").Bool()
 
 	// Push command
-	pushCmd = kingpin.Command("push", "Push file to remote directory")
-	pushDest = pushCmd.Flag("dest", "Destination directory on remote").Short('d').Required().String()
+	pushCmd = kingpin.Command("push", "Push file to remote watch directory")
+	pushWatch = pushCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
 	pushSrc = pushCmd.Arg("source", "Source file to push").Required().String()
 
 	// Exec command
@@ -101,6 +101,12 @@ func runPush() {
 		os.Exit(1)
 	}
 
+	watchCfg, err := cfg.GetWatchByID(*pushWatch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+		os.Exit(1)
+	}
+
 	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
@@ -109,7 +115,7 @@ func runPush() {
 
 	ctx := context.Background()
 	src := *pushSrc
-	dest := *pushDest + "/" + filepath.Base(src)
+	dest := watchCfg.WatchDir + "/" + filepath.Base(src)
 
 	info, err := os.Stat(src)
 	if err != nil {
@@ -118,7 +124,7 @@ func runPush() {
 	}
 
 	if info.IsDir() {
-		pushDir(ctx, b, src, *pushDest)
+		pushDir(ctx, b, src, watchCfg.WatchDir)
 	} else {
 		pushFile(ctx, b, src, dest)
 	}
