@@ -1,0 +1,44 @@
+# Binaries
+file-exchange
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+*.out
+
+# Output of the go coverage tool
+coverage.out
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+proxy.log
+
+# Temporary files
+/tmp/
+*.tmp
+
+# Environment files
+.env
+.env.local
+
+# Build artifacts
+dist/
+build/
+
+# Token cache (keep this out of git)
+# token.json
