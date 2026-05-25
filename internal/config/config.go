@@ -20,16 +20,19 @@ type Config struct {
 }
 
 type DeviceConfig struct {
-	ID      string        `yaml:"id"`
-	Name    string        `yaml:"name"`
-	Backend BackendConfig `yaml:"backend"`
-	Paths   DevicePaths   `yaml:"paths"`
+	ID       string           `yaml:"id"`
+	Name     string           `yaml:"name"`
+	Backend  BackendConfig    `yaml:"backend"`
+	Projects []ProjectConfig  `yaml:"projects"`
 }
 
-type DevicePaths struct {
-	WatchDir  string `yaml:"watch_dir"`
-	RemoteDir string `yaml:"remote_dir"`
-	CommandDir string `yaml:"command_dir"`
+type ProjectConfig struct {
+	ID          string `yaml:"id"`
+	Name        string `yaml:"name"`
+	WatchDir    string `yaml:"watch_dir"`
+	CommandDir  string `yaml:"command_dir"`
+	RemoteDir   string `yaml:"remote_dir"`
+	DeviceID    string `yaml:"-"` // populated at runtime from parent device
 }
 
 type BackendConfig struct {
@@ -47,7 +50,8 @@ type AuthConfig struct {
 
 type WatcherConfig struct {
 	Name   string        `yaml:"name"`
-	Device string        `yaml:"device"` // device ID to watch
+	Device string        `yaml:"device"`   // device ID
+	Project string       `yaml:"project"` // project ID
 	On     OnConfig      `yaml:"on"`
 	Jobs   []JobConfig   `yaml:"jobs"`
 }
@@ -91,6 +95,13 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
+	// Populate DeviceID for each project
+	for i := range cfg.Devices {
+		for j := range cfg.Devices[i].Projects {
+			cfg.Devices[i].Projects[j].DeviceID = cfg.Devices[i].ID
+		}
+	}
+
 	if cfg.Interval == 0 {
 		cfg.Interval = 60
 	}
@@ -128,6 +139,20 @@ func (c *Config) GetDevice(deviceID string) (*DeviceConfig, error) {
 	return nil, fmt.Errorf("device not found: %s", deviceID)
 }
 
+func (c *Config) GetProject(deviceID, projectID string) (*ProjectConfig, error) {
+	device, err := c.GetDevice(deviceID)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range device.Projects {
+		if device.Projects[i].ID == projectID {
+			return &device.Projects[i], nil
+		}
+	}
+	return nil, fmt.Errorf("project not found: %s on device %s", projectID, deviceID)
+}
+
 func (c *Config) GetDeviceBackend(deviceID string) (BackendConfig, error) {
 	device, err := c.GetDevice(deviceID)
 	if err != nil {
@@ -136,14 +161,29 @@ func (c *Config) GetDeviceBackend(deviceID string) (BackendConfig, error) {
 	return device.Backend, nil
 }
 
-func (c *Config) GetDevicePaths(deviceID string) (*DevicePaths, error) {
-	device, err := c.GetDevice(deviceID)
-	if err != nil {
-		return nil, err
-	}
-	return &device.Paths, nil
+func (c *Config) GetProjectPaths(deviceID, projectID string) (*ProjectConfig, error) {
+	return c.GetProject(deviceID, projectID)
 }
 
 func (c *Config) ListDevices() []DeviceConfig {
 	return c.Devices
+}
+
+func (c *Config) GetProjectByID(projectID string) (*ProjectConfig, error) {
+	for _, device := range c.Devices {
+		for i := range device.Projects {
+			if device.Projects[i].ID == projectID {
+				return &device.Projects[i], nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("project not found: %s", projectID)
+}
+
+func (c *Config) ListProjects() []ProjectConfig {
+	var projects []ProjectConfig
+	for _, device := range c.Devices {
+		projects = append(projects, device.Projects...)
+	}
+	return projects
 }

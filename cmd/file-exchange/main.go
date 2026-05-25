@@ -30,13 +30,13 @@ var (
 	watchOnce = watchCmd.Flag("once", "Run watch loop only once instead of daemon mode").Bool()
 
 	// Push command
-	pushCmd = kingpin.Command("push", "Push file to remote device")
-	pushDevice = pushCmd.Flag("device", "Target device ID").Short('d').Required().String()
+	pushCmd = kingpin.Command("push", "Push file to remote project")
+	pushProject = pushCmd.Flag("project", "Target project ID").Short('p').Required().String()
 	pushSrc = pushCmd.Arg("source", "Source file to push").Required().String()
 
 	// Exec command
-	execCmd = kingpin.Command("exec", "Execute command on remote device")
-	execDevice = execCmd.Flag("device", "Target device ID").Short('d').Required().String()
+	execCmd = kingpin.Command("exec", "Execute command on remote project")
+	execProject = execCmd.Flag("project", "Target project ID").Short('p').Required().String()
 	execCmdStr = execCmd.Arg("command", "Command to execute").Required().String()
 	execCwd = execCmd.Flag("cwd", "Working directory").String()
 )
@@ -103,7 +103,13 @@ func runPush() {
 		os.Exit(1)
 	}
 
-	device, err := cfg.GetDevice(*pushDevice)
+	project, err := cfg.GetProjectByID(*pushProject)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Project error: %v\n", err)
+		os.Exit(1)
+	}
+
+	device, err := cfg.GetDevice(project.DeviceID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Device error: %v\n", err)
 		os.Exit(1)
@@ -117,7 +123,7 @@ func runPush() {
 
 	ctx := context.Background()
 	src := *pushSrc
-	dest := device.Paths.WatchDir + "/" + filepath.Base(src)
+	dest := project.WatchDir + "/" + filepath.Base(src)
 
 	info, err := os.Stat(src)
 	if err != nil {
@@ -126,15 +132,75 @@ func runPush() {
 	}
 
 	if info.IsDir() {
-		pushDirToDevice(ctx, b, src, device.Paths.WatchDir)
+		pushDirToProject(ctx, b, src, project.WatchDir)
 	} else {
-		pushFileToDevice(ctx, b, src, dest)
+		pushFileToProject(ctx, b, src, dest)
 	}
 
 	fmt.Println("Push completed successfully")
 }
 
-func pushFileToDevice(ctx context.Context, b backend.FileTransferBackend, src, dest string) {
+func runExec() {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	project, err := cfg.GetProjectByID(*execProject)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Project error: %v\n", err)
+		os.Exit(1)
+	}
+
+	device, err := cfg.GetDevice(project.DeviceID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Device error: %v\n", err)
+		os.Exit(1)
+	}
+
+	b, err := backend.NewBackend(device.Backend.Type, device.Backend.Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
+		os.Exit(1)
+	}
+
+	if !b.SupportsExec() {
+		fmt.Fprintf(os.Stderr, "Project %q does not support exec action\n", *execProject)
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
+	cmd := *execCmdStr
+	cwd := *execCwd
+	if cwd == "" {
+		cwd = project.RemoteDir
+	}
+
+	commandDir := project.CommandDir
+	if commandDir == "" {
+		commandDir = b.GetCommandDir()
+	}
+
+	ex := exchange.NewFileExchange(b, commandDir)
+	result, err := ex.ExecuteCommand(ctx, cmd, cwd, 300)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Exec failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	if result.ExitCode != 0 {
+		fmt.Fprintf(os.Stderr, "Command exited with code %d:\n%s\n", result.ExitCode, result.Stderr)
+		os.Exit(1)
+	}
+
+	fmt.Print(result.Stdout)
+	if result.Stderr != "" {
+		fmt.Fprintf(os.Stderr, "\nStderr:\n%s\n", result.Stderr)
+	}
+}
+
+func pushFileToProject(ctx context.Context, b backend.FileTransferBackend, src, dest string) {
 	data, err := os.ReadFile(src)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to read source file: %v\n", err)
@@ -149,7 +215,7 @@ func pushFileToDevice(ctx context.Context, b backend.FileTransferBackend, src, d
 	fmt.Printf("Pushed: %s -> %s\n", src, dest)
 }
 
-func pushDirToDevice(ctx context.Context, b backend.FileTransferBackend, src, dest string) {
+func pushDirToProject(ctx context.Context, b backend.FileTransferBackend, src, dest string) {
 	entries, err := os.ReadDir(src)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to read source directory: %v\n", err)
@@ -165,58 +231,9 @@ func pushDirToDevice(ctx context.Context, b backend.FileTransferBackend, src, de
 		destPath := dest + entry.Name()
 
 		if entry.IsDir() {
-			pushDirToDevice(ctx, b, srcPath, destPath)
+			pushDirToProject(ctx, b, srcPath, destPath)
 		} else {
-			pushFileToDevice(ctx, b, srcPath, destPath)
+			pushFileToProject(ctx, b, srcPath, destPath)
 		}
-	}
-}
-
-func runExec() {
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
-		os.Exit(1)
-	}
-
-	device, err := cfg.GetDevice(*execDevice)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Device error: %v\n", err)
-		os.Exit(1)
-	}
-
-	b, err := backend.NewBackend(device.Backend.Type, device.Backend.Config)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
-		os.Exit(1)
-	}
-
-	if !b.SupportsExec() {
-		fmt.Fprintf(os.Stderr, "Device %q does not support exec action\n", *execDevice)
-		os.Exit(1)
-	}
-
-	ctx := context.Background()
-	cmd := *execCmdStr
-	cwd := *execCwd
-	if cwd == "" {
-		cwd = "/"
-	}
-
-	ex := exchange.NewFileExchange(b, b.GetCommandDir())
-	result, err := ex.ExecuteCommand(ctx, cmd, cwd, 300)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Exec failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	if result.ExitCode != 0 {
-		fmt.Fprintf(os.Stderr, "Command exited with code %d:\n%s\n", result.ExitCode, result.Stderr)
-		os.Exit(1)
-	}
-
-	fmt.Print(result.Stdout)
-	if result.Stderr != "" {
-		fmt.Fprintf(os.Stderr, "\nStderr:\n%s\n", result.Stderr)
 	}
 }
