@@ -1,0 +1,38 @@
+name: file-exchange
+version: 1
+
+# Example: fs-mcp backend
+# MCP (Model Context Protocol) filesystem server
+backend:
+  type: fs-mcp
+  config:
+    url: ${FS_MCP_URL}
+    headers:
+      Cookie: "${FS_MCP_COOKIE}"
+
+watch:
+  - id: web-app-patches
+    watch_dir: /patches/web-app
+    paths: ["*.patch"]
+    jobs:
+      - id: apply
+        type: exec
+        cmd: git am --3way {file_path}
+      - id: cleanup
+        type: file_delete
+        path: "{file_remote_path}"
+        if: jobs.apply.success
+
+  - id: api-service-patches
+    watch_dir: /patches/api-service
+    paths: ["*.patch"]
+    jobs:
+      - id: apply
+        type: exec
+        cmd: git am --3way {file_path}
+      - id: cleanup
+        type: file_delete
+        path: "{file_remote_path}"
+        if: jobs.apply.success
+
+interval_seconds: 60

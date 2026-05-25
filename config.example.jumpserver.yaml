@@ -1,0 +1,23 @@
+name: file-exchange
+version: 1
+
+# Example: jumpserver backend
+# JumpServer REST API (file operations only, no exec support)
+backend:
+  type: jumpserver
+  config:
+    base_url: ${JUMPSERVER_URL}
+    username: ${JUMPSERVER_USERNAME}
+    password: ${JUMPSERVER_PASSWORD}
+
+watch:
+  - id: web-app-patches
+    watch_dir: /patches/web-app
+    paths: ["*.patch"]
+    jobs:
+      # JumpServer only supports file_delete, not exec
+      - id: backup
+        type: file_delete
+        path: "{file_remote_path}"
+
+interval_seconds: 60
