@@ -135,12 +135,23 @@ func (b *FsMcpBackend) Read(ctx context.Context, path string) ([]byte, error) {
 }
 
 func (b *FsMcpBackend) Write(ctx context.Context, path string, content []byte) error {
+	// Try fs_create_file first (commonly used by fs-mcp)
+	err := b.writeFile(ctx, "fs_create_file", path, content)
+	if err == nil {
+		return nil
+	}
+
+	// Fallback to fs_write_file
+	return b.writeFile(ctx, "fs_write_file", path, content)
+}
+
+func (b *FsMcpBackend) writeFile(ctx context.Context, method string, path string, content []byte) error {
 	reqBody := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      uuid.New().String(),
 		"method":  "tools/call",
 		"params": map[string]interface{}{
-			"name": "fs_write_file",
+			"name": method,
 			"arguments": map[string]string{
 				"path":    path,
 				"content": string(content),
@@ -148,9 +159,20 @@ func (b *FsMcpBackend) Write(ctx context.Context, path string, content []byte) e
 		},
 	}
 
-	_, err := b.doRequest(ctx, reqBody)
+	resp, err := b.doRequest(ctx, reqBody)
 	if err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
+	}
+
+	// Check if response contains error
+	var result struct {
+		Error *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(resp, &result); err == nil && result.Error != nil {
+		return fmt.Errorf("mcp error: %s (code: %d)", result.Error.Message, result.Error.Code)
 	}
 
 	return nil
