@@ -103,7 +103,6 @@ func (p *ProxyAuth) performAuth(ctx context.Context) error {
 	}
 
 	var authToken string
-	var authErr error
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		dump, _ := httputil.DumpRequest(r, true)

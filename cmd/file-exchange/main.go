@@ -24,6 +24,7 @@ var (
 	_ = kingpin.CommandLine
 
 	configPath = kingpin.Flag("config", "Path to config file").Short('c').Default("~/.file-exchange/config.yaml").String()
+	debugFlag  = kingpin.Flag("debug", "Enable debug mode").Bool()
 
 	// Watch command
 	watchCmd = kingpin.Command("watch", "Watch remote directory and execute actions")
@@ -41,6 +42,11 @@ var (
 
 func main() {
 	kingpin.CommandLine.HelpFlag.Short('h')
+
+	// Enable debug mode if flag is set
+	if *debugFlag {
+		backend.SetDebug(true)
+	}
 
 	switch kingpin.Parse() {
 	case watchCmd.FullCommand():
@@ -101,7 +107,8 @@ func runPush() {
 		os.Exit(1)
 	}
 
-	watchCfg, err := cfg.GetWatchByID(*pushWatch)
+	// Verify watch ID exists
+	_, err = cfg.GetWatchByID(*pushWatch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 		os.Exit(1)
@@ -114,8 +121,19 @@ func runPush() {
 	}
 
 	ctx := context.Background()
+
+	// Get watch config to get watch_dir
 	src := *pushSrc
-	dest := watchCfg.WatchDir + "/" + filepath.Base(src)
+	watchCfg, err := cfg.GetWatchByID(*pushWatch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Determine destination path using watch_dir
+	watchDir := watchCfg.WatchDir
+	filename := filepath.Base(src)
+	dest := watchDir + "/" + filename
 
 	info, err := os.Stat(src)
 	if err != nil {
@@ -124,7 +142,7 @@ func runPush() {
 	}
 
 	if info.IsDir() {
-		pushDir(ctx, b, src, watchCfg.WatchDir)
+		pushDir(ctx, b, src, watchDir)
 	} else {
 		pushFile(ctx, b, src, dest)
 	}

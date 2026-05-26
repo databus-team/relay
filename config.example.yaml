@@ -8,7 +8,8 @@ backend:
 
 watch:
   - id: web-app-patches
-    watch_dir: projects/web-app/patches
+    watch_dir: projects/web-app/patches   # 远端中转站目录
+    local_dir: /path/to/local/repo       # 本机工作目录
     paths: ["*.patch"]
     jobs:
       - id: apply
@@ -21,6 +22,7 @@ watch:
 
   - id: web-app-deploy
     watch_dir: projects/web-app/deploy
+    local_dir: /path/to/local/repo
     paths: ["deploy-*.yaml"]
     jobs:
       - id: deploy
@@ -29,6 +31,7 @@ watch:
 
   - id: api-service-patches
     watch_dir: projects/api-service/patches
+    local_dir: /path/to/api/repo
     paths: ["*.patch"]
     jobs:
       - id: apply

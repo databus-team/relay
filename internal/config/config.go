@@ -19,10 +19,11 @@ type Config struct {
 }
 
 type WatchConfig struct {
-	ID       string        `yaml:"id"`
-	WatchDir string        `yaml:"watch_dir"`
-	Paths    []string      `yaml:"paths"`
-	Jobs     []JobConfig   `yaml:"jobs"`
+	ID       string      `yaml:"id"`
+	WatchDir string      `yaml:"watch_dir"` // 远端 MCP 目录（中转站）
+	LocalDir string      `yaml:"local_dir"` // 本机工作目录（jobs 执行位置）
+	Paths    []string    `yaml:"paths"`
+	Jobs     []JobConfig `yaml:"jobs"`
 }
 
 type BackendConfig struct {

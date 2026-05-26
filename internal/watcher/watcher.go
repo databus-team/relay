@@ -17,28 +17,20 @@ import (
 
 type Watcher struct {
 	cfg       *config.Config
-	backend   backend.FileTransferBackend
 	processed map[string]bool
 	jobResults map[string]bool
 }
 
 func New(cfg *config.Config) (*Watcher, error) {
-	backendCfg := cfg.Backend.Config
-	if backendCfg == nil {
-		backendCfg = make(map[string]interface{})
-	}
-
-	b, err := backend.NewBackend(cfg.Backend.Type, backendCfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create backend: %w", err)
-	}
-
 	return &Watcher{
 		cfg:       cfg,
-		backend:   b,
 		processed: make(map[string]bool),
 		jobResults: make(map[string]bool),
 	}, nil
+}
+
+func (w *Watcher) createBackend(watchCfg config.WatchConfig) (backend.FileTransferBackend, error) {
+	return backend.NewBackend(w.cfg.Backend.Type, w.cfg.Backend.Config)
 }
 
 func (w *Watcher) Run(ctx context.Context) error {
@@ -80,7 +72,12 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 }
 
 func (w *Watcher) processWatch(ctx context.Context, watchCfg config.WatchConfig) error {
-	files, err := w.backend.ListDir(ctx, watchCfg.WatchDir)
+	b, err := w.createBackend(watchCfg)
+	if err != nil {
+		return fmt.Errorf("failed to create backend: %w", err)
+	}
+
+	files, err := b.ListDir(ctx, watchCfg.WatchDir)
 	if err != nil {
 		return fmt.Errorf("failed to list directory %s: %w", watchCfg.WatchDir, err)
 	}
@@ -103,7 +100,7 @@ func (w *Watcher) processWatch(ctx context.Context, watchCfg config.WatchConfig)
 		w.processed[filePath] = true
 		w.jobResults = make(map[string]bool)
 
-		if err := w.executeJobs(ctx, watchCfg.Jobs, filePath, file.Name, watchCfg.WatchDir); err != nil {
+		if err := w.executeJobs(ctx, watchCfg.Jobs, filePath, file.Name, watchCfg.WatchDir, watchCfg.LocalDir, b); err != nil {
 			log.Printf("Job failed for %s: %v (file left untouched)", filePath, err)
 			delete(w.processed, filePath)
 		}
@@ -121,7 +118,9 @@ func (w *Watcher) matchAnyPattern(filename string, patterns []string) bool {
 	return false
 }
 
-func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, filePath, fileName, watchDir string) error {
+func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, filePath, fileName, watchDir, localDir string, b backend.FileTransferBackend) error {
+	vars := w.buildVariables(filePath, fileName, watchDir)
+
 	for _, job := range jobs {
 		if job.If != "" {
 			conditionMet, err := w.evaluateCondition(job.If)
@@ -134,12 +133,13 @@ func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, file
 			}
 		}
 
-		vars := w.buildVariables(filePath, fileName, watchDir)
-
 		switch job.Type {
 		case "exec":
 			cmd := substituteVariables(job.Cmd, vars)
 			cwd := job.Cwd
+			if cwd == "" && localDir != "" {
+				cwd = localDir
+			}
 			if cwd != "" {
 				cwd = substituteVariables(cwd, vars)
 			}
@@ -154,7 +154,7 @@ func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, file
 
 		case "file_delete":
 			delPath := substituteVariables(job.Path, vars)
-			if err := w.backend.Delete(ctx, delPath); err != nil {
+			if err := b.Delete(ctx, delPath); err != nil {
 				w.jobResults[job.ID] = false
 				return fmt.Errorf("file_delete job %s failed: %w", job.ID, err)
 			}

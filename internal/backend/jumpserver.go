@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
 type JumpServerBackend struct {
 	baseURL    string
+	remoteRoot string
 	username   string
 	password   string
 	token      string
@@ -26,6 +28,7 @@ type JumpServerConfig struct {
 	Password   string `mapstructure:"password"`
 	Token      string `mapstructure:"token"`
 	CommandDir string `mapstructure:"command_dir"`
+	RemoteRoot string `mapstructure:"remote_root"`
 }
 
 func NewJumpServerBackend(config map[string]interface{}) (FileTransferBackend, error) {
@@ -42,6 +45,11 @@ func NewJumpServerBackend(config map[string]interface{}) (FileTransferBackend, e
 		commandDir = dir
 	}
 
+	remoteRoot := "/"
+	if root, ok := config["remote_root"].(string); ok {
+		remoteRoot = root
+	}
+
 	username, _ := config["username"].(string)
 	password, _ := config["password"].(string)
 	token, _ := config["token"].(string)
@@ -51,9 +59,17 @@ func NewJumpServerBackend(config map[string]interface{}) (FileTransferBackend, e
 		username:   username,
 		password:   password,
 		token:      token,
+		remoteRoot: remoteRoot,
 		commandDir: commandDir,
 		httpClient: &http.Client{Timeout: 60 * time.Second},
 	}, nil
+}
+
+func (b *JumpServerBackend) resolvePath(path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(b.remoteRoot, path)
 }
 
 func (b *JumpServerBackend) ListDir(ctx context.Context, path string) ([]FileInfo, error) {
@@ -61,9 +77,11 @@ func (b *JumpServerBackend) ListDir(ctx context.Context, path string) ([]FileInf
 		return nil, err
 	}
 
+	resolvedPath := b.resolvePath(path)
+
 	url := fmt.Sprintf("%s/api/v1/filesystem/list/", b.baseURL)
 	reqBody := map[string]string{
-		"path": path,
+		"path": resolvedPath,
 	}
 
 	body, err := b.doRequest(ctx, "POST", url, reqBody)
@@ -87,9 +105,11 @@ func (b *JumpServerBackend) Read(ctx context.Context, path string) ([]byte, erro
 		return nil, err
 	}
 
+	resolvedPath := b.resolvePath(path)
+
 	url := fmt.Sprintf("%s/api/v1/filesystem/read/", b.baseURL)
 	reqBody := map[string]string{
-		"path": path,
+		"path": resolvedPath,
 	}
 
 	body, err := b.doRequest(ctx, "POST", url, reqBody)
@@ -113,9 +133,11 @@ func (b *JumpServerBackend) Write(ctx context.Context, path string, content []by
 		return err
 	}
 
+	resolvedPath := b.resolvePath(path)
+
 	url := fmt.Sprintf("%s/api/v1/filesystem/write/", b.baseURL)
 	reqBody := map[string]interface{}{
-		"path":    path,
+		"path":    resolvedPath,
 		"content": string(content),
 	}
 
@@ -132,9 +154,11 @@ func (b *JumpServerBackend) Delete(ctx context.Context, path string) error {
 		return err
 	}
 
+	resolvedPath := b.resolvePath(path)
+
 	url := fmt.Sprintf("%s/api/v1/filesystem/delete/", b.baseURL)
 	reqBody := map[string]string{
-		"path": path,
+		"path": resolvedPath,
 	}
 
 	_, err := b.doRequest(ctx, "POST", url, reqBody)
@@ -247,9 +271,11 @@ func (b *JumpServerBackend) Stat(ctx context.Context, path string) (interface{},
 		return nil, err
 	}
 
+	resolvedPath := b.resolvePath(path)
+
 	url := fmt.Sprintf("%s/api/v1/filesystem/stat/", b.baseURL)
 	reqBody := map[string]string{
-		"path": path,
+		"path": resolvedPath,
 	}
 
 	body, err := b.doRequest(ctx, "POST", url, reqBody)
