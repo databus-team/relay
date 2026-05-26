@@ -87,7 +87,7 @@ func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		req.Header.Set(k, v)
 	}
 	resp, err := t.base.RoundTrip(req)
-	if err == nil && resp != nil {
+	if debugMode && err == nil && resp != nil {
 		log.Printf("[fs-mcp debug] Request: %s %s, Status: %d", req.Method, req.URL.Path, resp.StatusCode)
 	}
 	return resp, err
