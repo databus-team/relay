@@ -265,8 +265,8 @@ func (b *FsMcpBackend) SupportsExec() bool {
 	return true
 }
 
-func (b *FsMcpBackend) GetCommandDir() string {
-	return b.commandDir
+func (b *FsMcpBackend) Exec(ctx context.Context, cmd string, workDir string) (string, error) {
+	return "", ErrNotSupported
 }
 
 func (b *FsMcpBackend) Stat(ctx context.Context, path string) (interface{}, error) {
