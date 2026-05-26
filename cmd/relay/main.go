@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -26,24 +25,27 @@ var (
 	configPath = kingpin.Flag("config", "Path to config file").Short('c').Default("~/.relay/config.yaml").String()
 	debugFlag  = kingpin.Flag("debug", "Enable debug mode").Bool()
 
-	// Watch command
-	watchCmd = kingpin.Command("watch", "Watch remote directory and execute actions")
-	watchOnce = watchCmd.Flag("once", "Run watch loop only once instead of daemon mode").Bool()
+	// Watch command - continuous monitoring
+	watchCmd = kingpin.Command("watch", "Watch remote directory and execute actions continuously")
 
-	// Push command
+	// Pull command - one-time sync
+	pullCmd = kingpin.Command("pull", "One-time sync: check watch_dir and execute jobs")
+	pullWatch = pullCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
+
+	// Push command - upload files
 	pushCmd = kingpin.Command("push", "Push file to remote watch directory")
 	pushWatch = pushCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
 	pushSrc = pushCmd.Arg("source", "Source file to push").Required().String()
 
-	// Exec command
-	execCmd = kingpin.Command("exec", "Execute command locally")
+	// Exec command - command forwarding (requires watch running)
+	execCmd = kingpin.Command("exec", "Forward command to remote backend")
+	execWatch = execCmd.Flag("watch", "Target watch ID").Short('w').String()
 	execCmdStr = execCmd.Arg("command", "Command to execute").Required().String()
 )
 
 func main() {
 	kingpin.CommandLine.HelpFlag.Short('h')
 
-	// Enable debug mode if flag is set
 	if *debugFlag {
 		backend.SetDebug(true)
 	}
@@ -51,6 +53,8 @@ func main() {
 	switch kingpin.Parse() {
 	case watchCmd.FullCommand():
 		runWatch()
+	case pullCmd.FullCommand():
+		runPull()
 	case pushCmd.FullCommand():
 		runPush()
 	case execCmd.FullCommand():
@@ -87,17 +91,39 @@ func runWatch() {
 		os.Exit(1)
 	}
 
-	if *watchOnce {
-		if err := w.RunOnce(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
-			os.Exit(1)
-		}
-	} else {
-		if err := w.Run(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
-			os.Exit(1)
-		}
+	if err := w.Run(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+		os.Exit(1)
 	}
+}
+
+func runPull() {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	watchCfg, err := cfg.GetWatchByID(*pullWatch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
+	w, err := watcher.New(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create watcher: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Run single watch check
+	if err := w.RunOnceForWatch(ctx, watchCfg.ID); err != nil {
+		fmt.Fprintf(os.Stderr, "Pull error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Pull completed successfully")
 }
 
 func runPush() {
@@ -107,8 +133,7 @@ func runPush() {
 		os.Exit(1)
 	}
 
-	// Verify watch ID exists
-	_, err = cfg.GetWatchByID(*pushWatch)
+	watchCfg, err := cfg.GetWatchByID(*pushWatch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 		os.Exit(1)
@@ -121,16 +146,8 @@ func runPush() {
 	}
 
 	ctx := context.Background()
-
-	// Get watch config to get watch_dir
 	src := *pushSrc
-	watchCfg, err := cfg.GetWatchByID(*pushWatch)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
-		os.Exit(1)
-	}
 
-	// Determine destination path using watch_dir
 	watchDir := watchCfg.WatchDir
 	filename := filepath.Base(src)
 	dest := watchDir + "/" + filename
@@ -151,19 +168,41 @@ func runPush() {
 }
 
 func runExec() {
-	// Execute command locally in current working directory
-	cmd := exec.Command("sh", "-c", *execCmdStr)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-
-	if err := cmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			os.Exit(exitErr.ExitCode())
-		}
-		fmt.Fprintf(os.Stderr, "Exec failed: %v\n", err)
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
 		os.Exit(1)
 	}
+
+	var watchDir string
+	if *execWatch != "" {
+		watchCfg, err := cfg.GetWatchByID(*execWatch)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+			os.Exit(1)
+		}
+		watchDir = watchCfg.WatchDir
+	}
+
+	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
+		os.Exit(1)
+	}
+
+	if !b.SupportsExec() {
+		fmt.Fprintf(os.Stderr, "Backend does not support exec\n")
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
+	result, err := b.Exec(ctx, *execCmdStr, watchDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Exec error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Print(result)
 }
 
 func pushFile(ctx context.Context, b backend.FileTransferBackend, src, dest string) {

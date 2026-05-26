@@ -174,8 +174,8 @@ func (b *JumpServerBackend) SupportsExec() bool {
 	return false
 }
 
-func (b *JumpServerBackend) GetCommandDir() string {
-	return b.commandDir
+func (b *JumpServerBackend) Exec(ctx context.Context, cmd string, workDir string) (string, error) {
+	return "", ErrNotSupported
 }
 
 func (b *JumpServerBackend) ensureAuth(ctx context.Context) error {

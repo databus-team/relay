@@ -111,8 +111,8 @@ func (b *LocalBackend) SupportsExec() bool {
 	return true
 }
 
-func (b *LocalBackend) GetCommandDir() string {
-	return b.commandDir
+func (b *LocalBackend) Exec(ctx context.Context, cmd string, workDir string) (string, error) {
+	return "", ErrNotSupported
 }
 
 func (b *LocalBackend) Stat(ctx context.Context, path string) (fs.FileInfo, error) {

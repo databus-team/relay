@@ -59,6 +59,15 @@ func (w *Watcher) RunOnce(ctx context.Context) error {
 	return w.runOnce(ctx)
 }
 
+func (w *Watcher) RunOnceForWatch(ctx context.Context, watchID string) error {
+	for _, watchCfg := range w.cfg.Watch {
+		if watchCfg.ID == watchID {
+			return w.processWatch(ctx, watchCfg)
+		}
+	}
+	return fmt.Errorf("watch not found: %s", watchID)
+}
+
 func (w *Watcher) runOnce(ctx context.Context) error {
 	g := &errgroup.Group{}
 
