@@ -180,8 +180,7 @@ func (w *Watcher) processCommands(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	log.Printf("[commands] Found %d files in %s", len(files), commandDir)
-	foundCmd := false
+	cmdCount := 0
 	for _, file := range files {
 		if file.IsDir {
 			continue
@@ -191,7 +190,7 @@ func (w *Watcher) processCommands(ctx context.Context) (bool, error) {
 		if !strings.HasPrefix(file.Name, "cmd-") || !strings.HasSuffix(file.Name, ".json") {
 			continue
 		}
-		foundCmd = true
+		cmdCount++
 
 		log.Printf("[commands] Processing %s", file.Name)
 
@@ -221,7 +220,11 @@ func (w *Watcher) processCommands(ctx context.Context) (bool, error) {
 		_ = b.Delete(ctx, cmdPath)
 	}
 
-	return foundCmd, nil
+	if cmdCount > 0 {
+		log.Printf("[commands] Found %d command files in %s", cmdCount, commandDir)
+	}
+
+	return cmdCount > 0, nil
 }
 
 func (w *Watcher) executeCommand(ctx context.Context, cmdPath string, b backend.FileTransferBackend) (*exchange.ResultFile, error) {
