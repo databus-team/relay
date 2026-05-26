@@ -70,7 +70,9 @@ func (b *FsMcpBackend) resolvePath(path string) string {
 	if filepath.IsAbs(path) {
 		return path
 	}
-	return filepath.Join(b.remoteRoot, path)
+	// Use Unix-style paths for remote filesystem
+	joined := filepath.Join(b.remoteRoot, path)
+	return strings.ReplaceAll(joined, "\\", "/")
 }
 
 // headerTransport wraps http.RoundTripper to add custom headers
