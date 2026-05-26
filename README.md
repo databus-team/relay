@@ -54,6 +54,8 @@ watch:
 interval_seconds: 60
 ```
 
+**Windows note:** When running on Windows (MSYS/Git Bash), `local_dir` can be written as `/d/...` and will be normalized to `D:\...` automatically.
+
 ## Usage
 
 ### Watch - Daemon Mode
