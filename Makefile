@@ -65,9 +65,13 @@ vet:
 run: build
 	./$(BINARY_NAME) watch
 
-## pull: Run single sync iteration
+## pull: Download single file from remote
 pull:
-	./$(BINARY_NAME) pull --watch=<watch_id>
+	./$(BINARY_NAME) pull -c config.yaml -w <watch_id> <filename>
+
+## list: List remote directory contents
+list:
+	./$(BINARY_NAME) list -c config.yaml -w <watch_id>
 
 ## push: Push file to remote
 push:

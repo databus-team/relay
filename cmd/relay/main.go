@@ -28,9 +28,14 @@ var (
 	// Watch command - continuous monitoring
 	watchCmd = kingpin.Command("watch", "Watch remote directory and execute actions continuously")
 
-	// Pull command - one-time sync
-	pullCmd = kingpin.Command("pull", "One-time sync: check watch_dir and execute jobs")
+	// Pull command - download single file (requires filename)
+	pullCmd = kingpin.Command("pull", "Download single file from remote watch directory")
 	pullWatch = pullCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
+	pullFile = pullCmd.Arg("filename", "Remote filename to download").Required().String()
+
+	// List command - list remote directory
+	listCmd = kingpin.Command("list", "List files in remote watch directory")
+	listWatch = listCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
 
 	// Push command - upload files
 	pushCmd = kingpin.Command("push", "Push file to remote watch directory")
@@ -59,6 +64,8 @@ func main() {
 		runPush()
 	case execCmd.FullCommand():
 		runExec()
+	case listCmd.FullCommand():
+		runList()
 	case "help":
 		app.Usage(os.Args)
 	default:
@@ -110,20 +117,71 @@ func runPull() {
 		os.Exit(1)
 	}
 
-	ctx := context.Background()
-	w, err := watcher.New(cfg)
+	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create watcher: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Run single watch check
-	if err := w.RunOnceForWatch(ctx, watchCfg.ID); err != nil {
-		fmt.Fprintf(os.Stderr, "Pull error: %v\n", err)
+	ctx := context.Background()
+	remotePath := watchCfg.WatchDir + "/" + *pullFile
+
+	data, err := b.Read(ctx, remotePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read remote file: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("Pull completed successfully")
+	// Write to current directory with same filename
+	localPath := *pullFile
+	if err := os.WriteFile(localPath, data, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to write local file: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Pulled: %s -> %s\n", remotePath, localPath)
+}
+
+func runList() {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	watchCfg, err := cfg.GetWatchByID(*listWatch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+		os.Exit(1)
+	}
+
+	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
+	files, err := b.ListDir(ctx, watchCfg.WatchDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "List error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(files) == 0 {
+		fmt.Println("(empty directory)")
+		return
+	}
+
+	fmt.Printf("%-40s %10s  %s\n", "NAME", "SIZE", "MODIFIED")
+	fmt.Println(strings.Repeat("-", 65))
+	for _, f := range files {
+		dirMarker := "-"
+		if f.IsDir {
+			dirMarker = "d"
+		}
+		fmt.Printf("%-40s %10s  %s [%s]\n", f.Name, formatSize(f.Size), f.ModTime, dirMarker)
+	}
 }
 
 func runPush() {
@@ -241,4 +299,17 @@ func pushDir(ctx context.Context, b backend.FileTransferBackend, src, dest strin
 			pushFile(ctx, b, srcPath, destPath)
 		}
 	}
+}
+
+func formatSize(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
