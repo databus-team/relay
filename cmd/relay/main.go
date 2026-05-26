@@ -261,17 +261,29 @@ func runExec() {
 
 	ctx := context.Background()
 
-	// Health check: verify remote watcher is running
-	fmt.Print("Checking remote watcher... ")
-	commandDir := "/commands"
+	// Get command directory, default to /tmp/relay-commands
+	commandDir := "/tmp/relay-commands"
 	if dir, ok := cfg.Backend.Config["command_dir"].(string); ok {
 		commandDir = dir
 	}
-	if err := b.Ping(ctx, commandDir); err != nil {
-		fmt.Fprintf(os.Stderr, "\nError: %v\n", err)
-		os.Exit(1)
+
+	// Health check: verify remote watcher is running
+	if *execWatch != "" {
+		watchCfg, err := cfg.GetWatchByID(*execWatch)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Print("Checking remote watcher... ")
+		if err := b.Ping(ctx, commandDir, watchCfg.ID); err != nil {
+			fmt.Fprintf(os.Stderr, "\nError: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("OK")
+	} else {
+		fmt.Println("Note: Specify -w to check remote watcher before exec")
 	}
-	fmt.Println("OK")
 
 	result, err := b.Exec(ctx, *execCmdStr, watchDir)
 	if err != nil {

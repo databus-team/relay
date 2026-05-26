@@ -44,8 +44,8 @@ func NewFsMcpBackend(config map[string]interface{}) (FileTransferBackend, error)
 		remoteRoot = root
 	}
 
-	commandDir := "/commands"
-	if dir, ok := config["command_dir"].(string); ok {
+	commandDir := "/tmp/relay-commands"
+	if dir, ok := config["command_dir"].(string); ok && dir != "" {
 		commandDir = dir
 	}
 
@@ -68,7 +68,8 @@ func NewFsMcpBackend(config map[string]interface{}) (FileTransferBackend, error)
 
 func (b *FsMcpBackend) resolvePath(path string) string {
 	if filepath.IsAbs(path) {
-		return path
+		// Convert Windows-style absolute paths to Unix
+		return strings.ReplaceAll(path, "\\", "/")
 	}
 	// Use Unix-style paths for remote filesystem
 	joined := filepath.Join(b.remoteRoot, path)
@@ -140,6 +141,16 @@ var (
 	listDirDirPattern = regexp.MustCompile(`\[DIR\]\s+(.+?)\s+\(file://(.+?)\)`)
 )
 
+// treeNode represents a node in the tree JSON structure
+type treeNode struct {
+	Name     string      `json:"name"`
+	Path     string      `json:"path"`
+	Type     string      `json:"type"`
+	Modified string      `json:"modified,omitempty"`
+	Size     int64       `json:"size,omitempty"`
+	Children []treeNode  `json:"children,omitempty"`
+}
+
 func (b *FsMcpBackend) ListDir(ctx context.Context, path string) ([]FileInfo, error) {
 	if err := b.ensureConnection(ctx); err != nil {
 		return nil, err
@@ -148,6 +159,14 @@ func (b *FsMcpBackend) ListDir(ctx context.Context, path string) ([]FileInfo, er
 	resolvedPath := b.resolvePath(path)
 	b.debugLog("ListDir: path=%s, resolved=%s", path, resolvedPath)
 
+	// First try tree command for structured output with modified times
+	files, err := b.listDirTree(ctx, resolvedPath)
+	if err == nil && len(files) > 0 {
+		return files, nil
+	}
+	b.debugLog("tree failed: %v, falling back to list_directory", err)
+
+	// Fallback to list_directory
 	result, err := b.session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "list_directory",
 		Arguments: map[string]any{
@@ -162,7 +181,6 @@ func (b *FsMcpBackend) ListDir(ctx context.Context, path string) ([]FileInfo, er
 		return []FileInfo{}, nil
 	}
 
-	var files []FileInfo
 	for _, content := range result.Content {
 		if textContent, ok := content.(*mcp.TextContent); ok {
 			// Try JSON first
@@ -181,6 +199,68 @@ func (b *FsMcpBackend) ListDir(ctx context.Context, path string) ([]FileInfo, er
 	}
 
 	return files, nil
+}
+
+func (b *FsMcpBackend) listDirTree(ctx context.Context, path string) ([]FileInfo, error) {
+	result, err := b.session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "tree",
+		Arguments: map[string]any{
+			"path":  path,
+			"depth": 1, // Only need one level for list
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if len(result.Content) == 0 {
+		return nil, fmt.Errorf("empty response")
+	}
+
+	for _, content := range result.Content {
+		// Try TextContent first (text format)
+		if textContent, ok := content.(*mcp.TextContent); ok {
+			// Extract JSON from text (may have prefix like "Directory tree for...")
+			files := parseTreeText(textContent.Text, path)
+			if len(files) > 0 {
+				return files, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("failed to parse tree output")
+}
+
+func parseTreeText(text string, parentPath string) []FileInfo {
+	// Try to extract JSON object from text
+	jsonStart := strings.Index(text, "{")
+	if jsonStart == -1 {
+		return nil
+	}
+	jsonText := text[jsonStart:]
+	return parseTreeJSON([]byte(jsonText), parentPath)
+}
+
+func parseTreeJSON(data []byte, parentPath string) []FileInfo {
+	var root treeNode
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil
+	}
+
+	var files []FileInfo
+	for _, child := range root.Children {
+		files = append(files, treeNodeToFileInfo(child))
+	}
+	return files
+}
+
+func treeNodeToFileInfo(node treeNode) FileInfo {
+	return FileInfo{
+		Name:    node.Name,
+		IsDir:   node.Type == "directory",
+		Size:    node.Size,
+		ModTime: node.Modified,
+	}
 }
 
 // parseListOutput parses MCP text output format to FileInfo slice
@@ -252,6 +332,8 @@ func (b *FsMcpBackend) Write(ctx context.Context, path string, content []byte) e
 
 	// Ensure parent directory exists
 	parentDir := filepath.Dir(resolvedPath)
+	// Convert to forward slashes for remote filesystem
+	parentDir = strings.ReplaceAll(parentDir, "\\", "/")
 	if parentDir != "/" && parentDir != "" {
 		b.debugLog("Creating parent directory: %s", parentDir)
 		_, dirErr := b.session.CallTool(ctx, &mcp.CallToolParams{
@@ -365,11 +447,12 @@ func (b *FsMcpBackend) Stat(ctx context.Context, path string) (interface{}, erro
 	return nil, ErrNotFound
 }
 
-func (b *FsMcpBackend) Ping(ctx context.Context, commandDir string) error {
+func (b *FsMcpBackend) Ping(ctx context.Context, commandDir, watchID string) error {
 	if err := b.ensureConnection(ctx); err != nil {
 		return err
 	}
 
+	// Heartbeat file is stored in commandDir
 	heartbeatPath := commandDir + "/.heartbeat"
 	data, err := b.Read(ctx, heartbeatPath)
 	if err != nil {
