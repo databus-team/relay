@@ -20,11 +20,11 @@ type TokenCache struct {
 }
 
 type ProxyAuth struct {
-	loginURL         string
-	tokenCookieName  string
-	proxyPort        int
-	tokenCacheFile   string
-	token            string
+	loginURL        string
+	tokenCookieName string
+	proxyPort       int
+	tokenCacheFile  string
+	token           string
 }
 
 func NewProxyAuth(loginURL, tokenCookieName string, proxyPort int, tokenCacheFile string) *ProxyAuth {

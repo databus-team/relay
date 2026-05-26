@@ -32,11 +32,11 @@ type BackendConfig struct {
 }
 
 type AuthConfig struct {
-	Method           string `yaml:"method"`
-	LoginURL         string `yaml:"login_url"`
-	TokenCookieName  string `yaml:"token_cookie_name"`
-	ProxyPort        int    `yaml:"proxy_port"`
-	TokenCacheFile   string `yaml:"token_cache_file"`
+	Method          string `yaml:"method"`
+	LoginURL        string `yaml:"login_url"`
+	TokenCookieName string `yaml:"token_cookie_name"`
+	ProxyPort       int    `yaml:"proxy_port"`
+	TokenCacheFile  string `yaml:"token_cache_file"`
 }
 
 type JobConfig struct {
@@ -47,6 +47,7 @@ type JobConfig struct {
 	Path     string `yaml:"path,omitempty"`
 	If       string `yaml:"if,omitempty"`
 	KeepFile bool   `yaml:"keep_file"`
+	Timeout  int    `yaml:"timeout,omitempty"` // seconds, optional per-job timeout
 }
 
 func Load(path string) (*Config, error) {

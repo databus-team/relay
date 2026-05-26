@@ -11,8 +11,8 @@ import (
 )
 
 type LocalBackend struct {
-	baseDir     string
-	commandDir  string
+	baseDir    string
+	commandDir string
 }
 
 func NewLocalBackend(config map[string]interface{}) (FileTransferBackend, error) {
@@ -113,13 +113,24 @@ func (b *LocalBackend) SupportsExec() bool {
 	return true
 }
 
-func (b *LocalBackend) Exec(ctx context.Context, cmd string, cwd string) (string, error) {
-	execCmd := exec.Command("sh", "-c", cmd)
+func (b *LocalBackend) Exec(ctx context.Context, cmd string, cwd string, timeout int) (string, error) {
+	// Use context with timeout if provided
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+		defer cancel()
+	}
+
+	execCmd := exec.CommandContext(ctx, "sh", "-c", cmd)
 	if cwd != "" {
 		execCmd.Dir = cwd
 	}
 	output, err := execCmd.CombinedOutput()
 	if err != nil {
+		// If context deadline exceeded, return a clear error
+		if ctx.Err() == context.DeadlineExceeded {
+			return string(output), fmt.Errorf("command timed out after %d seconds", timeout)
+		}
 		return string(output), fmt.Errorf("command failed: %w", err)
 	}
 	return string(output), nil

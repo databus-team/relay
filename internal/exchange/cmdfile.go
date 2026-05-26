@@ -48,7 +48,7 @@ func NewFileExchange(backend FileBackend, commandDir string) *FileExchange {
 	return &FileExchange{
 		backend:      backend,
 		commandDir:   commandDir,
-		pollDefault:  30,
+		pollDefault:  300, // default to 300s to match responder default
 		pollInterval: 2,
 	}
 }
@@ -83,7 +83,13 @@ func (e *FileExchange) ExecuteCommand(ctx context.Context, cmd, cwd string, time
 		return nil, err
 	}
 
-	result, err := e.pollResult(ctx, cmdID)
+	// Use provided timeout if set, otherwise fallback to default
+	pollTimeout := e.pollDefault
+	if timeout > 0 {
+		pollTimeout = timeout
+	}
+
+	result, err := e.pollResultWithTimeout(ctx, cmdID, pollTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -96,13 +102,18 @@ func (e *FileExchange) ExecuteCommand(ctx context.Context, cmd, cwd string, time
 	return result, nil
 }
 
-func (e *FileExchange) pollResult(ctx context.Context, cmdID string) (*ResultFile, error) {
+func (e *FileExchange) pollResultWithTimeout(ctx context.Context, cmdID string, timeoutSeconds int) (*ResultFile, error) {
 	resultPath := "result-" + cmdID + ".json"
 	fullPath := e.commandDir + "/" + resultPath
 	pollInterval := time.Duration(e.pollInterval) * time.Second
-	timeout := time.Duration(e.pollDefault) * time.Second
+	var timeout time.Duration
+	if timeoutSeconds > 0 {
+		timeout = time.Duration(timeoutSeconds) * time.Second
+	} else {
+		timeout = time.Duration(e.pollDefault) * time.Second
+	}
 
-	log.Printf("[exchange] Polling for result at %s", fullPath)
+	log.Printf("[exchange] Polling for result at %s (timeout: %v)", fullPath, timeout)
 
 	if ctx == nil {
 		ctx = context.Background()

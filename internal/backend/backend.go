@@ -24,7 +24,7 @@ type FileTransferBackend interface {
 	Write(ctx context.Context, path string, content []byte) error
 	Delete(ctx context.Context, path string) error
 	SupportsExec() bool
-	Exec(ctx context.Context, cmd string, cwd string) (string, error)
+	Exec(ctx context.Context, cmd string, cwd string, timeout int) (string, error)
 	// Ping checks if remote watcher is alive by checking heartbeat file in commandDir
 	Ping(ctx context.Context, commandDir, watchID string) error
 }
