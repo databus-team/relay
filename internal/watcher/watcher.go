@@ -1,6 +1,7 @@
 package watcher
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -202,6 +203,7 @@ func (w *Watcher) processCommands(ctx context.Context) error {
 }
 
 func (w *Watcher) executeCommand(ctx context.Context, cmdPath string, b backend.FileTransferBackend) (*exchange.ResultFile, error) {
+	_ = ctx // keep ctx param for future use
 	data, err := b.Read(ctx, cmdPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read cmd file: %w", err)
@@ -212,29 +214,60 @@ func (w *Watcher) executeCommand(ctx context.Context, cmdPath string, b backend.
 		return nil, fmt.Errorf("failed to parse cmd file: %w", err)
 	}
 
-	log.Printf("[commands] Executing via MCP: %s (cwd: %s)", cmd.Cmd, cmd.Cwd)
+	log.Printf("[commands] Responder executing locally: %s (cwd: %s, timeout: %d)", cmd.Cmd, cmd.Cwd, cmd.Timeout)
 
 	var result exchange.ResultFile
 	result.ID = cmd.ID
 
-	if !b.SupportsExec() {
-		return nil, fmt.Errorf("backend does not support exec")
-	}
+	// Execute locally (this watcher acts as the responder)
+	stdout, stderr, exitCode := runLocalCommandCapture(cmd.Cmd, cmd.Cwd, cmd.Timeout)
+	result.Stdout = stdout
+	result.Stderr = stderr
+	result.ExitCode = exitCode
 
-	output, err := b.Exec(ctx, cmd.Cmd, cmd.Cwd, cmd.Timeout)
-	if err != nil {
-		result.Stderr = err.Error()
-		result.ExitCode = 1
-		result.Stdout = output
-		log.Printf("[commands] Command failed: %v", err)
-		return &result, nil
+	if exitCode != 0 {
+		log.Printf("[commands] Command failed (exit %d): %s", exitCode, strings.TrimSpace(stderr))
+	} else {
+		log.Printf("[commands] Command succeeded: %s", strings.TrimSpace(stdout))
 	}
-
-	result.Stdout = output
-	result.ExitCode = 0
-	log.Printf("[commands] Command succeeded: %s", strings.TrimSpace(result.Stdout))
 
 	return &result, nil
+}
+
+// runLocalCommandCapture runs cmd in shell with optional cwd and timeout (seconds).
+// Returns stdout, stderr and exit code.
+func runLocalCommandCapture(cmdStr, cwd string, timeout int) (string, string, int) {
+	if cmdStr == "" {
+		return "", "no command provided", 1
+	}
+
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+		defer cancel()
+	}
+
+	execCmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
+	if cwd != "" {
+		execCmd.Dir = cwd
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	execCmd.Stdout = &stdoutBuf
+	execCmd.Stderr = &stderrBuf
+
+	err := execCmd.Run()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return stdoutBuf.String(), stderrBuf.String(), exitErr.ExitCode()
+		}
+		if ctx.Err() == context.DeadlineExceeded {
+			return stdoutBuf.String(), stderrBuf.String() + " (timed out)", 124
+		}
+		return stdoutBuf.String(), stderrBuf.String() + " (" + err.Error() + ")", 1
+	}
+	return stdoutBuf.String(), stderrBuf.String(), 0
 }
 
 func (w *Watcher) processWatch(ctx context.Context, watchCfg config.WatchConfig) error {
