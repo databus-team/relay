@@ -1,18 +1,15 @@
-# Makefile for file-exchange
+# Makefile for relay
 
-BINARY_NAME := file-exchange
-BUILD_DIR := .
-MAIN_PATH := ./cmd/file-exchange
+BINARY_NAME := relay
+MAIN_PATH := ./cmd/relay
 
-# Go parameters
 GOCMD := go
 GOBUILD := $(GOCMD) build
 GOTEST := $(GOCMD) test
 GOCLEAN := $(GOCMD) clean
-GOGET := $(GOCMD) get
 GOMOD := $(GOCMD) mod
 
-.PHONY: all build test clean install fmt lint deps help
+.PHONY: all build test clean install fmt vet help
 
 all: build
 
@@ -52,34 +49,37 @@ deps:
 fmt:
 	$(GOCMD) fmt ./...
 
-## lint: Run linter (requires golangci-lint)
-lint:
-	golangci-lint run ./...
-
 ## vet: Run go vet
 vet:
 	$(GOCMD) vet ./...
 
-## run: Run the application
+## run: Run in daemon mode (continuous watch)
 run: build
-	./$(BINARY_NAME) watch --config ~/.file-exchange/config.yaml
+	./$(BINARY_NAME) watch
 
-## run-once: Run single iteration
-run-once: build
-	./$(BINARY_NAME) watch --config ~/.file-exchange/config.yaml --once
+## pull: Run single sync iteration
+pull:
+	./$(BINARY_NAME) pull --watch=<watch_id>
+
+## push: Push file to remote
+push:
+	./$(BINARY_NAME) push --watch=<watch_id> <source>
+
+## exec: Forward command to remote
+exec:
+	./$(BINARY_NAME) exec -w <watch_id> <command>
 
 ## help: Show this help
 help:
-	@echo "Makefile for file-exchange"
+	@grep -E '^[##]+' $< | head -20
 	@echo ""
 	@echo "Usage:"
 	@echo "  make build          Build the binary"
-	@echo "  make test          Run all tests"
-	@echo "  make clean         Clean build artifacts"
-	@echo "  make install       Install binary to GOPATH"
-	@echo "  make deps          Download dependencies"
-	@echo "  make fmt           Format code"
-	@echo "  make lint          Run linter"
-	@echo "  make run           Run in daemon mode"
-	@echo "  make run-once      Run single iteration"
-	@echo "  make help          Show this help"
+	@echo "  make test           Run all tests"
+	@echo "  make clean          Clean build artifacts"
+	@echo "  make install        Install binary to GOPATH"
+	@echo "  make deps           Download dependencies"
+	@echo "  make fmt            Format code"
+	@echo "  make vet            Run go vet"
+	@echo "  make run            Run in daemon mode"
+	@echo "  make help           Show this help"
