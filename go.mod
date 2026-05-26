@@ -1,4 +1,4 @@
-module github.com/user/file-exchange
+module github.com/user/relay
 
 go 1.25.0
 

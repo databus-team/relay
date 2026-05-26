@@ -11,19 +11,19 @@ import (
 	"syscall"
 
 	"github.com/alecthomas/kingpin/v2"
-	"github.com/user/file-exchange/internal/backend"
-	"github.com/user/file-exchange/internal/config"
-	"github.com/user/file-exchange/internal/watcher"
+	"github.com/user/relay/internal/backend"
+	"github.com/user/relay/internal/config"
+	"github.com/user/relay/internal/watcher"
 )
 
 var (
 	version = "1.0.0"
 
-	app = kingpin.New("file-exchange", "Generic File Exchange Command Execution System")
+	app = kingpin.New("relay", "Generic File Exchange Command Execution System")
 
 	_ = kingpin.CommandLine
 
-	configPath = kingpin.Flag("config", "Path to config file").Short('c').Default("~/.file-exchange/config.yaml").String()
+	configPath = kingpin.Flag("config", "Path to config file").Short('c').Default("~/.relay/config.yaml").String()
 	debugFlag  = kingpin.Flag("debug", "Enable debug mode").Bool()
 
 	// Watch command
