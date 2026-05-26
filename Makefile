@@ -13,9 +13,17 @@ GOMOD := $(GOCMD) mod
 
 all: build
 
-## build: Build the binary
+## build: Build the binary (development)
 build:
 	$(GOBUILD) -o $(BINARY_NAME) $(MAIN_PATH)
+
+## build-release: Build optimized binary for production
+build-release:
+	CGO_ENABLED=0 $(GOBUILD) -ldflags="-s -w" -o $(BINARY_NAME) $(MAIN_PATH)
+
+## build-windows: Cross-compile for Windows x64
+build-windows:
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GOBUILD) -ldflags="-s -w" -o $(BINARY_NAME).exe $(MAIN_PATH)
 
 ## build-debug: Build with debug symbols
 build-debug:
