@@ -114,8 +114,8 @@ func (b *FsMcpBackend) ensureConnection(ctx context.Context) error {
 
 	// Create Streamable HTTP transport
 	transport := &mcp.StreamableClientTransport{
-		Endpoint:            b.url,
-		HTTPClient:          httpClient,
+		Endpoint:             b.url,
+		HTTPClient:           httpClient,
 		DisableStandaloneSSE: true,
 	}
 
@@ -137,18 +137,18 @@ func (b *FsMcpBackend) ensureConnection(ctx context.Context) error {
 
 // ListDir regex patterns for parsing text output
 var (
-	listDirPattern   = regexp.MustCompile(`\[FILE\]\s+(.+?)\s+\(file://(.+?)\)\s+-\s+(\d+)\s+bytes`)
+	listDirPattern    = regexp.MustCompile(`\[FILE\]\s+(.+?)\s+\(file://(.+?)\)\s+-\s+(\d+)\s+bytes`)
 	listDirDirPattern = regexp.MustCompile(`\[DIR\]\s+(.+?)\s+\(file://(.+?)\)`)
 )
 
 // treeNode represents a node in the tree JSON structure
 type treeNode struct {
-	Name     string      `json:"name"`
-	Path     string      `json:"path"`
-	Type     string      `json:"type"`
-	Modified string      `json:"modified,omitempty"`
-	Size     int64       `json:"size,omitempty"`
-	Children []treeNode  `json:"children,omitempty"`
+	Name     string     `json:"name"`
+	Path     string     `json:"path"`
+	Type     string     `json:"type"`
+	Modified string     `json:"modified,omitempty"`
+	Size     int64      `json:"size,omitempty"`
+	Children []treeNode `json:"children,omitempty"`
 }
 
 func (b *FsMcpBackend) ListDir(ctx context.Context, path string) ([]FileInfo, error) {
@@ -396,7 +396,7 @@ func (b *FsMcpBackend) SupportsExec() bool {
 	return true
 }
 
-func (b *FsMcpBackend) Exec(ctx context.Context, cmd string, cwd string) (string, error) {
+func (b *FsMcpBackend) Exec(ctx context.Context, cmd string, cwd string, timeout int) (string, error) {
 	if err := b.ensureConnection(ctx); err != nil {
 		return "", err
 	}
@@ -405,7 +405,7 @@ func (b *FsMcpBackend) Exec(ctx context.Context, cmd string, cwd string) (string
 		b.exchanger = exchange.NewFileExchange(b, b.commandDir)
 	}
 
-	result, err := b.exchanger.ExecuteCommand(ctx, cmd, cwd, 0)
+	result, err := b.exchanger.ExecuteCommand(ctx, cmd, cwd, timeout)
 	if err != nil {
 		return "", err
 	}

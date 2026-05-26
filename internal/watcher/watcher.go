@@ -18,15 +18,15 @@ import (
 )
 
 type Watcher struct {
-	cfg       *config.Config
-	processed map[string]bool
+	cfg        *config.Config
+	processed  map[string]bool
 	jobResults map[string]bool
 }
 
 func New(cfg *config.Config) (*Watcher, error) {
 	return &Watcher{
-		cfg:       cfg,
-		processed: make(map[string]bool),
+		cfg:        cfg,
+		processed:  make(map[string]bool),
 		jobResults: make(map[string]bool),
 	}, nil
 }
@@ -221,7 +221,7 @@ func (w *Watcher) executeCommand(ctx context.Context, cmdPath string, b backend.
 		return nil, fmt.Errorf("backend does not support exec")
 	}
 
-	output, err := b.Exec(ctx, cmd.Cmd, cmd.Cwd)
+	output, err := b.Exec(ctx, cmd.Cmd, cmd.Cwd, cmd.Timeout)
 	if err != nil {
 		result.Stderr = err.Error()
 		result.ExitCode = 1
@@ -312,7 +312,9 @@ func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, file
 
 			// Try backend exec first (file exchange protocol)
 			if b.SupportsExec() {
-				output, err := b.Exec(ctx, cmd, cwd)
+				// Use job timeout if provided
+				timeout := job.Timeout
+				output, err := b.Exec(ctx, cmd, cwd, timeout)
 				if err != nil {
 					w.jobResults[job.ID] = false
 					return fmt.Errorf("exec job %s failed: %w", job.ID, err)

@@ -57,7 +57,19 @@ process_command() {
 
     local exit_code=0
     cd "$cwd"
-    eval "$cmd" > "$stdout_file" 2> "$stderr_file" || exit_code=$?
+
+    # Execute with timeout if available
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$timeout" sh -c "$cmd" > "$stdout_file" 2> "$stderr_file" || exit_code=$?
+    else
+        # Fallback: run command in background and kill after timeout
+        ( sh -c "$cmd" > "$stdout_file" 2> "$stderr_file" ) &
+        cmd_pid=$!
+        ( sleep "$timeout"; kill -9 "$cmd_pid" 2>/dev/null ) &
+        killer_pid=$!
+        wait $cmd_pid || exit_code=$?
+        kill -9 $killer_pid 2>/dev/null || true
+    fi
 
     local stdout stderr
     stdout=$(cat "$stdout_file")

@@ -29,26 +29,26 @@ var (
 	watchCmd = kingpin.Command("watch", "Watch remote directory and execute actions continuously")
 
 	// Pull command - download single file (requires filename)
-	pullCmd = kingpin.Command("pull", "Download single file from remote watch directory")
+	pullCmd   = kingpin.Command("pull", "Download single file from remote watch directory")
 	pullWatch = pullCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
-	pullFile = pullCmd.Arg("filename", "Remote filename to download").Required().String()
+	pullFile  = pullCmd.Arg("filename", "Remote filename to download").Required().String()
 
 	// List command - list remote directory
-	listCmd = kingpin.Command("list", "List files in remote watch directory")
+	listCmd   = kingpin.Command("list", "List files in remote watch directory")
 	listWatch = listCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
 
 	// Push command - upload files
-	pushCmd = kingpin.Command("push", "Push file to remote watch directory")
+	pushCmd   = kingpin.Command("push", "Push file to remote watch directory")
 	pushWatch = pushCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
-	pushSrc = pushCmd.Arg("source", "Source file to push").Required().String()
+	pushSrc   = pushCmd.Arg("source", "Source file to push").Required().String()
 
 	// Exec command - command forwarding (requires watch running)
-	execCmd = kingpin.Command("exec", "Forward command to remote backend")
-	execWatch = execCmd.Flag("watch", "Target watch ID").Short('w').String()
+	execCmd    = kingpin.Command("exec", "Forward command to remote backend")
+	execWatch  = execCmd.Flag("watch", "Target watch ID").Short('w').String()
 	execCmdStr = execCmd.Arg("command", "Command to execute").Required().String()
 
 	// Cleanup command - remove stale command files
-	cleanupCmd = kingpin.Command("cleanup", "Remove stale command and result files from remote")
+	cleanupCmd   = kingpin.Command("cleanup", "Remove stale command and result files from remote")
 	cleanupWatch = cleanupCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
 )
 
@@ -285,7 +285,7 @@ func runExec() {
 		fmt.Println("Note: Specify -w to check remote watcher before exec")
 	}
 
-	result, err := b.Exec(ctx, *execCmdStr, watchDir)
+	result, err := b.Exec(ctx, *execCmdStr, watchDir, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Exec error: %v\n", err)
 		os.Exit(1)
