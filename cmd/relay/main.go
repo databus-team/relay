@@ -46,6 +46,10 @@ var (
 	execCmd = kingpin.Command("exec", "Forward command to remote backend")
 	execWatch = execCmd.Flag("watch", "Target watch ID").Short('w').String()
 	execCmdStr = execCmd.Arg("command", "Command to execute").Required().String()
+
+	// Cleanup command - remove stale command files
+	cleanupCmd = kingpin.Command("cleanup", "Remove stale command and result files from remote")
+	cleanupWatch = cleanupCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
 )
 
 func main() {
@@ -66,6 +70,8 @@ func main() {
 		runExec()
 	case listCmd.FullCommand():
 		runList()
+	case cleanupCmd.FullCommand():
+		runCleanup()
 	case "help":
 		app.Usage(os.Args)
 	default:
@@ -254,6 +260,19 @@ func runExec() {
 	}
 
 	ctx := context.Background()
+
+	// Health check: verify remote watcher is running
+	fmt.Print("Checking remote watcher... ")
+	commandDir := "/commands"
+	if dir, ok := cfg.Backend.Config["command_dir"].(string); ok {
+		commandDir = dir
+	}
+	if err := b.Ping(ctx, commandDir); err != nil {
+		fmt.Fprintf(os.Stderr, "\nError: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("OK")
+
 	result, err := b.Exec(ctx, *execCmdStr, watchDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Exec error: %v\n", err)
@@ -312,4 +331,56 @@ func formatSize(bytes int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+func runCleanup() {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	_, err = cfg.GetWatchByID(*cleanupWatch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+		os.Exit(1)
+	}
+
+	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
+	commandDir := "/commands"
+	if dir, ok := cfg.Backend.Config["command_dir"].(string); ok {
+		commandDir = dir
+	}
+
+	files, err := b.ListDir(ctx, commandDir)
+	if err != nil {
+		// Directory doesn't exist or other error - nothing to clean
+		fmt.Println("No command files to clean up (command directory may not exist)")
+		return
+	}
+
+	var cleaned int
+	for _, f := range files {
+		if strings.HasPrefix(f.Name, "cmd-") || strings.HasPrefix(f.Name, "result-") {
+			filePath := commandDir + "/" + f.Name
+			if err := b.Delete(ctx, filePath); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to delete %s: %v\n", f.Name, err)
+			} else {
+				cleaned++
+				fmt.Printf("Deleted: %s\n", f.Name)
+			}
+		}
+	}
+
+	if cleaned == 0 {
+		fmt.Println("No stale command files found")
+	} else {
+		fmt.Printf("Cleanup complete: %d files removed\n", cleaned)
+	}
 }

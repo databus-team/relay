@@ -39,6 +39,11 @@ func (w *Watcher) Run(ctx context.Context) error {
 	ticker := time.NewTicker(time.Duration(w.cfg.Interval) * time.Second)
 	defer ticker.Stop()
 
+	// Start heartbeat goroutine
+	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
+	defer heartbeatCancel()
+	go w.heartbeat(heartbeatCtx)
+
 	if err := w.runOnce(ctx); err != nil {
 		log.Println("Initial watch error:", err)
 	}
@@ -50,6 +55,38 @@ func (w *Watcher) Run(ctx context.Context) error {
 		case <-ticker.C:
 			if err := w.runOnce(ctx); err != nil {
 				log.Printf("Watch error: %v", err)
+			}
+		}
+	}
+}
+
+func (w *Watcher) heartbeat(ctx context.Context) {
+	// Get command directory from backend config
+	commandDir := "/commands"
+	if dir, ok := w.cfg.Backend.Config["command_dir"].(string); ok && dir != "" && dir != "/" {
+		commandDir = dir
+	}
+
+	heartbeatPath := commandDir + "/.heartbeat"
+
+	// Create backend for heartbeat
+	b, err := backend.NewBackend(w.cfg.Backend.Type, w.cfg.Backend.Config)
+	if err != nil {
+		log.Printf("Heartbeat: failed to create backend: %v", err)
+		return
+	}
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			timestamp := time.Now().Format(time.RFC3339)
+			if err := b.Write(context.Background(), heartbeatPath, []byte(timestamp)); err != nil {
+				log.Printf("Heartbeat: failed to write heartbeat: %v", err)
 			}
 		}
 	}

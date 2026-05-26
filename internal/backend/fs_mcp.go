@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/user/relay/internal/exchange"
@@ -360,6 +361,33 @@ func (b *FsMcpBackend) Stat(ctx context.Context, path string) (interface{}, erro
 	}
 
 	return nil, ErrNotFound
+}
+
+func (b *FsMcpBackend) Ping(ctx context.Context, commandDir string) error {
+	if err := b.ensureConnection(ctx); err != nil {
+		return err
+	}
+
+	heartbeatPath := commandDir + "/.heartbeat"
+	data, err := b.Read(ctx, heartbeatPath)
+	if err != nil {
+		return fmt.Errorf("remote watcher appears to be offline (heartbeat file not found)")
+	}
+
+	// Parse timestamp from heartbeat file
+	timestamp := strings.TrimSpace(string(data))
+	heartbeatTime, parseErr := time.Parse(time.RFC3339, timestamp)
+	if parseErr != nil {
+		return fmt.Errorf("remote watcher appears to be offline (invalid heartbeat format)")
+	}
+
+	// Check if heartbeat is recent (within 15 seconds)
+	age := time.Since(heartbeatTime)
+	if age > 15*time.Second {
+		return fmt.Errorf("remote watcher appears to be offline (heartbeat age: %v)", age.Round(time.Second))
+	}
+
+	return nil
 }
 
 // Ensure fs_mcp backend is registered

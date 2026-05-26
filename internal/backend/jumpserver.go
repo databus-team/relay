@@ -294,6 +294,10 @@ func (b *JumpServerBackend) Stat(ctx context.Context, path string) (interface{},
 	return result.Data, nil
 }
 
+func (b *JumpServerBackend) Ping(ctx context.Context, commandDir string) error {
+	return ErrNotSupported
+}
+
 // Ensure jumpserver backend is registered
 func init() {
 	RegisterBackend("jumpserver", NewJumpServerBackend)
