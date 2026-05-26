@@ -7,6 +7,9 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/user/relay/internal/exchange"
@@ -128,6 +131,12 @@ func (b *FsMcpBackend) ensureConnection(ctx context.Context) error {
 	return nil
 }
 
+// ListDir regex patterns for parsing text output
+var (
+	listDirPattern   = regexp.MustCompile(`\[FILE\]\s+(.+?)\s+\(file://(.+?)\)\s+-\s+(\d+)\s+bytes`)
+	listDirDirPattern = regexp.MustCompile(`\[DIR\]\s+(.+?)\s+\(file://(.+?)\)`)
+)
+
 func (b *FsMcpBackend) ListDir(ctx context.Context, path string) ([]FileInfo, error) {
 	if err := b.ensureConnection(ctx); err != nil {
 		return nil, err
@@ -150,18 +159,53 @@ func (b *FsMcpBackend) ListDir(ctx context.Context, path string) ([]FileInfo, er
 		return []FileInfo{}, nil
 	}
 
-	// Parse the text content into FileInfo array
 	var files []FileInfo
 	for _, content := range result.Content {
 		if textContent, ok := content.(*mcp.TextContent); ok {
-			if err := json.Unmarshal([]byte(textContent.Text), &files); err != nil {
-				return nil, fmt.Errorf("failed to parse file list: %w", err)
+			// Try JSON first
+			if err := json.Unmarshal([]byte(textContent.Text), &files); err == nil && len(files) > 0 {
+				return files, nil
 			}
-			break
+
+			// Parse text format: [FILE] name (file://path) - N bytes
+			files = parseListOutput(textContent.Text)
+			if len(files) > 0 {
+				return files, nil
+			}
+
+			return nil, fmt.Errorf("failed to parse directory listing (raw: %s)", textContent.Text)
 		}
 	}
 
 	return files, nil
+}
+
+// parseListOutput parses MCP text output format to FileInfo slice
+func parseListOutput(text string) []FileInfo {
+	var files []FileInfo
+
+	// Parse files: [FILE] name (file://path) - N bytes
+	for _, match := range listDirPattern.FindAllStringSubmatch(text, -1) {
+		size, _ := strconv.ParseInt(match[3], 10, 64)
+		files = append(files, FileInfo{
+			Name:    strings.TrimSpace(match[1]),
+			IsDir:   false,
+			Size:    size,
+			ModTime: "",
+		})
+	}
+
+	// Parse directories: [DIR] name (file://path)
+	for _, match := range listDirDirPattern.FindAllStringSubmatch(text, -1) {
+		files = append(files, FileInfo{
+			Name:    strings.TrimSpace(match[1]),
+			IsDir:   true,
+			Size:    0,
+			ModTime: "",
+		})
+	}
+
+	return files
 }
 
 func (b *FsMcpBackend) Read(ctx context.Context, path string) ([]byte, error) {
