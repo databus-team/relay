@@ -12,7 +12,8 @@ backend:
 
 watch:
   - id: web-app-patches
-    watch_dir: /patches/web-app
+    watch_dir: /patches/web-app     # 远端 MCP 中转站目录
+    local_dir: /workspace/web-app  # 本机工作目录
     paths: ["*.patch"]
     jobs:
       - id: apply
@@ -25,6 +26,7 @@ watch:
 
   - id: api-service-patches
     watch_dir: /patches/api-service
+    local_dir: /workspace/api-service
     paths: ["*.patch"]
     jobs:
       - id: apply
