@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/user/file-exchange/internal/backend"
+	"github.com/user/relay/internal/backend"
 )
 
 type CmdFile struct {

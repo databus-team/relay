@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/user/file-exchange/internal/backend"
-	"github.com/user/file-exchange/internal/config"
+	"github.com/user/relay/internal/backend"
+	"github.com/user/relay/internal/config"
 	"golang.org/x/sync/errgroup"
 )
 
