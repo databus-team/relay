@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -77,6 +78,16 @@ func Load(path string) (*Config, error) {
 		cfg.Interval = 60
 	}
 
+	// Normalize MSYS-style paths (e.g. /d/...) when running on Windows
+	for i := range cfg.Watch {
+		cfg.Watch[i].LocalDir = normalizeWindowsPath(cfg.Watch[i].LocalDir)
+		for j := range cfg.Watch[i].Jobs {
+			if cfg.Watch[i].Jobs[j].Cwd != "" {
+				cfg.Watch[i].Jobs[j].Cwd = normalizeWindowsPath(cfg.Watch[i].Jobs[j].Cwd)
+			}
+		}
+	}
+
 	return &cfg, nil
 }
 
@@ -91,4 +102,21 @@ func (c *Config) GetWatchByID(id string) (*WatchConfig, error) {
 		}
 	}
 	return nil, fmt.Errorf("watch not found: %s", id)
+}
+
+func normalizeWindowsPath(p string) string {
+	if p == "" || runtime.GOOS != "windows" {
+		return p
+	}
+	// Convert MSYS-style /d/... to D:\...
+	if len(p) >= 3 && p[0] == '/' && isAlpha(p[1]) && (p[2] == '/' || p[2] == '\\') {
+		drive := strings.ToUpper(string(p[1]))
+		rest := p[2:]
+		return filepath.FromSlash(drive + ":" + rest)
+	}
+	return p
+}
+
+func isAlpha(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
