@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"time"
 )
 
@@ -62,6 +63,8 @@ func (e *FileExchange) SetTimeout(timeout int) {
 
 func (e *FileExchange) ExecuteCommand(ctx context.Context, cmd, cwd string, timeout int) (*ResultFile, error) {
 	cmdID := newUUID()
+	cmdPath := "cmd-" + cmdID + ".json"
+	fullCmdPath := e.commandDir + "/" + cmdPath
 
 	cmdFile := CmdFile{
 		ID:      cmdID,
@@ -75,8 +78,8 @@ func (e *FileExchange) ExecuteCommand(ctx context.Context, cmd, cwd string, time
 		return nil, err
 	}
 
-	cmdPath := "cmd-" + cmdID + ".json"
-	if err := e.backend.Write(ctx, e.commandDir+"/"+cmdPath, cmdData); err != nil {
+	log.Printf("[exchange] Writing cmd file: %s", fullCmdPath)
+	if err := e.backend.Write(ctx, fullCmdPath, cmdData); err != nil {
 		return nil, err
 	}
 
@@ -86,7 +89,8 @@ func (e *FileExchange) ExecuteCommand(ctx context.Context, cmd, cwd string, time
 	}
 
 	// Cleanup - ignore errors
-	_ = e.backend.Delete(ctx, e.commandDir+"/"+cmdPath)
+	log.Printf("[exchange] Cleaning up: %s and result-%s.json", cmdPath, cmdID)
+	_ = e.backend.Delete(ctx, fullCmdPath)
 	_ = e.backend.Delete(ctx, e.commandDir+"/result-"+cmdID+".json")
 
 	return result, nil
@@ -94,8 +98,11 @@ func (e *FileExchange) ExecuteCommand(ctx context.Context, cmd, cwd string, time
 
 func (e *FileExchange) pollResult(ctx context.Context, cmdID string) (*ResultFile, error) {
 	resultPath := "result-" + cmdID + ".json"
+	fullPath := e.commandDir + "/" + resultPath
 	pollInterval := time.Duration(e.pollInterval) * time.Second
 	timeout := time.Duration(e.pollDefault) * time.Second
+
+	log.Printf("[exchange] Polling for result at %s", fullPath)
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -111,7 +118,7 @@ func (e *FileExchange) pollResult(ctx context.Context, cmdID string) (*ResultFil
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-ticker.C:
-			data, err := e.backend.Read(ctx, e.commandDir+"/"+resultPath)
+			data, err := e.backend.Read(ctx, fullPath)
 			if err != nil {
 				continue
 			}

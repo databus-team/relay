@@ -294,7 +294,7 @@ func (b *JumpServerBackend) Stat(ctx context.Context, path string) (interface{},
 	return result.Data, nil
 }
 
-func (b *JumpServerBackend) Ping(ctx context.Context, commandDir string) error {
+func (b *JumpServerBackend) Ping(ctx context.Context, commandDir, watchID string) error {
 	return ErrNotSupported
 }
 

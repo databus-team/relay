@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/config"
+	"github.com/user/relay/internal/exchange"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -44,6 +46,11 @@ func (w *Watcher) Run(ctx context.Context) error {
 	defer heartbeatCancel()
 	go w.heartbeat(heartbeatCtx)
 
+	// Start command processor goroutine (check every 2 seconds)
+	cmdCtx, cmdCancel := context.WithCancel(ctx)
+	defer cmdCancel()
+	go w.processCommandsLoop(cmdCtx)
+
 	if err := w.runOnce(ctx); err != nil {
 		log.Println("Initial watch error:", err)
 	}
@@ -60,14 +67,28 @@ func (w *Watcher) Run(ctx context.Context) error {
 	}
 }
 
+func (w *Watcher) processCommandsLoop(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := w.processCommands(ctx); err != nil {
+				log.Printf("Process commands error: %v", err)
+			}
+		}
+	}
+}
+
 func (w *Watcher) heartbeat(ctx context.Context) {
-	// Get command directory from backend config
-	commandDir := "/commands"
+	// Get command directory from backend config, default to /tmp/relay-commands
+	commandDir := "/tmp/relay-commands"
 	if dir, ok := w.cfg.Backend.Config["command_dir"].(string); ok && dir != "" && dir != "/" {
 		commandDir = dir
 	}
-
-	heartbeatPath := commandDir + "/.heartbeat"
 
 	// Create backend for heartbeat
 	b, err := backend.NewBackend(w.cfg.Backend.Type, w.cfg.Backend.Config)
@@ -75,6 +96,8 @@ func (w *Watcher) heartbeat(ctx context.Context) {
 		log.Printf("Heartbeat: failed to create backend: %v", err)
 		return
 	}
+
+	heartbeatPath := commandDir + "/.heartbeat"
 
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -108,6 +131,7 @@ func (w *Watcher) RunOnceForWatch(ctx context.Context, watchID string) error {
 func (w *Watcher) runOnce(ctx context.Context) error {
 	g := &errgroup.Group{}
 
+	// Process watch directories (user files)
 	for _, watchCfg := range w.cfg.Watch {
 		g.Go(func() error {
 			return w.processWatch(ctx, watchCfg)
@@ -115,6 +139,101 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 	}
 
 	return g.Wait()
+}
+
+func (w *Watcher) processCommands(ctx context.Context) error {
+	commandDir := "/tmp/relay-commands"
+	if dir, ok := w.cfg.Backend.Config["command_dir"].(string); ok && dir != "" && dir != "/" {
+		commandDir = dir
+	}
+
+	b, err := backend.NewBackend(w.cfg.Backend.Type, w.cfg.Backend.Config)
+	if err != nil {
+		return fmt.Errorf("failed to create backend for commands: %w", err)
+	}
+
+	files, err := b.ListDir(ctx, commandDir)
+	if err != nil {
+		// Command directory might not exist yet
+		return nil
+	}
+
+	log.Printf("[commands] Found %d files in %s", len(files), commandDir)
+	for _, file := range files {
+		if file.IsDir {
+			continue
+		}
+
+		// Only process cmd-*.json files
+		if !strings.HasPrefix(file.Name, "cmd-") || !strings.HasSuffix(file.Name, ".json") {
+			continue
+		}
+
+		log.Printf("[commands] Processing %s", file.Name)
+
+		cmdPath := commandDir + "/" + file.Name
+		if w.processed[cmdPath] {
+			continue
+		}
+
+		w.processed[cmdPath] = true
+
+		// Execute command
+		result, err := w.executeCommand(ctx, cmdPath, b)
+		if err != nil {
+			log.Printf("Command failed %s: %v", file.Name, err)
+			delete(w.processed, cmdPath)
+		}
+
+		// Write result file
+		if result != nil {
+			resultPath := commandDir + "/result-" + result.ID + ".json"
+			result.CompletedAt = time.Now().Format(time.RFC3339)
+			resultData, _ := json.Marshal(result)
+			_ = b.Write(ctx, resultPath, resultData)
+		}
+
+		// Delete cmd file
+		_ = b.Delete(ctx, cmdPath)
+	}
+
+	return nil
+}
+
+func (w *Watcher) executeCommand(ctx context.Context, cmdPath string, b backend.FileTransferBackend) (*exchange.ResultFile, error) {
+	data, err := b.Read(ctx, cmdPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read cmd file: %w", err)
+	}
+
+	var cmd exchange.CmdFile
+	if err := json.Unmarshal(data, &cmd); err != nil {
+		return nil, fmt.Errorf("failed to parse cmd file: %w", err)
+	}
+
+	log.Printf("[commands] Executing via MCP: %s (cwd: %s)", cmd.Cmd, cmd.Cwd)
+
+	var result exchange.ResultFile
+	result.ID = cmd.ID
+
+	if !b.SupportsExec() {
+		return nil, fmt.Errorf("backend does not support exec")
+	}
+
+	output, err := b.Exec(ctx, cmd.Cmd, cmd.Cwd)
+	if err != nil {
+		result.Stderr = err.Error()
+		result.ExitCode = 1
+		result.Stdout = output
+		log.Printf("[commands] Command failed: %v", err)
+		return &result, nil
+	}
+
+	result.Stdout = output
+	result.ExitCode = 0
+	log.Printf("[commands] Command succeeded: %s", strings.TrimSpace(result.Stdout))
+
+	return &result, nil
 }
 
 func (w *Watcher) processWatch(ctx context.Context, watchCfg config.WatchConfig) error {
