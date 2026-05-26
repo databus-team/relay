@@ -173,7 +173,23 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 		})
 	}
 
-	return g.Wait()
+	err := g.Wait()
+
+	// Cleanup processed map to prevent unbounded growth
+	// Threshold: 5000 entries (~500KB for typical paths)
+	w.cleanupProcessedMap()
+
+	return err
+}
+
+// cleanupProcessedMap clears the processed map when it exceeds the threshold.
+// This prevents memory from growing indefinitely as files are processed over time.
+func (w *Watcher) cleanupProcessedMap() {
+	const maxProcessedEntries = 5000
+	if len(w.processed) > maxProcessedEntries {
+		w.processed = make(map[string]bool)
+		log.Printf("[watcher] Cleaned up processed map (had %d entries)", maxProcessedEntries)
+	}
 }
 
 func (w *Watcher) processCommands(ctx context.Context) (bool, error) {
