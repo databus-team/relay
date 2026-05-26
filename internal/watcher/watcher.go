@@ -370,7 +370,14 @@ func (w *Watcher) applyPendingConfig() error {
 		return fmt.Errorf("failed to atomic replace config: %w", err)
 	}
 
-	log.Printf("[watcher] Config applied from pending; reload takes effect next cycle")
+	// Reload config into memory
+	newCfg, err := config.LoadFromBytes(payload)
+	if err != nil {
+		return fmt.Errorf("failed to parse new config: %w", err)
+	}
+	w.cfg = newCfg
+
+	log.Printf("[watcher] Config applied and reloaded; changes take effect this cycle")
 	return nil
 }
 
