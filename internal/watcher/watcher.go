@@ -132,7 +132,8 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 	g := &errgroup.Group{}
 
 	// Process watch directories (user files)
-	for _, watchCfg := range w.cfg.Watch {
+	for i := range w.cfg.Watch {
+		watchCfg := w.cfg.Watch[i]
 		g.Go(func() error {
 			return w.processWatch(ctx, watchCfg)
 		})

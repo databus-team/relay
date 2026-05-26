@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-COMMAND_DIR="${COMMAND_DIR:-/commands}"
+COMMAND_DIR="${COMMAND_DIR:-/tmp/relay-commands}"
 POLL_INTERVAL="${POLL_INTERVAL:-2}"
 LOG_FILE="${LOG_FILE:-/var/log/command-responder.log}"
 
