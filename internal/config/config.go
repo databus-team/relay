@@ -80,10 +80,10 @@ func Load(path string) (*Config, error) {
 
 	// Normalize MSYS-style paths (e.g. /d/...) when running on Windows
 	for i := range cfg.Watch {
-		cfg.Watch[i].LocalDir = normalizeWindowsPath(cfg.Watch[i].LocalDir)
+		cfg.Watch[i].LocalDir = NormalizeWindowsPath(cfg.Watch[i].LocalDir)
 		for j := range cfg.Watch[i].Jobs {
 			if cfg.Watch[i].Jobs[j].Cwd != "" {
-				cfg.Watch[i].Jobs[j].Cwd = normalizeWindowsPath(cfg.Watch[i].Jobs[j].Cwd)
+				cfg.Watch[i].Jobs[j].Cwd = NormalizeWindowsPath(cfg.Watch[i].Jobs[j].Cwd)
 			}
 		}
 	}
@@ -104,7 +104,7 @@ func (c *Config) GetWatchByID(id string) (*WatchConfig, error) {
 	return nil, fmt.Errorf("watch not found: %s", id)
 }
 
-func normalizeWindowsPath(p string) string {
+func NormalizeWindowsPath(p string) string {
 	if p == "" || runtime.GOOS != "windows" {
 		return p
 	}
