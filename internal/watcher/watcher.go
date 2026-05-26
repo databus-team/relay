@@ -153,13 +153,24 @@ func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, file
 				cwd = substituteVariables(cwd, vars)
 			}
 
-			if err := w.runLocalCommand(cmd, cwd); err != nil {
-				w.jobResults[job.ID] = false
-				return fmt.Errorf("exec job %s failed: %w", job.ID, err)
+			// Try backend exec first (file exchange protocol)
+			if b.SupportsExec() {
+				output, err := b.Exec(ctx, cmd, cwd)
+				if err != nil {
+					w.jobResults[job.ID] = false
+					return fmt.Errorf("exec job %s failed: %w", job.ID, err)
+				}
+				w.jobResults[job.ID] = true
+				log.Printf("Exec job %s completed successfully: %s", job.ID, output)
+			} else {
+				// Fallback to local command execution
+				if err := w.runLocalCommand(cmd, cwd); err != nil {
+					w.jobResults[job.ID] = false
+					return fmt.Errorf("exec job %s failed: %w", job.ID, err)
+				}
+				w.jobResults[job.ID] = true
+				log.Printf("Exec job %s completed successfully (local)", job.ID)
 			}
-
-			w.jobResults[job.ID] = true
-			log.Printf("Exec job %s completed successfully", job.ID)
 
 		case "file_delete":
 			delPath := substituteVariables(job.Path, vars)

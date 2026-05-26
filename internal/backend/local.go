@@ -2,8 +2,10 @@ package backend
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 )
@@ -111,8 +113,16 @@ func (b *LocalBackend) SupportsExec() bool {
 	return true
 }
 
-func (b *LocalBackend) Exec(ctx context.Context, cmd string, workDir string) (string, error) {
-	return "", ErrNotSupported
+func (b *LocalBackend) Exec(ctx context.Context, cmd string, cwd string) (string, error) {
+	execCmd := exec.Command("sh", "-c", cmd)
+	if cwd != "" {
+		execCmd.Dir = cwd
+	}
+	output, err := execCmd.CombinedOutput()
+	if err != nil {
+		return string(output), fmt.Errorf("command failed: %w", err)
+	}
+	return string(output), nil
 }
 
 func (b *LocalBackend) Stat(ctx context.Context, path string) (fs.FileInfo, error) {

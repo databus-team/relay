@@ -174,7 +174,7 @@ func (b *JumpServerBackend) SupportsExec() bool {
 	return false
 }
 
-func (b *JumpServerBackend) Exec(ctx context.Context, cmd string, workDir string) (string, error) {
+func (b *JumpServerBackend) Exec(ctx context.Context, cmd string, cwd string) (string, error) {
 	return "", ErrNotSupported
 }
 

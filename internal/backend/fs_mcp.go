@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/user/relay/internal/exchange"
 )
 
 type FsMcpBackend struct {
@@ -17,6 +18,7 @@ type FsMcpBackend struct {
 	commandDir string
 	headers    map[string]string
 	session    *mcp.ClientSession
+	exchanger  *exchange.FileExchange
 }
 
 // Global debug flag - can be set via CLI
@@ -265,8 +267,25 @@ func (b *FsMcpBackend) SupportsExec() bool {
 	return true
 }
 
-func (b *FsMcpBackend) Exec(ctx context.Context, cmd string, workDir string) (string, error) {
-	return "", ErrNotSupported
+func (b *FsMcpBackend) Exec(ctx context.Context, cmd string, cwd string) (string, error) {
+	if err := b.ensureConnection(ctx); err != nil {
+		return "", err
+	}
+
+	if b.exchanger == nil {
+		b.exchanger = exchange.NewFileExchange(b, b.commandDir)
+	}
+
+	result, err := b.exchanger.ExecuteCommand(ctx, cmd, cwd, 0)
+	if err != nil {
+		return "", err
+	}
+
+	if result.ExitCode != 0 {
+		return "", fmt.Errorf("command failed with exit code %d: %s", result.ExitCode, result.Stderr)
+	}
+
+	return result.Stdout, nil
 }
 
 func (b *FsMcpBackend) Stat(ctx context.Context, path string) (interface{}, error) {
