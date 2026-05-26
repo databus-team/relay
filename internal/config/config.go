@@ -66,9 +66,19 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
+	return loadFromBytes(data)
+}
+
+// LoadFromBytes parses YAML content and applies defaults/normalization.
+// This is used for config validation without file I/O (e.g., hot reload).
+func LoadFromBytes(data []byte) (*Config, error) {
 	// Only expand $VAR and ${VAR} patterns, not {var} patterns
 	data = []byte(os.ExpandEnv(string(data)))
+	return loadFromBytes(data)
+}
 
+// loadFromBytes is the internal implementation shared by Load and LoadFromBytes.
+func loadFromBytes(data []byte) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)

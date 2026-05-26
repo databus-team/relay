@@ -3,6 +3,7 @@ package exchange
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"log"
@@ -21,6 +22,12 @@ type CmdFile struct {
 	Cmd     string `json:"cmd"`
 	Cwd     string `json:"cwd"`
 	Timeout int    `json:"timeout"`
+	// Op is the operation type for built-in commands. When Op is set,
+	// the Cmd/Cwd/Timeout fields may be empty and the operation is handled
+	// internally (e.g., "relay:config-sync" for config hot reload).
+	Op      string `json:"op,omitempty"`
+	// Payload holds base64-encoded content for built-in commands.
+	Payload string `json:"payload,omitempty"`
 }
 
 type ResultFile struct {
@@ -59,6 +66,18 @@ func (e *FileExchange) SetPollInterval(interval int) {
 
 func (e *FileExchange) SetTimeout(timeout int) {
 	e.pollDefault = timeout
+}
+
+// ConfigSyncOp is the operation identifier for config hot reload.
+const ConfigSyncOp = "relay:config-sync"
+
+// BuildConfigSyncCmd creates a CmdFile for config sync with base64-encoded payload.
+func BuildConfigSyncCmd(payload []byte) CmdFile {
+	return CmdFile{
+		ID:      newUUID(),
+		Op:      ConfigSyncOp,
+		Payload: base64.StdEncoding.EncodeToString(payload),
+	}
 }
 
 func (e *FileExchange) ExecuteCommand(ctx context.Context, cmd, cwd string, timeout int) (*ResultFile, error) {

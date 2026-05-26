@@ -3,13 +3,16 @@ package watcher
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/user/relay/internal/backend"
@@ -20,13 +23,18 @@ import (
 
 type Watcher struct {
 	cfg        *config.Config
+	configPath string // path to config file for backup/write operations
 	processed  map[string]bool
-	jobResults map[string]bool
+	jobResults  map[string]bool
+	// pendingConfig holds staged config for next cycle apply
+	pendingConfig     []byte
+	pendingConfigMu   sync.Mutex
 }
 
-func New(cfg *config.Config) (*Watcher, error) {
+func New(cfg *config.Config, configPath string) (*Watcher, error) {
 	return &Watcher{
 		cfg:        cfg,
+		configPath: configPath,
 		processed:  make(map[string]bool),
 		jobResults: make(map[string]bool),
 	}, nil
@@ -150,6 +158,11 @@ func (w *Watcher) RunOnceForWatch(ctx context.Context, watchID string) error {
 }
 
 func (w *Watcher) runOnce(ctx context.Context) error {
+	// Apply any pending config from sync before this cycle
+	if err := w.applyPendingConfig(); err != nil {
+		log.Printf("[watcher] Failed to apply pending config: %v", err)
+	}
+
 	g := &errgroup.Group{}
 
 	// Process watch directories (user files)
@@ -228,7 +241,6 @@ func (w *Watcher) processCommands(ctx context.Context) (bool, error) {
 }
 
 func (w *Watcher) executeCommand(ctx context.Context, cmdPath string, b backend.FileTransferBackend) (*exchange.ResultFile, error) {
-	_ = ctx // keep ctx param for future use
 	data, err := b.Read(ctx, cmdPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read cmd file: %w", err)
@@ -239,14 +251,19 @@ func (w *Watcher) executeCommand(ctx context.Context, cmdPath string, b backend.
 		return nil, fmt.Errorf("failed to parse cmd file: %w", err)
 	}
 
+	result := &exchange.ResultFile{ID: cmd.ID}
+
+	// Handle built-in config-sync command
+	if cmd.Op == exchange.ConfigSyncOp {
+		return w.handleConfigSync(ctx, cmd, b)
+	}
+
+	// Normal command execution
 	if cmd.Cwd != "" {
 		cmd.Cwd = config.NormalizeWindowsPath(cmd.Cwd)
 	}
 
 	log.Printf("[commands] Responder executing locally: %s (cwd: %s, timeout: %d)", cmd.Cmd, cmd.Cwd, cmd.Timeout)
-
-	var result exchange.ResultFile
-	result.ID = cmd.ID
 
 	// Execute locally (this watcher acts as the responder)
 	stdout, stderr, exitCode := runLocalCommandCapture(cmd.Cmd, cmd.Cwd, cmd.Timeout)
@@ -260,7 +277,101 @@ func (w *Watcher) executeCommand(ctx context.Context, cmdPath string, b backend.
 		log.Printf("[commands] Command succeeded: %s", strings.TrimSpace(stdout))
 	}
 
-	return &result, nil
+	return result, nil
+}
+
+// handleConfigSync processes the config-sync built-in command.
+func (w *Watcher) handleConfigSync(ctx context.Context, cmd exchange.CmdFile, b backend.FileTransferBackend) (*exchange.ResultFile, error) {
+	log.Printf("[commands] Handling config sync command: %s", cmd.ID)
+
+	result := &exchange.ResultFile{ID: cmd.ID}
+
+	// Decode base64 payload
+	payload, err := base64.StdEncoding.DecodeString(cmd.Payload)
+	if err != nil {
+		result.ExitCode = 1
+		result.Stderr = fmt.Sprintf("failed to decode config payload: %v", err)
+		log.Printf("[commands] Config sync failed (decode): %s", result.Stderr)
+		return result, nil
+	}
+
+	// Validate config using LoadFromBytes
+	newCfg, err := config.LoadFromBytes(payload)
+	if err != nil {
+		result.ExitCode = 1
+		result.Stderr = fmt.Sprintf("failed to parse config: %v", err)
+		log.Printf("[commands] Config sync failed (validation): %s", result.Stderr)
+		return result, nil
+	}
+	_ = newCfg // validated, actual apply happens on next cycle
+
+	// Check if configPath is available
+	if w.configPath == "" {
+		result.ExitCode = 1
+		result.Stderr = "config path not configured; watcher must be started with -c flag"
+		log.Printf("[commands] Config sync failed: %s", result.Stderr)
+		return result, nil
+	}
+
+	// Backup current config
+	backupPath := w.configPath + ".bak"
+	currentData, err := os.ReadFile(w.configPath)
+	if err != nil {
+		result.ExitCode = 1
+		result.Stderr = fmt.Sprintf("failed to read current config for backup: %v", err)
+		log.Printf("[commands] Config sync failed (backup read): %s", result.Stderr)
+		return result, nil
+	}
+
+	if err := os.WriteFile(backupPath, currentData, 0644); err != nil {
+		result.ExitCode = 1
+		result.Stderr = fmt.Sprintf("failed to write backup: %v", err)
+		log.Printf("[commands] Config sync failed (backup write): %s", result.Stderr)
+		return result, nil
+	}
+	log.Printf("[commands] Config backed up to: %s", backupPath)
+
+	// Stage pending config for next cycle
+	w.pendingConfigMu.Lock()
+	w.pendingConfig = payload
+	w.pendingConfigMu.Unlock()
+
+	result.ExitCode = 0
+	result.Stdout = "config staged for next cycle; backup at " + backupPath
+	log.Printf("[commands] Config sync succeeded; staging %d bytes for next cycle", len(payload))
+
+	return result, nil
+}
+
+// applyPendingConfig applies staged config if available, called before each runOnce.
+func (w *Watcher) applyPendingConfig() error {
+	w.pendingConfigMu.Lock()
+	if w.pendingConfig == nil {
+		w.pendingConfigMu.Unlock()
+		return nil
+	}
+	payload := w.pendingConfig
+	w.pendingConfig = nil
+	w.pendingConfigMu.Unlock()
+
+	if w.configPath == "" {
+		log.Printf("[watcher] Cannot apply pending config: configPath not set")
+		return nil
+	}
+
+	// Write new config using atomic rename
+	tmpPath := w.configPath + ".tmp"
+	if err := os.WriteFile(tmpPath, payload, 0644); err != nil {
+		return fmt.Errorf("failed to write temp config: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, w.configPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("failed to atomic replace config: %w", err)
+	}
+
+	log.Printf("[watcher] Config applied from pending; reload takes effect next cycle")
+	return nil
 }
 
 // runLocalCommandCapture runs cmd in shell with optional cwd and timeout (seconds).

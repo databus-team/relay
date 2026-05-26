@@ -2,16 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/config"
+	"github.com/user/relay/internal/exchange"
 	"github.com/user/relay/internal/watcher"
 )
 
@@ -50,6 +53,9 @@ var (
 	// Cleanup command - remove stale command files
 	cleanupCmd   = kingpin.Command("cleanup", "Remove stale command and result files from remote")
 	cleanupWatch = cleanupCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
+
+	// Sync command - push config to remote watcher for hot reload
+	syncCmd = kingpin.Command("sync", "Push config to remote watcher for hot reload")
 )
 
 func main() {
@@ -74,6 +80,8 @@ func main() {
 		runCleanup()
 	case "help":
 		app.Usage(os.Args)
+	case syncCmd.FullCommand():
+		runSync()
 	default:
 		app.Usage(os.Args)
 	}
@@ -98,7 +106,7 @@ func runWatch() {
 		cancel()
 	}()
 
-	w, err := watcher.New(cfg)
+	w, err := watcher.New(cfg, *configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create watcher: %v\n", err)
 		os.Exit(1)
@@ -394,5 +402,100 @@ func runCleanup() {
 		fmt.Println("No stale command files found")
 	} else {
 		fmt.Printf("Cleanup complete: %d files removed\n", cleaned)
+	}
+}
+
+func runSync() {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Get command directory
+	commandDir := "/tmp/relay-commands"
+	if dir, ok := cfg.Backend.Config["command_dir"].(string); ok && dir != "" {
+		commandDir = dir
+	}
+
+	// Read local config file
+	configData, err := os.ReadFile(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read config file: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Expand environment variables in config content
+	configData = []byte(os.ExpandEnv(string(configData)))
+
+	// Create backend for file exchange
+	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Build config-sync command
+	cmdFile := exchange.BuildConfigSyncCmd(configData)
+	cmdPath := "cmd-" + cmdFile.ID + ".json"
+	fullCmdPath := commandDir + "/" + cmdPath
+
+	// Write command file
+	cmdData, err := json.Marshal(cmdFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to marshal command: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Pushing config to watcher (command_dir: %s)...\n", commandDir)
+	if err := b.Write(context.Background(), fullCmdPath, cmdData); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to write command file: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Poll for result
+	resultPath := "result-" + cmdFile.ID + ".json"
+	fullResultPath := commandDir + "/" + resultPath
+	pollInterval := 2 * time.Second
+	timeout := 300 * time.Second
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Fprintf(os.Stderr, "Timeout waiting for watcher response\n")
+			os.Exit(1)
+		case <-ticker.C:
+			data, err := b.Read(context.Background(), fullResultPath)
+			if err != nil {
+				continue
+			}
+
+			var result exchange.ResultFile
+			if err := json.Unmarshal(data, &result); err != nil {
+				continue
+			}
+
+			if result.ID != cmdFile.ID {
+				continue
+			}
+
+			// Got result - cleanup and report
+			_ = b.Delete(context.Background(), fullCmdPath)
+			_ = b.Delete(context.Background(), fullResultPath)
+
+			if result.ExitCode != 0 {
+				fmt.Fprintf(os.Stderr, "Sync failed: %s\n", result.Stderr)
+				os.Exit(1)
+			}
+
+			fmt.Printf("Sync successful: %s\n", result.Stdout)
+			return
+		}
 	}
 }

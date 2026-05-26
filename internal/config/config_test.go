@@ -22,11 +22,11 @@ backend:
     base_dir: /tmp
     command_dir: /commands
 
-watchers:
-  - name: Test
-    on:
-      file_match: "*.txt"
-      watch_dir: /tmp
+watch:
+  - id: test
+    watch_dir: /tmp
+    paths: ["*.txt"]
+    local_dir: /tmp
     jobs:
       - id: test
         type: exec
@@ -55,10 +55,10 @@ interval_seconds: 60
 	if cfg.Backend.Type != "local" {
 		t.Errorf("Expected backend type 'local', got '%s'", cfg.Backend.Type)
 	}
-	if len(cfg.Watchers) != 1 {
-		t.Errorf("Expected 1 watcher, got %d", len(cfg.Watchers))
+	if len(cfg.Watch) != 1 {
+		t.Errorf("Expected 1 watcher, got %d", len(cfg.Watch))
 	}
-	if cfg.Watchers[0].Name != "Test" {
-		t.Errorf("Expected watcher name 'Test', got '%s'", cfg.Watchers[0].Name)
+	if cfg.Watch[0].ID != "test" {
+		t.Errorf("Expected watcher id 'test', got '%s'", cfg.Watch[0].ID)
 	}
 }

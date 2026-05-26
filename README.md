@@ -82,6 +82,39 @@ file-exchange exec "npm run build"
 
 If you pass `-w <watch-id>`, the command runs with that watch's `local_dir` as the working directory.
 
+### Sync - Config Hot Reload
+
+Push a new config to a running watcher without restarting it.
+
+```bash
+file-exchange sync
+```
+
+The watcher must be started with `-c` to own the config path. The `command_dir` must be consistent between watcher and CLI (default: `/tmp/relay-commands`).
+
+**How it works:**
+
+1. CLI reads the local config file and sends it via the command exchange channel
+2. Watcher validates the config, creates a backup at `<configPath>.bak`, and stages the new config
+3. New config applies on the next watch cycle (not immediately)
+
+**Requirements:**
+
+- Watcher must be running and started with `-c` flag
+- `command_dir` in backend config must match between watcher and CLI
+- On validation failure, current config is preserved (no changes made)
+
+**Example:**
+
+```bash
+# Start watcher with config
+file-exchange watch -c ~/.relay/config.yaml
+
+# In another terminal, update config and sync
+# Edit ~/.relay/config.yaml, then:
+file-exchange sync -c ~/.relay/config.yaml
+```
+
 ## Config Structure
 
 | Field | Description |
