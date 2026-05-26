@@ -24,7 +24,7 @@ type FileTransferBackend interface {
 	Write(ctx context.Context, path string, content []byte) error
 	Delete(ctx context.Context, path string) error
 	SupportsExec() bool
-	Exec(ctx context.Context, cmd string, workDir string) (string, error)
+	Exec(ctx context.Context, cmd string, cwd string) (string, error)
 }
 
 type BackendFactory func(config map[string]interface{}) (FileTransferBackend, error)
