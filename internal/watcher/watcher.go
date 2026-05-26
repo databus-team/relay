@@ -69,17 +69,37 @@ func (w *Watcher) Run(ctx context.Context) error {
 }
 
 func (w *Watcher) processCommandsLoop(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
+	minInterval := 2 * time.Second
+	maxInterval := 30 * time.Second
+	interval := minInterval
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			if err := w.processCommands(ctx); err != nil {
+		case <-timer.C:
+			hasWork, err := w.processCommands(ctx)
+			if err != nil {
 				log.Printf("Process commands error: %v", err)
 			}
+			if hasWork {
+				interval = minInterval
+			} else {
+				interval *= 2
+				if interval > maxInterval {
+					interval = maxInterval
+				}
+			}
+			stopped := timer.Stop()
+			if !stopped {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(interval)
 		}
 	}
 }
@@ -143,7 +163,7 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 	return g.Wait()
 }
 
-func (w *Watcher) processCommands(ctx context.Context) error {
+func (w *Watcher) processCommands(ctx context.Context) (bool, error) {
 	commandDir := "/tmp/relay-commands"
 	if dir, ok := w.cfg.Backend.Config["command_dir"].(string); ok && dir != "" && dir != "/" {
 		commandDir = dir
@@ -151,16 +171,17 @@ func (w *Watcher) processCommands(ctx context.Context) error {
 
 	b, err := backend.NewBackend(w.cfg.Backend.Type, w.cfg.Backend.Config)
 	if err != nil {
-		return fmt.Errorf("failed to create backend for commands: %w", err)
+		return false, fmt.Errorf("failed to create backend for commands: %w", err)
 	}
 
 	files, err := b.ListDir(ctx, commandDir)
 	if err != nil {
 		// Command directory might not exist yet
-		return nil
+		return false, nil
 	}
 
 	log.Printf("[commands] Found %d files in %s", len(files), commandDir)
+	foundCmd := false
 	for _, file := range files {
 		if file.IsDir {
 			continue
@@ -170,6 +191,7 @@ func (w *Watcher) processCommands(ctx context.Context) error {
 		if !strings.HasPrefix(file.Name, "cmd-") || !strings.HasSuffix(file.Name, ".json") {
 			continue
 		}
+		foundCmd = true
 
 		log.Printf("[commands] Processing %s", file.Name)
 
@@ -199,7 +221,7 @@ func (w *Watcher) processCommands(ctx context.Context) error {
 		_ = b.Delete(ctx, cmdPath)
 	}
 
-	return nil
+	return foundCmd, nil
 }
 
 func (w *Watcher) executeCommand(ctx context.Context, cmdPath string, b backend.FileTransferBackend) (*exchange.ResultFile, error) {
