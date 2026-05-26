@@ -214,6 +214,10 @@ func (w *Watcher) executeCommand(ctx context.Context, cmdPath string, b backend.
 		return nil, fmt.Errorf("failed to parse cmd file: %w", err)
 	}
 
+	if cmd.Cwd != "" {
+		cmd.Cwd = config.NormalizeWindowsPath(cmd.Cwd)
+	}
+
 	log.Printf("[commands] Responder executing locally: %s (cwd: %s, timeout: %d)", cmd.Cmd, cmd.Cwd, cmd.Timeout)
 
 	var result exchange.ResultFile
