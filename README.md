@@ -78,6 +78,8 @@ file-exchange push -d projects/app/patches ./my.patch
 file-exchange exec "npm run build"
 ```
 
+If you pass `-w <watch-id>`, the command runs with that watch's `local_dir` as the working directory.
+
 ## Config Structure
 
 | Field | Description |

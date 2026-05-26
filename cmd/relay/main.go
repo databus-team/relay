@@ -238,14 +238,14 @@ func runExec() {
 		os.Exit(1)
 	}
 
-	var watchDir string
+	var execCwd string
 	if *execWatch != "" {
 		watchCfg, err := cfg.GetWatchByID(*execWatch)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 			os.Exit(1)
 		}
-		watchDir = watchCfg.WatchDir
+		execCwd = watchCfg.LocalDir
 	}
 
 	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
@@ -285,7 +285,7 @@ func runExec() {
 		fmt.Println("Note: Specify -w to check remote watcher before exec")
 	}
 
-	result, err := b.Exec(ctx, *execCmdStr, watchDir, 0)
+	result, err := b.Exec(ctx, *execCmdStr, execCwd, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Exec error: %v\n", err)
 		os.Exit(1)
