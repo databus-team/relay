@@ -73,6 +73,10 @@ pull:
 list:
 	./$(BINARY_NAME) list -c config.yaml -w <watch_id>
 
+## cleanup: Remove stale command files from remote
+cleanup:
+	./$(BINARY_NAME) cleanup -c config.yaml -w <watch_id>
+
 ## push: Push file to remote
 push:
 	./$(BINARY_NAME) push --watch=<watch_id> <source>

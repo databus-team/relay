@@ -25,6 +25,8 @@ type FileTransferBackend interface {
 	Delete(ctx context.Context, path string) error
 	SupportsExec() bool
 	Exec(ctx context.Context, cmd string, cwd string) (string, error)
+	// Ping checks if remote watcher is alive by writing a marker and waiting for processing
+	Ping(ctx context.Context, commandDir string) error
 }
 
 type BackendFactory func(config map[string]interface{}) (FileTransferBackend, error)

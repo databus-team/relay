@@ -129,3 +129,8 @@ func (b *LocalBackend) Stat(ctx context.Context, path string) (fs.FileInfo, erro
 	fullPath := filepath.Join(b.baseDir, path)
 	return os.Stat(fullPath)
 }
+
+func (b *LocalBackend) Ping(ctx context.Context, commandDir string) error {
+	// Local backend always has watcher if this process is running
+	return nil
+}
