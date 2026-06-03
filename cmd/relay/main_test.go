@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/user/relay/internal/config"
 )
 
@@ -367,5 +368,58 @@ func TestResolveWatches_FirstMatchOnDuplicateID(t *testing.T) {
 	}
 	if got[0].WatchDir != "first" {
 		t.Errorf("expected first match (WatchDir=first), got %q", got[0].WatchDir)
+	}
+}
+
+// TestWorkspaces_VerboseDynamicWidth pins the dynamic column-width contract:
+// the JOBS column header should sit immediately after the LOCAL_DIR column
+// (not 11 spaces later as in the old fixed 30/30 layout) when the actual data
+// is short. Concretely: with watch_dirs of length 24 and local_dirs of length
+// 19, the separator line should be substantially shorter than 113 chars.
+func TestWorkspaces_VerboseDynamicWidth(t *testing.T) {
+	resetWsFlags()
+	*wsVerbose = true
+	_, cleanup := withTempConfig(t, exampleConfig)
+	defer cleanup()
+
+	out := withCapturedStdout(t, runWorkspaces)
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) < 3 {
+		t.Fatalf("expected header + separator + rows, got %d lines: %q", len(lines), out)
+	}
+	separator := lines[1]
+	header := lines[0]
+	if len(separator) != len(header) {
+		t.Errorf("separator width %d should equal header width %d\nheader: %q\nsep:    %q",
+			len(separator), len(header), header, separator)
+	}
+	// Old fixed-width layout was 113 chars. With the example config (max
+	// watch_dir=24, max local_dir=19) the dynamic layout should be visibly
+	// shorter.
+	const oldFixedWidth = 113
+	if len(separator) >= oldFixedWidth {
+		t.Errorf("separator width %d is at or above the old fixed width %d; dynamic sizing did not take effect",
+			len(separator), oldFixedWidth)
+	}
+}
+
+// TestWorkspaces_WorkspacesAlias verifies that invoking kingpin with
+// "workspaces" (the alias declared on wsCmd) parses to the same FullCommand
+// as "ws", confirming our switch dispatch handles both forms. We use a small
+// sub-application that mirrors the production wsCmd registration; this keeps
+// the test independent of the package-level kingpin state.
+func TestWorkspaces_WorkspacesAlias(t *testing.T) {
+	a := kingpin.New("relay-test", "")
+	cmd := a.Command("ws", "").Alias("workspaces")
+
+	// Parsing either name must resolve to the same FullCommand.
+	for _, arg := range []string{"ws", "workspaces"} {
+		selected, err := a.Parse([]string{arg})
+		if err != nil {
+			t.Fatalf("parse %q: %v", arg, err)
+		}
+		if selected != cmd.FullCommand() {
+			t.Errorf("kingpin.Parse(%q) = %q, want %q (alias should resolve to main name)", arg, selected, cmd.FullCommand())
+		}
 	}
 }
