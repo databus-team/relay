@@ -58,7 +58,7 @@ var (
 	syncCmd = kingpin.Command("sync", "Push config to remote watcher for hot reload")
 
 	// Workspaces command - list configured workspaces from config
-	wsCmd     = kingpin.Command("ws", "List configured workspaces from config")
+	wsCmd     = kingpin.Command("ws", "List configured workspaces from config").Alias("workspaces")
 	wsName    = wsCmd.Flag("name", "Show details for a specific workspace ID").String()
 	wsJSON    = wsCmd.Flag("json", "Output as JSON").Bool()
 	wsVerbose = wsCmd.Flag("verbose", "Show detailed table output").Short('v').Bool()
@@ -303,27 +303,41 @@ func toWorkspaceJSON(w config.WatchConfig) workspaceJSON {
 	}
 }
 
-// printWorkspacesTable renders a fixed-width 4-column summary of configured
-// workspaces. Column widths follow the runList precedent (cmd/relay/main.go
-// runList): values longer than the column width are truncated by fmt's %-Ns.
+// printWorkspacesTable renders a 4-column summary of configured workspaces
+// with column widths sized to the longest cell in each column (subject to a
+// min width equal to the column header). A row that exceeds its column width
+// is truncated by fmt's %-*s.
 func printWorkspacesTable(watches []config.WatchConfig) {
-	const (
-		idWidth     = 40
-		remoteWidth = 30
-		localWidth  = 30
-		jobsWidth   = 5
-		jobsFieldW  = 10 // visual width of the JOBS column, including leading spaces
-	)
-	separator := strings.Repeat("-", idWidth+1+remoteWidth+1+localWidth+1+jobsFieldW)
+	idW := len("ID")
+	remoteW := len("REMOTE_DIR")
+	localW := len("LOCAL_DIR")
+	jobsW := len("JOBS")
+	for _, w := range watches {
+		if n := len(w.ID); n > idW {
+			idW = n
+		}
+		if n := len(w.WatchDir); n > remoteW {
+			remoteW = n
+		}
+		if n := len(w.LocalDir); n > localW {
+			localW = n
+		}
+	}
 
-	fmt.Printf("%-*s %-*s %-*s %*s\n", idWidth, "ID", remoteWidth, "REMOTE_DIR", localWidth, "LOCAL_DIR", jobsFieldW, "JOBS")
+	// Right-aligned numeric column gets a small extra pad so it doesn't sit
+	// flush against the previous column's data.
+	const jobsFieldExtra = 4
+
+	separator := strings.Repeat("-", idW+1+remoteW+1+localW+1+jobsW+jobsFieldExtra)
+
+	fmt.Printf("%-*s %-*s %-*s %*s\n", idW, "ID", remoteW, "REMOTE_DIR", localW, "LOCAL_DIR", jobsW+jobsFieldExtra, "JOBS")
 	fmt.Println(separator)
 	for _, w := range watches {
 		fmt.Printf("%-*s %-*s %-*s %*d\n",
-			idWidth, w.ID,
-			remoteWidth, w.WatchDir,
-			localWidth, w.LocalDir,
-			jobsFieldW, len(w.Jobs),
+			idW, w.ID,
+			remoteW, w.WatchDir,
+			localW, w.LocalDir,
+			jobsW+jobsFieldExtra, len(w.Jobs),
 		)
 	}
 }
