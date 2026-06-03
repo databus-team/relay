@@ -58,7 +58,8 @@ var (
 	syncCmd = kingpin.Command("sync", "Push config to remote watcher for hot reload")
 
 	// Workspaces command - list configured workspaces from config
-	wsCmd     = kingpin.Command("ws", "List configured workspaces from config").Alias("workspaces")
+	// (alias: `workspaces`; kingpin v2 doesn't render aliases in --help)
+	wsCmd     = kingpin.Command("ws", "List configured workspaces from config (alias: workspaces)").Alias("workspaces")
 	wsName    = wsCmd.Flag("name", "Show details for a specific workspace ID").String()
 	wsJSON    = wsCmd.Flag("json", "Output as JSON").Bool()
 	wsVerbose = wsCmd.Flag("verbose", "Show detailed table output").Short('v').Bool()
