@@ -56,6 +56,12 @@ var (
 
 	// Sync command - push config to remote watcher for hot reload
 	syncCmd = kingpin.Command("sync", "Push config to remote watcher for hot reload")
+
+	// Workspaces command - list configured workspaces from config
+	wsCmd     = kingpin.Command("ws", "List configured workspaces from config")
+	wsName    = wsCmd.Flag("name", "Show details for a specific workspace ID").String()
+	wsJSON    = wsCmd.Flag("json", "Output as JSON").Bool()
+	wsVerbose = wsCmd.Flag("verbose", "Show detailed table output").Short('v').Bool()
 )
 
 func main() {
@@ -82,6 +88,8 @@ func main() {
 		app.Usage(os.Args)
 	case syncCmd.FullCommand():
 		runSync()
+	case wsCmd.FullCommand():
+		runWorkspaces()
 	default:
 		app.Usage(os.Args)
 	}
@@ -195,6 +203,128 @@ func runList() {
 			dirMarker = "d"
 		}
 		fmt.Printf("%-40s %10s  %s [%s]\n", f.Name, formatSize(f.Size), f.ModTime, dirMarker)
+	}
+}
+
+func runWorkspaces() {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	watches, err := resolveWatches(cfg, *wsName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to find workspace: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *wsJSON {
+		out := make([]workspaceJSON, len(watches))
+		for i, w := range watches {
+			out[i] = toWorkspaceJSON(w)
+		}
+		data, err := json.MarshalIndent(out, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to marshal workspaces: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(data))
+		return
+	}
+
+	if *wsVerbose {
+		printWorkspacesTable(watches)
+		return
+	}
+
+	for _, w := range watches {
+		fmt.Println(w.ID)
+	}
+}
+
+// resolveWatches returns the slice of workspaces to render. When name is
+// non-empty it looks up the single matching workspace; when name is empty it
+// returns the full list. Errors propagate from config.GetWatchByID (e.g. "watch
+// not found: <id>") so callers can surface them with their own exit handling.
+func resolveWatches(cfg *config.Config, name string) ([]config.WatchConfig, error) {
+	if name == "" {
+		return cfg.Watch, nil
+	}
+	w, err := cfg.GetWatchByID(name)
+	if err != nil {
+		return nil, err
+	}
+	return []config.WatchConfig{*w}, nil
+}
+
+// workspaceJSON is the on-the-wire shape for `relay ws --json`. It mirrors
+// config.WatchConfig but uses lower-case JSON keys so consumers can pipe into
+// jq / scripts without depending on Go's default field capitalization.
+type workspaceJSON struct {
+	ID       string             `json:"id"`
+	WatchDir string             `json:"watch_dir"`
+	LocalDir string             `json:"local_dir"`
+	Paths    []string           `json:"paths"`
+	Jobs     []jobConfigJSON    `json:"jobs"`
+}
+
+type jobConfigJSON struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Cmd      string `json:"cmd,omitempty"`
+	Cwd      string `json:"cwd,omitempty"`
+	Path     string `json:"path,omitempty"`
+	If       string `json:"if,omitempty"`
+	KeepFile bool   `json:"keep_file"`
+	Timeout  int    `json:"timeout,omitempty"`
+}
+
+func toWorkspaceJSON(w config.WatchConfig) workspaceJSON {
+	jobs := make([]jobConfigJSON, len(w.Jobs))
+	for i, j := range w.Jobs {
+		jobs[i] = jobConfigJSON{
+			ID:       j.ID,
+			Type:     j.Type,
+			Cmd:      j.Cmd,
+			Cwd:      j.Cwd,
+			Path:     j.Path,
+			If:       j.If,
+			KeepFile: j.KeepFile,
+			Timeout:  j.Timeout,
+		}
+	}
+	return workspaceJSON{
+		ID:       w.ID,
+		WatchDir: w.WatchDir,
+		LocalDir: w.LocalDir,
+		Paths:    w.Paths,
+		Jobs:     jobs,
+	}
+}
+
+// printWorkspacesTable renders a fixed-width 4-column summary of configured
+// workspaces. Column widths follow the runList precedent (cmd/relay/main.go
+// runList): values longer than the column width are truncated by fmt's %-Ns.
+func printWorkspacesTable(watches []config.WatchConfig) {
+	const (
+		idWidth     = 40
+		remoteWidth = 30
+		localWidth  = 30
+		jobsWidth   = 5
+		jobsFieldW  = 10 // visual width of the JOBS column, including leading spaces
+	)
+	separator := strings.Repeat("-", idWidth+1+remoteWidth+1+localWidth+1+jobsFieldW)
+
+	fmt.Printf("%-*s %-*s %-*s %*s\n", idWidth, "ID", remoteWidth, "REMOTE_DIR", localWidth, "LOCAL_DIR", jobsFieldW, "JOBS")
+	fmt.Println(separator)
+	for _, w := range watches {
+		fmt.Printf("%-*s %-*s %-*s %*d\n",
+			idWidth, w.ID,
+			remoteWidth, w.WatchDir,
+			localWidth, w.LocalDir,
+			jobsFieldW, len(w.Jobs),
+		)
 	}
 }
 
