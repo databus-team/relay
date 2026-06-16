@@ -13,6 +13,8 @@ import (
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/user/relay/internal/backend"
+	_ "github.com/user/relay/internal/relay/backend"
+	_ "github.com/user/relay/internal/relay/server"
 	"github.com/user/relay/internal/config"
 	"github.com/user/relay/internal/exchange"
 	"github.com/user/relay/internal/watcher"
@@ -89,6 +91,9 @@ func main() {
 		app.Usage(os.Args)
 	case syncCmd.FullCommand():
 		runSync()
+	
+	case serverCmd.FullCommand():
+		runServer()
 	case wsCmd.FullCommand():
 		runWorkspaces()
 	default:
@@ -97,6 +102,7 @@ func main() {
 }
 
 func runWatch() {
+	ctx := context.Background()
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
