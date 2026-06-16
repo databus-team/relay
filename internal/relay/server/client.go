@@ -239,8 +239,13 @@ func (c *Client) handleStreamData(msg protocol.Message) {
 	
 	if sd.Offset != stream.received { return }
 	
-	stream.buf = append(stream.buf, sd.Data...)
-	stream.received += int64(len(sd.Data))
+	chunkData, err := protocol.Decompress(sd.Data)
+	if err != nil {
+		chunkData = sd.Data
+	}
+	
+	stream.buf = append(stream.buf, chunkData...)
+	stream.received += int64(len(chunkData))
 	
 	if len(stream.buf) > 64*1024 {
 		os.MkdirAll(filepath.Dir(stream.tmpPath), 0755)
@@ -338,7 +343,7 @@ func (c *Client) handlePull(msg protocol.Message) {
 	
 	c.Send(protocol.Message{
 		Type: protocol.MsgStreamStart, ID: uuid.New().String(), RequestID: msg.ID, StreamID: streamID,
-		Payload: protocol.StreamStart{StreamID: streamID, Total: info.Size(), Offset: 0, Remaining: info.Size()},
+		Payload: protocol.StreamStart{StreamID: streamID, Total: info.Size(), Offset: 0, Remaining: info.Size(), Compressed: true},
 	})
 	
 	f, err := os.Open(fullPath)
@@ -356,9 +361,10 @@ func (c *Client) handlePull(msg protocol.Message) {
 		n, err := f.Read(buf)
 		if n > 0 {
 			hasher.Write(buf[:n])
+			compressed := protocol.Compress(buf[:n])
 			c.Send(protocol.Message{
 				Type: protocol.MsgStreamData, ID: uuid.New().String(), StreamID: streamID,
-				Payload: protocol.StreamData{StreamID: streamID, Offset: offset, Data: buf[:n], Chunk: chunk},
+				Payload: protocol.StreamData{StreamID: streamID, Offset: offset, Data: compressed, Chunk: chunk},
 			})
 			offset += int64(n)
 			chunk++
