@@ -45,6 +45,14 @@ func (w *Watcher) createBackend(watchCfg config.WatchConfig) (backend.FileTransf
 }
 
 func (w *Watcher) Run(ctx context.Context) error {
+	probeBackend, err := backend.NewBackend(w.cfg.Backend.Type, w.cfg.Backend.Config)
+	if err == nil {
+		if eb, ok := probeBackend.(backend.EventBackend); ok {
+			log.Println("Starting watcher in event-driven mode")
+			return w.runEventDriven(ctx, eb)
+		}
+	}
+
 	log.Println("Starting watcher with interval:", w.cfg.Interval, "seconds")
 
 	ticker := time.NewTicker(time.Duration(w.cfg.Interval) * time.Second)
@@ -74,6 +82,80 @@ func (w *Watcher) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (w *Watcher) runEventDriven(ctx context.Context, eb backend.EventBackend) error {
+	if err := eb.SubscribeEvents(ctx); err != nil {
+		return fmt.Errorf("subscribe events: %w", err)
+	}
+
+	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
+	defer heartbeatCancel()
+	go w.heartbeat(heartbeatCtx)
+
+	cmdCtx, cmdCancel := context.WithCancel(ctx)
+	defer cmdCancel()
+	go w.processCommandsLoop(cmdCtx)
+
+	debounce := make(map[string]*time.Timer)
+	var debounceMu sync.Mutex
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case fi, ok := <-eb.Events():
+			if !ok {
+				return fmt.Errorf("event channel closed")
+			}
+
+			watchCfg := w.findWatchForEvent(fi)
+			if watchCfg == nil {
+				continue
+			}
+
+			if !w.matchAnyPattern(fi.Name, watchCfg.Paths) {
+				continue
+			}
+
+			filePath := watchCfg.WatchDir + "/" + fi.Name
+
+			debounceMu.Lock()
+			if timer, exists := debounce[filePath]; exists {
+				timer.Stop()
+			}
+			debounce[filePath] = time.AfterFunc(500*time.Millisecond, func() {
+				debounceMu.Lock()
+				delete(debounce, filePath)
+				debounceMu.Unlock()
+
+				if w.processed[filePath] {
+					return
+				}
+				w.processed[filePath] = true
+				w.jobResults = make(map[string]bool)
+
+				b, err := w.createBackend(*watchCfg)
+				if err != nil {
+					log.Printf("Event: failed to create backend: %v", err)
+					return
+				}
+
+				if err := w.executeJobs(ctx, watchCfg.Jobs, filePath, fi.Name, watchCfg.WatchDir, watchCfg.LocalDir, b); err != nil {
+					log.Printf("Event job failed for %s: %v", filePath, err)
+					delete(w.processed, filePath)
+				}
+			})
+			debounceMu.Unlock()
+		}
+	}
+}
+
+func (w *Watcher) findWatchForEvent(fi backend.FileInfo) *config.WatchConfig {
+	for i := range w.cfg.Watch {
+		return &w.cfg.Watch[i]
+	}
+	return nil
 }
 
 func (w *Watcher) processCommandsLoop(ctx context.Context) {

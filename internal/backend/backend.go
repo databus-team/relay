@@ -29,6 +29,16 @@ type FileTransferBackend interface {
 	Ping(ctx context.Context, commandDir, watchID string) error
 }
 
+// EventBackend is an optional interface for backends that support
+// event-driven file watching. The watcher checks for this interface
+// and uses events instead of polling when available.
+type EventBackend interface {
+	// Events returns a channel of file change events from the remote server.
+	Events() <-chan FileInfo
+	// SubscribeEvents starts receiving events for the configured watch.
+	SubscribeEvents(ctx context.Context) error
+}
+
 type BackendFactory func(config map[string]interface{}) (FileTransferBackend, error)
 
 var backends = make(map[string]BackendFactory)
