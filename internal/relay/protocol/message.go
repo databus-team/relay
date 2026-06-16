@@ -158,11 +158,12 @@ type SubscribedResponse struct {
 
 // StreamStart 流开始
 type StreamStart struct {
-	StreamID  string `json:"stream_id"`
-	Total     int64  `json:"total"`
-	Offset    int64  `json:"offset"`
-	Remaining int64  `json:"remaining"`
-	Digest    string `json:"digest,omitempty"`
+	StreamID   string `json:"stream_id"`
+	Total      int64  `json:"total"`
+	Offset     int64  `json:"offset"`
+	Remaining  int64  `json:"remaining"`
+	Digest     string `json:"digest,omitempty"`
+	Compressed bool   `json:"compressed,omitempty"`
 }
 
 // StreamData 流数据块
