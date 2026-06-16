@@ -14,13 +14,14 @@ import (
 )
 
 type receiveStream struct {
-	streamID string
-	buf      bytes.Buffer
-	doneCh   chan struct{}
-	errCh    chan error
-	digest   string
-	total    int64
-	mu       sync.Mutex
+	streamID   string
+	buf        bytes.Buffer
+	doneCh     chan struct{}
+	errCh      chan error
+	digest     string
+	total      int64
+	compressed bool
+	mu         sync.Mutex
 }
 
 func (c *Client) Pull(ctx context.Context, path string) ([]byte, error) {
@@ -130,6 +131,9 @@ func (c *Client) Push(ctx context.Context, path string, data []byte) error {
 			end = total
 		}
 
+		chunkData := data[offset:end]
+		compressed := protocol.Compress(chunkData)
+
 		dataMsg := &Message{
 			Type:     protocol.MsgStreamData,
 			ID:       uuid.New().String(),
@@ -137,7 +141,7 @@ func (c *Client) Push(ctx context.Context, path string, data []byte) error {
 			Payload: protocol.StreamData{
 				StreamID: streamID,
 				Offset:   offset,
-				Data:     data[offset:end],
+				Data:     compressed,
 				Chunk:    chunk,
 			},
 		}
@@ -201,6 +205,7 @@ func (c *Client) handleStreamStart(msg Message) {
 
 	rs.mu.Lock()
 	rs.total = start.Total
+	rs.compressed = start.Compressed
 	rs.mu.Unlock()
 }
 
@@ -220,8 +225,21 @@ func (c *Client) handleStreamData(msg Message) {
 		return
 	}
 
+	chunkData := sd.Data
+	if rs.compressed {
+		decompressed, err := protocol.Decompress(sd.Data)
+		if err != nil {
+			select {
+			case rs.errCh <- fmt.Errorf("decompress: %w", err):
+			default:
+			}
+			return
+		}
+		chunkData = decompressed
+	}
+
 	rs.mu.Lock()
-	rs.buf.Write(sd.Data)
+	rs.buf.Write(chunkData)
 	rs.mu.Unlock()
 }
 
