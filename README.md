@@ -2,20 +2,20 @@
 
 Generic File Exchange Command Execution System
 
-A Go-based daemon for monitoring remote directories and executing actions when files matching patterns are detected. Supports pluggable backends (local, MCP, JumpServer) and config hot-reload without restart.
+A Go-based daemon for monitoring remote directories and executing actions when files matching patterns are detected. Supports pluggable backends (native relay WebSocket, local, MCP, JumpServer) and config hot-reload without restart.
 
 ## Features
 
-- **Watch Mode**: Monitor multiple remote directories, trigger exec/file_delete jobs on file pattern matches
+- **Watch Mode**: Monitor remote directories, trigger exec/file_delete jobs on file pattern matches
+- **Event-Driven Mode**: Real-time file change events via WebSocket (relay backend) — no polling
 - **Multiple Paths**: One watch supports multiple file glob patterns
 - **Multiple Jobs**: Each watch supports a chain of jobs with conditional execution (`if: jobs.X.success/failure`)
-- **Push Mode**: Upload files/directories to remote storage
-- **Pull Mode**: Download single files from remote storage
-- **List Mode**: List remote directory contents
-- **Exec Mode**: Forward commands to remote backend
+- **Push/Pull**: Upload and download files with streaming transfer and zstd compression
+- **Remote Exec**: Forward commands to remote server via WebSocket
 - **Config Hot-Reload**: Push config to a running watcher without restart
-- **Pluggable Backends**: Local filesystem, MCP SDK (HTTP SSE), JumpServer API
+- **Pluggable Backends**: Local filesystem, native relay (WebSocket), MCP SDK (HTTP SSE), JumpServer API
 - **Backend Auto-Discovery**: New backends register via `init()` — no switch/enum dispatch
+- **Connection Resilience**: Automatic reconnection with exponential backoff, heartbeat health checks
 
 ## Installation
 
@@ -27,11 +27,14 @@ go install ./cmd/relay
 
 ## Backends
 
-| Backend | Type | Exec Support | Description |
-|---------|------|-------------|-------------|
-| `local` | built-in | yes | Local filesystem with `base_dir` and `command_dir` |
-| `fs_mcp` | plugin | yes | MCP SDK backend over HTTP SSE with `remote_root`, `url`, custom headers |
-| `jumpserver` | plugin | no | JumpServer REST API with token auth and auto-login |
+| Backend | Type | Exec | Events | Description |
+|---------|------|------|--------|-------------|
+| `relay` | plugin | yes | yes | Native WebSocket protocol — streaming, zstd compression, real-time events |
+| `local` | built-in | yes | no | Local filesystem with `base_dir` and `command_dir` |
+| `fs-mcp` | plugin | yes | no | MCP SDK backend over HTTP SSE |
+| `jumpserver` | plugin | no | no | JumpServer REST API with token auth |
+
+When using the `relay` backend, the watcher automatically switches from polling to **event-driven mode** — file changes are pushed in real-time via WebSocket instead of periodic directory listing.
 
 ## Configuration
 
@@ -144,6 +147,93 @@ relay sync -c ~/.relay/config.yaml
 - Watcher must be running and started with `-c` flag
 - `command_dir` must be consistent between watcher and CLI (default: `/tmp/relay-commands`)
 - On validation failure, current config is preserved (no changes made)
+
+### server — Relay Server
+
+Run the relay server that serves file storage and event broadcasting.
+
+```bash
+# With YAML config file
+relay server --config server.yaml
+
+# With CLI flags only
+relay server --addr :8443 --watch web-app:/data/web-app --token secret
+
+# CLI flags override config file values
+relay server --config server.yaml --addr :9000
+```
+
+**Server config** (`server.yaml`):
+
+```yaml
+addr: ":8443"
+
+watch:
+  - id: web-app-patches
+    dir: /data/relay/web-app/patches
+  - id: api-service-patches
+    dir: /data/relay/api-service/patches
+
+auth:
+  tokens:
+    - "${RELAY_TOKEN}"
+
+tls:
+  enabled: false
+  cert_file: ""
+  key_file: ""
+```
+
+Environment variables (`$VAR`, `${VAR}`) are expanded in all string values.
+
+### ws — List Workspaces
+
+```bash
+relay ws              # list workspace IDs
+relay ws -v           # verbose table with remote/local dirs and job counts
+relay ws --json       # output as JSON
+relay ws -w web-app   # details for a specific workspace
+```
+
+## Relay Backend Configuration
+
+When using the `relay` backend, configure the WebSocket connection to the relay server:
+
+```yaml
+backend:
+  type: relay
+  config:
+    url: "wss://server:8443/relay"     # WebSocket URL
+    token: "${RELAY_TOKEN}"            # authentication token
+    watch_id: web-app-patches          # watch ID to subscribe to on server
+    watch_dir: .                       # remote directory (relative to server's watch dir)
+    command_dir: /tmp/relay-commands   # command directory for config hot-reload
+```
+
+| Field | Description |
+|-------|-------------|
+| `url` | WebSocket URL (`ws://` or `wss://`) |
+| `token` | Auth token (must match server config) |
+| `watch_id` | Server-side watch ID to subscribe to |
+| `watch_dir` | Remote directory path (relative to server's watch dir) |
+| `command_dir` | Shared directory for config sync commands |
+
+**Transfer features** (automatic, no config needed):
+- 64KB chunked streaming for large files
+- zstd compression on all chunks
+- WebSocket binary frames (no base64 overhead)
+- SHA256 digest verification
+- Exponential backoff reconnection (1s→30s, 10 retries)
+- 30s heartbeat with 90s timeout
+
+## Example Configs
+
+| File | Description |
+|------|-------------|
+| `config.example.relay.yaml` | Client config with native relay backend |
+| `config.example.fs-mcp.relay.yaml` | Client config with MCP backend |
+| `config.example.jumpserver.relay.yaml` | Client config with JumpServer backend |
+| `server.example.yaml` | Server configuration |
 
 ## Config Structure
 

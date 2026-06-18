@@ -1,0 +1,34 @@
+# relay server configuration
+
+# Listen address
+addr: ":8443"
+
+# Watch directories — each maps an ID to a filesystem path
+watch:
+  - id: web-app-patches
+    dir: /data/relay/web-app/patches
+  - id: web-app-deploy
+    dir: /data/relay/web-app/deploy
+  - id: api-service-patches
+    dir: /data/relay/api-service/patches
+
+# Authentication
+auth:
+  tokens:
+    - "${RELAY_TOKEN}"
+
+# TLS (optional)
+tls:
+  enabled: false
+  cert_file: ""
+  key_file: ""
+
+# Usage:
+#   relay server --config server.yaml
+#
+# CLI flags override config file values:
+#   relay server --config server.yaml --addr :9000 --token secret
+#   relay server --watch myapp:/data/app --token mytoken
+#
+# Environment variables are expanded in all string values:
+#   RELAY_TOKEN=my-secret relay server --config server.yaml
