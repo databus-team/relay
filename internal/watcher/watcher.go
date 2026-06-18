@@ -144,6 +144,12 @@ func (w *Watcher) runEventDriven(ctx context.Context, eb backend.EventBackend) e
 				if err := w.executeJobs(ctx, watchCfg.Jobs, filePath, fi.Name, watchCfg.WatchDir, watchCfg.LocalDir, b); err != nil {
 					log.Printf("Event job failed for %s: %v", filePath, err)
 					delete(w.processed, filePath)
+				} else if watchCfg.AutoCleanup {
+					if err := b.Delete(ctx, filePath); err != nil {
+						log.Printf("Auto-cleanup failed for %s: %v", filePath, err)
+					} else {
+						log.Printf("Auto-cleanup: deleted %s", filePath)
+					}
 				}
 			})
 			debounceMu.Unlock()
@@ -540,6 +546,12 @@ func (w *Watcher) processWatch(ctx context.Context, watchCfg config.WatchConfig)
 		if err := w.executeJobs(ctx, watchCfg.Jobs, filePath, file.Name, watchCfg.WatchDir, watchCfg.LocalDir, b); err != nil {
 			log.Printf("Job failed for %s: %v (file left untouched)", filePath, err)
 			delete(w.processed, filePath)
+		} else if watchCfg.AutoCleanup {
+			if err := b.Delete(ctx, filePath); err != nil {
+				log.Printf("Auto-cleanup failed for %s: %v", filePath, err)
+			} else {
+				log.Printf("Auto-cleanup: deleted %s", filePath)
+			}
 		}
 	}
 

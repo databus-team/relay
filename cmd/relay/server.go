@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/user/relay/internal/config"
@@ -28,8 +29,9 @@ var (
 type serverYAMLConfig struct {
 	Addr  string `yaml:"addr"`
 	Watch []struct {
-		ID  string `yaml:"id"`
-		Dir string `yaml:"dir"`
+		ID  string        `yaml:"id"`
+		Dir string        `yaml:"dir"`
+		TTL time.Duration `yaml:"ttl"`
 	} `yaml:"watch"`
 	Auth struct {
 		Tokens []string `yaml:"tokens"`
@@ -71,7 +73,7 @@ func runServer() error {
 
 	watchDirs := make([]server.WatchDirConfig, 0)
 	for _, w := range fileCfg.Watch {
-		watchDirs = append(watchDirs, server.WatchDirConfig{ID: w.ID, Dir: w.Dir})
+		watchDirs = append(watchDirs, server.WatchDirConfig{ID: w.ID, Dir: w.Dir, TTL: w.TTL})
 	}
 	for _, wd := range *serverWatchDirs {
 		parts := strings.SplitN(wd, ":", 2)
