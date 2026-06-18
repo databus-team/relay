@@ -7,10 +7,13 @@ addr: ":8443"
 watch:
   - id: web-app-patches
     dir: /data/relay/web-app/patches
+    ttl: 30m                  # auto-delete files older than 30 minutes
   - id: web-app-deploy
     dir: /data/relay/web-app/deploy
+    ttl: 1h                   # auto-delete after 1 hour
   - id: api-service-patches
     dir: /data/relay/api-service/patches
+    # no ttl = files kept indefinitely
 
 # Authentication
 auth:
