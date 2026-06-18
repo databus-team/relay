@@ -61,15 +61,28 @@ func (c *Client) readLoop() {
 	defer c.conn.Close()
 	
 	for {
-		_, data, err := c.conn.ReadMessage()
+		msgType, data, err := c.conn.ReadMessage()
 		if err != nil {
 			return
+		}
+		
+		if msgType == websocket.BinaryMessage {
+			continue
 		}
 		
 		var msg protocol.Message
 		if err := json.Unmarshal(data, &msg); err != nil {
 			c.SendError("", "invalid message")
 			continue
+		}
+		
+		if msg.Type == protocol.MsgStreamData {
+			binType, binData, err := c.conn.ReadMessage()
+			if err == nil && binType == websocket.BinaryMessage {
+				if payload, ok := msg.Payload.(map[string]interface{}); ok {
+					payload["data"] = binData
+				}
+			}
 		}
 		
 		c.handleMessage(msg)
@@ -232,16 +245,19 @@ func (c *Client) handleStreamData(msg protocol.Message) {
 	
 	if !ok || stream == nil { return }
 	
-	payloadData, err := json.Marshal(msg.Payload)
-	if err != nil { return }
-	var sd protocol.StreamData
-	if err := json.Unmarshal(payloadData, &sd); err != nil { return }
+	payload, _ := msg.Payload.(map[string]interface{})
+	offset := toFloat64(payload["offset"])
 	
-	if sd.Offset != stream.received { return }
+	if int64(offset) != stream.received { return }
 	
-	chunkData, err := protocol.Decompress(sd.Data)
-	if err != nil {
-		chunkData = sd.Data
+	var chunkData []byte
+	if raw, ok := payload["data"].([]byte); ok {
+		decompressed, err := protocol.Decompress(raw)
+		if err == nil {
+			chunkData = decompressed
+		} else {
+			chunkData = raw
+		}
 	}
 	
 	stream.buf = append(stream.buf, chunkData...)
@@ -291,6 +307,16 @@ func (c *Client) Send(msg protocol.Message) error {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 	return c.conn.WriteJSON(msg)
+}
+
+// SendBinary sends a JSON message followed by a binary frame
+func (c *Client) SendBinary(msg protocol.Message, raw []byte) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	if err := c.conn.WriteJSON(msg); err != nil {
+		return err
+	}
+	return c.conn.WriteMessage(websocket.BinaryMessage, raw)
 }
 
 // SendResponse 发送响应
@@ -362,10 +388,10 @@ func (c *Client) handlePull(msg protocol.Message) {
 		if n > 0 {
 			hasher.Write(buf[:n])
 			compressed := protocol.Compress(buf[:n])
-			c.Send(protocol.Message{
+			c.SendBinary(protocol.Message{
 				Type: protocol.MsgStreamData, ID: uuid.New().String(), StreamID: streamID,
-				Payload: protocol.StreamData{StreamID: streamID, Offset: offset, Data: compressed, Chunk: chunk},
-			})
+				Payload: protocol.StreamData{StreamID: streamID, Offset: offset, Chunk: chunk},
+			}, compressed)
 			offset += int64(n)
 			chunk++
 		}

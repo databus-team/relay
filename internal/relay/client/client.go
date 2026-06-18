@@ -19,7 +19,7 @@ type Client struct {
 	conn      *websocket.Conn
 	connected atomic.Bool
 
-	sendCh      chan *protocol.Message
+	sendCh      chan sendMsg
 	recvCh      chan *protocol.Message
 	eventCh     chan protocol.FileEvent
 	pending     map[string]chan *protocol.Response
@@ -39,7 +39,7 @@ func New(url, token, watchID string) (*Client, error) {
 		url:          url,
 		token:        token,
 		watchID:      watchID,
-		sendCh:       make(chan *protocol.Message, 100),
+		sendCh:       make(chan sendMsg, 100),
 		recvCh:       make(chan *protocol.Message, 100),
 		eventCh:      make(chan protocol.FileEvent, 100),
 		pending:      make(map[string]chan *protocol.Response),
@@ -113,11 +113,15 @@ func (c *Client) CloseCh() <-chan struct{} {
 
 func (c *Client) readLoop() {
 	for {
-		_, data, err := c.conn.ReadMessage()
+		msgType, data, err := c.conn.ReadMessage()
 		if err != nil {
 			c.connected.Store(false)
 			go c.reconnectLoop(context.Background())
 			return
+		}
+
+		if msgType == websocket.BinaryMessage {
+			continue
 		}
 
 		var msg protocol.Message
@@ -125,14 +129,37 @@ func (c *Client) readLoop() {
 			continue
 		}
 
+		if msg.Type == protocol.MsgStreamData {
+			binType, binData, err := c.conn.ReadMessage()
+			if err != nil {
+				continue
+			}
+			if binType == websocket.BinaryMessage {
+				c.attachBinaryToStreamData(&msg, binData)
+			}
+		}
+
 		c.handleMessage(msg)
 	}
 }
 
+func (c *Client) attachBinaryToStreamData(msg *protocol.Message, raw []byte) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+	payload["data"] = raw
+}
+
 func (c *Client) writeLoop() {
-	for msg := range c.sendCh {
-		if err := c.conn.WriteJSON(msg); err != nil {
+	for sm := range c.sendCh {
+		if err := c.conn.WriteJSON(sm.Message); err != nil {
 			continue
+		}
+		if len(sm.Raw) > 0 {
+			if err := c.conn.WriteMessage(websocket.BinaryMessage, sm.Raw); err != nil {
+				continue
+			}
 		}
 	}
 }
@@ -226,7 +253,7 @@ func (c *Client) Request(ctx context.Context, msgType protocol.MessageType, payl
 	}()
 
 	select {
-	case c.sendCh <- msg:
+	case c.sendCh <- sendMsg{Message: msg}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -252,7 +279,7 @@ func (c *Client) sendAndWait(ctx context.Context, msg *protocol.Message) (*proto
 	}()
 
 	select {
-	case c.sendCh <- msg:
+	case c.sendCh <- sendMsg{Message: msg}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
