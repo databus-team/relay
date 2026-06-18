@@ -31,13 +31,13 @@ func (c *Client) startHeartbeat(ctx context.Context) {
 				return
 			}
 
-			c.sendCh <- &Message{
+			c.sendCh <- sendMsg{Message: &Message{
 				Type: protocol.MsgPing,
 				ID:   uuid.New().String(),
 				Payload: protocol.Heartbeat{
 					Timestamp: now,
 				},
-			}
+			}}
 		}
 	}
 }

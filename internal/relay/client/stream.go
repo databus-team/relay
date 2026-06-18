@@ -67,7 +67,7 @@ func (c *Client) Pull(ctx context.Context, path string) ([]byte, error) {
 	}
 
 	select {
-	case c.sendCh <- msg:
+	case c.sendCh <- sendMsg{Message: msg}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -141,13 +141,12 @@ func (c *Client) Push(ctx context.Context, path string, data []byte) error {
 			Payload: protocol.StreamData{
 				StreamID: streamID,
 				Offset:   offset,
-				Data:     compressed,
 				Chunk:    chunk,
 			},
 		}
 
 		select {
-		case c.sendCh <- dataMsg:
+		case c.sendCh <- sendMsg{Message: dataMsg, Raw: compressed}:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -174,7 +173,7 @@ func (c *Client) Push(ctx context.Context, path string, data []byte) error {
 	c.streamMu.Unlock()
 
 	select {
-	case c.sendCh <- endMsg:
+	case c.sendCh <- sendMsg{Message: endMsg}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -212,11 +211,6 @@ func (c *Client) handleStreamStart(msg Message) {
 func (c *Client) handleStreamData(msg Message) {
 	streamID := msg.StreamID
 
-	payload, _ := msg.Payload.(map[string]interface{})
-	data, _ := json.Marshal(payload)
-	var sd protocol.StreamData
-	json.Unmarshal(data, &sd)
-
 	c.streamMu.RLock()
 	rs, ok := c.streams[streamID]
 	c.streamMu.RUnlock()
@@ -225,9 +219,16 @@ func (c *Client) handleStreamData(msg Message) {
 		return
 	}
 
-	chunkData := sd.Data
+	payload, _ := msg.Payload.(map[string]interface{})
+	var chunkData []byte
+	if raw, ok := payload["data"].([]byte); ok {
+		chunkData = raw
+	} else {
+		return
+	}
+
 	if rs.compressed {
-		decompressed, err := protocol.Decompress(sd.Data)
+		decompressed, err := protocol.Decompress(chunkData)
 		if err != nil {
 			select {
 			case rs.errCh <- fmt.Errorf("decompress: %w", err):
