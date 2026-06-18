@@ -1,15 +1,21 @@
 name: relay
 version: 1
 
+# Example: native relay backend
+# WebSocket-based relay server with streaming, compression, and event push
 backend:
-  type: local
+  type: relay
   config:
-    base_dir: /path/to/remote/storage
+    url: ${RELAY_SERVER_URL}          # ws://host:port/relay or wss://...
+    token: ${RELAY_TOKEN}
+    watch_id: web-app-patches          # subscribe to this watch on server
+    watch_dir: .                       # remote watch directory (relative to server's watch dir)
+    command_dir: /tmp/relay-commands   # shared command directory for hot-reload
 
 watch:
   - id: web-app-patches
-    watch_dir: projects/web-app/patches   # 远端中转站目录
-    local_dir: /path/to/local/repo       # 本机工作目录
+    watch_dir: .                       # relative to server's watch dir root
+    local_dir: /path/to/local/repo
     paths: ["*.patch"]
     jobs:
       - id: apply
@@ -21,7 +27,7 @@ watch:
         if: jobs.apply.success
 
   - id: web-app-deploy
-    watch_dir: projects/web-app/deploy
+    watch_dir: .
     local_dir: /path/to/local/repo
     paths: ["deploy-*.yaml"]
     jobs:
@@ -29,17 +35,6 @@ watch:
         type: exec
         cmd: ./deploy.sh {file_name}
 
-  - id: api-service-patches
-    watch_dir: projects/api-service/patches
-    local_dir: /path/to/api/repo
-    paths: ["*.patch"]
-    jobs:
-      - id: apply
-        type: exec
-        cmd: git am --3way {file_path}
-      - id: cleanup
-        type: file_delete
-        path: "{file_remote_path}"
-        if: jobs.apply.success
-
+# Note: interval_seconds is ignored when using relay backend
+# (event-driven mode replaces polling automatically)
 interval_seconds: 60
