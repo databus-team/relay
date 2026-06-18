@@ -71,6 +71,15 @@ func New(cfg Config) (*Server, error) {
 	return s, nil
 }
 
+func (s *Server) StartFileWatcher(ctx context.Context) error {
+	fw, err := NewFileWatcher(s)
+	if err != nil {
+		return err
+	}
+	go fw.Start(ctx)
+	return nil
+}
+
 func (s *Server) Serve(ctx context.Context) error {
 	httpServer := &http.Server{Addr: s.addr, Handler: s}
 
