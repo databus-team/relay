@@ -17,6 +17,7 @@ watch:
     watch_dir: .                       # relative to server's watch dir root
     local_dir: /path/to/local/repo
     paths: ["*.patch"]
+    auto_cleanup: true                 # delete remote file after successful job execution
     jobs:
       - id: apply
         type: exec
@@ -30,6 +31,7 @@ watch:
     watch_dir: .
     local_dir: /path/to/local/repo
     paths: ["deploy-*.yaml"]
+    auto_cleanup: true
     jobs:
       - id: deploy
         type: exec

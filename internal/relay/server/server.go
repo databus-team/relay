@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -15,6 +18,7 @@ import (
 type Server struct {
 	addr      string
 	watchDirs map[string]string
+	watchCfgs []WatchDirConfig
 	clients   map[string]*Client
 	clientMu  sync.RWMutex
 	upgrader  websocket.Upgrader
@@ -45,14 +49,16 @@ type AuthConfig struct {
 }
 
 type WatchDirConfig struct {
-	ID  string
-	Dir string
+	ID  string        `yaml:"id"`
+	Dir string        `yaml:"dir"`
+	TTL time.Duration `yaml:"ttl"`
 }
 
 func New(cfg Config) (*Server, error) {
 	s := &Server{
 		addr:      cfg.Addr,
 		watchDirs: make(map[string]string),
+		watchCfgs: cfg.WatchDirs,
 		clients:   make(map[string]*Client),
 		serverID:  "relay-" + uuid.New().String()[:8],
 		auth:      cfg.Auth,
@@ -80,6 +86,58 @@ func (s *Server) StartFileWatcher(ctx context.Context) error {
 	return nil
 }
 
+func (s *Server) StartTTL(ctx context.Context) {
+	go s.ttlCleanupLoop(ctx)
+}
+
+func (s *Server) ttlCleanupLoop(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.cleanupExpiredFiles()
+		}
+	}
+}
+
+func (s *Server) cleanupExpiredFiles() {
+	now := time.Now()
+	for _, cfg := range s.watchCfgs {
+		if cfg.TTL <= 0 {
+			continue
+		}
+
+		entries, err := os.ReadDir(cfg.Dir)
+		if err != nil {
+			continue
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			if now.Sub(info.ModTime()) > cfg.TTL {
+				filePath := filepath.Join(cfg.Dir, entry.Name())
+				if err := os.Remove(filePath); err != nil {
+					log.Printf("[ttl] failed to remove %s: %v", filePath, err)
+				} else {
+					log.Printf("[ttl] expired: %s (age: %v, ttl: %v)", filePath, now.Sub(info.ModTime()).Round(time.Second), cfg.TTL)
+				}
+			}
+		}
+	}
+}
+
 func (s *Server) Serve(ctx context.Context) error {
 	httpServer := &http.Server{Addr: s.addr, Handler: s}
 
@@ -93,6 +151,8 @@ func (s *Server) Serve(ctx context.Context) error {
 			log.Printf("[server] file watcher error: %v", err)
 		}
 	}()
+
+	s.StartTTL(ctx)
 
 	go func() {
 		<-ctx.Done()

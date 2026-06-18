@@ -248,7 +248,42 @@ backend:
 | `watch[].local_dir` | Local working directory for job execution |
 | `watch[].paths` | Array of glob patterns to match files |
 | `watch[].jobs` | Actions to execute when file matches |
-| `interval_seconds` | Watch poll interval (default: 60) |
+| `watch[].auto_cleanup` | Delete remote file after all jobs succeed (default: false) |
+| `interval_seconds` | Watch poll interval (default: 60, ignored in event-driven mode) |
+
+## File Cleanup
+
+Two complementary strategies to prevent files from accumulating on the server:
+
+### Watcher-side: `auto_cleanup`
+
+When `auto_cleanup: true`, the watcher deletes the remote file after all jobs succeed. Jobs that fail leave the file untouched for retry.
+
+```yaml
+watch:
+  - id: web-app-patches
+    auto_cleanup: true
+    jobs:
+      - id: apply
+        type: exec
+        cmd: git am --3way {file_path}
+```
+
+### Server-side: `ttl`
+
+When `ttl` is set on a watch directory, the server automatically deletes files older than the specified duration. Runs every minute.
+
+```yaml
+# server.yaml
+watch:
+  - id: web-app-patches
+    dir: /data/relay/web-app/patches
+    ttl: 30m     # delete files older than 30 minutes
+```
+
+Supported duration formats: `30s`, `5m`, `1h`, `24h`.
+
+**Recommended**: Use both — `auto_cleanup` for immediate cleanup on success, `ttl` as a safety net for orphaned files.
 
 ## Job Types
 
