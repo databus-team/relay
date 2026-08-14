@@ -84,6 +84,12 @@ All commands load config via `-c` / `--config` (default: `~/.relay/config.yaml`)
 relay -c ~/.relay/config.yaml -d <command>
 ```
 
+The `push`, `pull`, `list`, `exec` and `job run` commands take an optional `-w`
+/ `--watch` workspace. When omitted, the current directory's name is matched
+against the configured workspace IDs. If it matches exactly one workspace that
+one is used; if it matches none (or several) an error lists the available
+workspaces instead.
+
 ### watch — Daemon Mode
 
 ```bash
@@ -102,9 +108,12 @@ Pushes file or directory to the watch's `watch_dir` on the remote backend.
 
 ```bash
 relay pull -w web-app-patches remote-filename.patch
+relay pull -d remote-filename.patch   # infer workspace from cwd, delete remote after
 ```
 
-Downloads a file from the watch's `watch_dir` to the current directory.
+Downloads a file from the watch's `watch_dir` to the current directory. With
+`--delete` / `-d`, the remote file is removed after a successful local write;
+a failed delete is reported but does not fail the pull.
 
 ### list — List Remote Directory
 
@@ -120,7 +129,16 @@ Lists files in the watch's remote `watch_dir` with size and modification time.
 relay exec -w web-app-patches "npm run build"
 ```
 
-Forwards a command to the remote backend for execution. Requires a backend that supports `Exec` (local, fs_mcp). The `-w` flag sets the working directory to the watch's `local_dir`.
+Forwards a command to the remote backend for execution. Requires a backend that supports `Exec` (local, fs_mcp). The `-w` flag sets the working directory to the watch's `local_dir`. When omitted, `-w` is inferred from the cwd when it can be; otherwise `exec` falls back to its no-workspace behavior.
+
+### job run — Run a Config Job Locally
+
+```bash
+relay job run apply ./my.patch            # infer workspace from cwd
+relay job run -w web-app-patches apply ../my.patch
+```
+
+Manually runs a job defined under the workspace's `jobs` in config, on the local machine. The optional file argument is bound to the `{file_path}`, `{file_name}` and `{file_dir}` variables. `exec` jobs run locally (defaulting to the workspace's `local_dir`), `file_delete` jobs delete the given local file. Job `if` conditions are ignored for manual runs. A job that references a file variable but is invoked without a file — or that fails — exits non-zero.
 
 ### cleanup — Remove Stale Command Files
 
