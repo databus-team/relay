@@ -18,6 +18,9 @@ watch:
     local_dir: /path/to/local/repo
     paths: ["*.patch"]
     auto_cleanup: true                 # delete remote file after successful job execution
+    # These jobs also run on the watcher (file arrives -> auto_cleanup) and can
+    # be triggered manually on the local machine with:
+    #   relay job run apply ./my.patch
     jobs:
       - id: apply
         type: exec
