@@ -4,11 +4,9 @@
 package jobrunner
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -43,7 +41,7 @@ func Run(ctx context.Context, watchCfg *config.WatchConfig, jobID, file string) 
 
 	switch job.Type {
 	case "exec":
-		if file == "" && usesFileVars(job.Cmd) {
+		if file == "" && (usesFileVars(job.Cmd) || usesFileVars(job.Cwd)) {
 			return Result{}, fmt.Errorf("job %q uses a file variable; provide a file argument", jobID)
 		}
 		cmd := watcher.SubstituteVariables(job.Cmd, vars)
@@ -53,14 +51,14 @@ func Run(ctx context.Context, watchCfg *config.WatchConfig, jobID, file string) 
 		}
 		cwd = watcher.SubstituteVariables(cwd, vars)
 
-		stdout, stderr, code := runLocalCommandCapture(cmd, cwd, job.Timeout)
+		stdout, stderr, code := watcher.RunLocalCommandCapture(cmd, cwd, job.Timeout)
 		if code != 0 {
 			return Result{Stdout: stdout, Stderr: stderr}, fmt.Errorf("exec job %q failed (exit %d): %s", jobID, code, strings.TrimSpace(stderr))
 		}
 		return Result{Stdout: stdout, Stderr: stderr}, nil
 
 	case "file_delete":
-		if file == "" {
+		if file == "" && usesFileVars(job.Path) {
 			return Result{}, fmt.Errorf("job %q deletes a file; provide a file argument", jobID)
 		}
 		path := watcher.SubstituteVariables(job.Path, vars)
@@ -74,9 +72,13 @@ func Run(ctx context.Context, watchCfg *config.WatchConfig, jobID, file string) 
 	}
 }
 
+// fileVarNames is the single source of truth for the file-binding variable
+// names, shared by buildVars and usesFileVars so the two can't drift apart.
+var fileVarNames = []string{"file_path", "file_name", "file_dir", "file_remote_path"}
+
 // buildVars constructs the substitution variables for a manual run. file_path
-// and friends bind to the local file argument (when given); otherwise only the
-// timestamp is provided.
+// and friends bind to the local file argument (when provided); otherwise only
+// the timestamp is provided.
 func buildVars(file string) map[string]string {
 	vars := map[string]string{
 		"timestamp": time.Now().Format(time.RFC3339),
@@ -88,51 +90,25 @@ func buildVars(file string) map[string]string {
 	if err != nil {
 		abs = file
 	}
-	vars["file_path"] = abs
-	vars["file_remote_path"] = abs
-	vars["file_name"] = filepath.Base(abs)
-	vars["file_dir"] = filepath.Dir(abs)
+	for _, name := range fileVarNames {
+		switch name {
+		case "file_path", "file_remote_path":
+			vars[name] = abs
+		case "file_name":
+			vars[name] = filepath.Base(abs)
+		case "file_dir":
+			vars[name] = filepath.Dir(abs)
+		}
+	}
 	return vars
 }
 
 // usesFileVars reports whether s references any of the file-binding variables.
 func usesFileVars(s string) bool {
-	for _, token := range []string{"{file_path}", "{file_name}", "{file_dir}", "{file_remote_path}"} {
-		if strings.Contains(s, token) {
+	for _, name := range fileVarNames {
+		if strings.Contains(s, "{"+name+"}") {
 			return true
 		}
 	}
 	return false
-}
-
-// runLocalCommandCapture runs cmd in sh with an optional cwd and timeout
-// (seconds), returning captured stdout, stderr, and the exit code.
-func runLocalCommandCapture(cmd, cwd string, timeout int) (string, string, int) {
-	ctx := context.Background()
-	var cancel context.CancelFunc
-	if timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
-		defer cancel()
-	}
-
-	ec := exec.CommandContext(ctx, "sh", "-c", cmd)
-	if cwd != "" {
-		ec.Dir = cwd
-	}
-
-	var stdout, stderr bytes.Buffer
-	ec.Stdout = &stdout
-	ec.Stderr = &stderr
-
-	err := ec.Run()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return stdout.String(), stderr.String(), exitErr.ExitCode()
-		}
-		if ctx.Err() == context.DeadlineExceeded {
-			return stdout.String(), stderr.String() + " (timed out)", 124
-		}
-		return stdout.String(), stderr.String() + " (" + err.Error() + ")", 1
-	}
-	return stdout.String(), stderr.String(), 0
 }

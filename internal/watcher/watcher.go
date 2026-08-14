@@ -370,7 +370,7 @@ func (w *Watcher) executeCommand(ctx context.Context, cmdPath string, b backend.
 	log.Printf("[commands] Responder executing locally: %s (cwd: %s, timeout: %d)", cmd.Cmd, cmd.Cwd, cmd.Timeout)
 
 	// Execute locally (this watcher acts as the responder)
-	stdout, stderr, exitCode := runLocalCommandCapture(cmd.Cmd, cmd.Cwd, cmd.Timeout)
+	stdout, stderr, exitCode := RunLocalCommandCapture(cmd.Cmd, cmd.Cwd, cmd.Timeout)
 	result.Stdout = stdout
 	result.Stderr = stderr
 	result.ExitCode = exitCode
@@ -478,9 +478,11 @@ func (w *Watcher) applyPendingConfig() error {
 	return nil
 }
 
-// runLocalCommandCapture runs cmd in shell with optional cwd and timeout (seconds).
-// Returns stdout, stderr and exit code.
-func runLocalCommandCapture(cmdStr, cwd string, timeout int) (string, string, int) {
+// RunLocalCommandCapture runs cmd in shell with an optional cwd and timeout
+// (seconds), returning captured stdout, stderr, and the exit code. It is the
+// shared local-command runner used by both the watcher and manual job execution
+// (internal/jobrunner). An empty command is treated as an error.
+func RunLocalCommandCapture(cmdStr, cwd string, timeout int) (string, string, int) {
 	if cmdStr == "" {
 		return "", "no command provided", 1
 	}

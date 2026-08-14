@@ -75,6 +75,31 @@ func TestRun_ExecDefaultsToLocalDir(t *testing.T) {
 	}
 }
 
+func TestRun_FileDeleteHardcodedPathNeedsNoFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stale.log")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	watch := baseWatch()
+	watch.Jobs = []config.JobConfig{{ID: "purge", Type: "file_delete", Path: path}}
+	if _, err := Run(context.Background(), watch, "purge", ""); err != nil {
+		t.Fatalf("file_delete with a hardcoded path should not demand a file arg: %v", err)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Errorf("expected hardcoded-path file to be deleted, stat err = %v", statErr)
+	}
+}
+
+func TestRun_ExecNeedsFileWhenCwdReferencesFile(t *testing.T) {
+	watch := baseWatch()
+	watch.Jobs = []config.JobConfig{{ID: "go", Type: "exec", Cmd: "pwd", Cwd: "{file_dir}"}}
+	if _, err := Run(context.Background(), watch, "go", ""); err == nil {
+		t.Fatal("expected a file-required error for a job referencing a file var in cwd")
+	}
+}
+
 func TestRun_FileDeleteDeletesLocalFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a.patch")

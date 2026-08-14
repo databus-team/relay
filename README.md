@@ -77,12 +77,14 @@ interval_seconds: 60
 
 ## Usage
 
-All commands load config via `-c` / `--config` (default: `~/.relay/config.yaml`). Enable debug output with `-d` / `--debug`.
+All commands load config via `-c` / `--config` (default: `~/.relay/config.yaml`). Enable debug output with `--debug`.
 
 ```bash
 # Global flags
-relay -c ~/.relay/config.yaml -d <command>
+relay -c ~/.relay/config.yaml --debug <command>
 ```
+
+Note: on `pull`, the short flag `-d` means `--delete` (delete the remote file after pulling), not debug. Debug is long-form `--debug` only.
 
 The `push`, `pull`, `list`, `exec` and `job run` commands take an optional `-w`
 / `--watch` workspace. When omitted, the current directory's name is matched
