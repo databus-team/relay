@@ -151,12 +151,7 @@ func runPull() {
 		os.Exit(1)
 	}
 
-	watchID, err := resolveWorkspaceID(cfg, *pullWatch)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
-		os.Exit(1)
-	}
-	watchCfg, err := cfg.GetWatchByID(watchID)
+	watchCfg, err := lookupWatch(cfg, *pullWatch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 		os.Exit(1)
@@ -204,12 +199,7 @@ func runList() {
 		os.Exit(1)
 	}
 
-	watchID, err := resolveWorkspaceID(cfg, *listWatch)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
-		os.Exit(1)
-	}
-	watchCfg, err := cfg.GetWatchByID(watchID)
+	watchCfg, err := lookupWatch(cfg, *listWatch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 		os.Exit(1)
@@ -319,18 +309,34 @@ func resolveWorkspaceID(cfg *config.Config, provided string) (string, error) {
 		}
 	}
 
-	available := make([]string, 0, len(cfg.Watch))
-	for _, w := range cfg.Watch {
-		available = append(available, w.ID+" ("+w.LocalDir+")")
-	}
-
-	if len(matches) == 0 {
-		return "", fmt.Errorf("no workspace matches current directory %q; specify -w. Available: %s", base, strings.Join(available, ", "))
-	}
 	if len(matches) > 1 {
-		return "", fmt.Errorf("current directory %q matches multiple workspaces (%s); specify -w. Available: %s", base, strings.Join(matches, ", "), strings.Join(available, ", "))
+		return "", fmt.Errorf("current directory %q matches multiple workspaces (%s); specify -w. Available: %s", base, strings.Join(matches, ", "), joinAvailable(cfg.Watch))
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("no workspace matches current directory %q; specify -w. Available: %s", base, joinAvailable(cfg.Watch))
 	}
 	return matches[0], nil
+}
+
+// joinAvailable renders the configured workspaces as "id (local_dir)" for
+// error messages. It is only invoked on the error paths.
+func joinAvailable(watches []config.WatchConfig) string {
+	parts := make([]string, 0, len(watches))
+	for _, w := range watches {
+		parts = append(parts, w.ID+" ("+w.LocalDir+")")
+	}
+	return strings.Join(parts, ", ")
+}
+
+// lookupWatch resolves an optional -w value (or the cwd-inferred workspace) to
+// its WatchConfig. It separates workspace resolution from the commands that
+// just need the config.
+func lookupWatch(cfg *config.Config, provided string) (*config.WatchConfig, error) {
+	watchID, err := resolveWorkspaceID(cfg, provided)
+	if err != nil {
+		return nil, err
+	}
+	return cfg.GetWatchByID(watchID)
 }
 
 // workspaceJSON is the on-the-wire shape for `relay ws --json`. It mirrors
@@ -424,12 +430,7 @@ func runPush() {
 		os.Exit(1)
 	}
 
-	watchID, err := resolveWorkspaceID(cfg, *pushWatch)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
-		os.Exit(1)
-	}
-	watchCfg, err := cfg.GetWatchByID(watchID)
+	watchCfg, err := lookupWatch(cfg, *pushWatch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 		os.Exit(1)
@@ -543,12 +544,7 @@ func runJobRun() {
 		os.Exit(1)
 	}
 
-	watchID, err := resolveWorkspaceID(cfg, *jobRunWatch)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
-		os.Exit(1)
-	}
-	watchCfg, err := cfg.GetWatchByID(watchID)
+	watchCfg, err := lookupWatch(cfg, *jobRunWatch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 		os.Exit(1)
@@ -556,10 +552,9 @@ func runJobRun() {
 
 	res, err := jobrunner.Run(context.Background(), watchCfg, *jobRunID, *jobRunFile)
 	if err != nil {
+		// The error already carries the captured stderr (for exec failures), so
+		// print only the error and exit non-zero; res.Stderr would repeat it.
 		fmt.Fprintf(os.Stderr, "Job error: %v\n", err)
-		if res.Stderr != "" {
-			fmt.Fprint(os.Stderr, res.Stderr)
-		}
 		os.Exit(1)
 	}
 
