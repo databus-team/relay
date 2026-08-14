@@ -13,10 +13,11 @@ import (
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/user/relay/internal/backend"
-	_ "github.com/user/relay/internal/relay/backend"
-	_ "github.com/user/relay/internal/relay/server"
 	"github.com/user/relay/internal/config"
 	"github.com/user/relay/internal/exchange"
+	"github.com/user/relay/internal/jobrunner"
+	_ "github.com/user/relay/internal/relay/backend"
+	_ "github.com/user/relay/internal/relay/server"
 	"github.com/user/relay/internal/watcher"
 )
 
@@ -34,18 +35,26 @@ var (
 	watchCmd = kingpin.Command("watch", "Watch remote directory and execute actions continuously")
 
 	// Pull command - download single file (requires filename)
-	pullCmd   = kingpin.Command("pull", "Download single file from remote watch directory")
-	pullWatch = pullCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
-	pullFile  = pullCmd.Arg("filename", "Remote filename to download").Required().String()
+	pullCmd    = kingpin.Command("pull", "Download single file from remote watch directory")
+	pullWatch  = pullCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
+	pullFile   = pullCmd.Arg("filename", "Remote filename to download").Required().String()
+	pullDelete = pullCmd.Flag("delete", "Delete the remote file after a successful pull").Short('d').Bool()
 
 	// List command - list remote directory
 	listCmd   = kingpin.Command("list", "List files in remote watch directory")
-	listWatch = listCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
+	listWatch = listCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
 
 	// Push command - upload files
 	pushCmd   = kingpin.Command("push", "Push file to remote watch directory")
-	pushWatch = pushCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
+	pushWatch = pushCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
 	pushSrc   = pushCmd.Arg("source", "Source file to push").Required().String()
+
+	// Job command - run config-defined jobs locally
+	jobCmd      = kingpin.Command("job", "Run config-defined jobs on the local machine")
+	jobRun      = jobCmd.Command("run", "Run a config job locally")
+	jobRunWatch = jobRun.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
+	jobRunID    = jobRun.Arg("jobid", "Job ID to run").Required().String()
+	jobRunFile  = jobRun.Arg("file", "Local file to bind to {file_path} and friends").String()
 
 	// Exec command - command forwarding (requires watch running)
 	execCmd    = kingpin.Command("exec", "Forward command to remote backend")
@@ -91,11 +100,13 @@ func main() {
 		app.Usage(os.Args)
 	case syncCmd.FullCommand():
 		runSync()
-	
+
 	case serverCmd.FullCommand():
 		runServer()
 	case wsCmd.FullCommand():
 		runWorkspaces()
+	case jobRun.FullCommand():
+		runJobRun()
 	default:
 		app.Usage(os.Args)
 	}
@@ -140,7 +151,12 @@ func runPull() {
 		os.Exit(1)
 	}
 
-	watchCfg, err := cfg.GetWatchByID(*pullWatch)
+	watchID, err := resolveWorkspaceID(cfg, *pullWatch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+		os.Exit(1)
+	}
+	watchCfg, err := cfg.GetWatchByID(watchID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 		os.Exit(1)
@@ -169,6 +185,16 @@ func runPull() {
 	}
 
 	fmt.Printf("Pulled: %s -> %s\n", remotePath, localPath)
+
+	if *pullDelete {
+		if err := b.Delete(ctx, remotePath); err != nil {
+			// Deleting the remote file is a cleanup step, not part of the pull
+			// itself. Report it but keep the successful pull as the outcome.
+			fmt.Fprintf(os.Stderr, "WARNING: failed to delete remote file %s: %v\n", remotePath, err)
+		} else {
+			fmt.Printf("Deleted remote: %s\n", remotePath)
+		}
+	}
 }
 
 func runList() {
@@ -178,7 +204,12 @@ func runList() {
 		os.Exit(1)
 	}
 
-	watchCfg, err := cfg.GetWatchByID(*listWatch)
+	watchID, err := resolveWorkspaceID(cfg, *listWatch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+		os.Exit(1)
+	}
+	watchCfg, err := cfg.GetWatchByID(watchID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 		os.Exit(1)
@@ -265,15 +296,52 @@ func resolveWatches(cfg *config.Config, name string) ([]config.WatchConfig, erro
 	return []config.WatchConfig{*w}, nil
 }
 
+// resolveWorkspaceID returns the watch ID a command should target. An explicit
+// -w value wins; otherwise the current working directory's basename is matched
+// against the configured watch ids. When the basename matches zero or more than
+// one workspace, it fails with the list of available workspaces so the caller
+// can prompt the user instead of guessing.
+func resolveWorkspaceID(cfg *config.Config, provided string) (string, error) {
+	if provided != "" {
+		return provided, nil
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("failed to get current directory: %w", err)
+	}
+	base := filepath.Base(cwd)
+
+	var matches []string
+	for _, w := range cfg.Watch {
+		if w.ID == base {
+			matches = append(matches, w.ID)
+		}
+	}
+
+	available := make([]string, 0, len(cfg.Watch))
+	for _, w := range cfg.Watch {
+		available = append(available, w.ID+" ("+w.LocalDir+")")
+	}
+
+	if len(matches) == 0 {
+		return "", fmt.Errorf("no workspace matches current directory %q; specify -w. Available: %s", base, strings.Join(available, ", "))
+	}
+	if len(matches) > 1 {
+		return "", fmt.Errorf("current directory %q matches multiple workspaces (%s); specify -w. Available: %s", base, strings.Join(matches, ", "), strings.Join(available, ", "))
+	}
+	return matches[0], nil
+}
+
 // workspaceJSON is the on-the-wire shape for `relay ws --json`. It mirrors
 // config.WatchConfig but uses lower-case JSON keys so consumers can pipe into
 // jq / scripts without depending on Go's default field capitalization.
 type workspaceJSON struct {
-	ID       string             `json:"id"`
-	WatchDir string             `json:"watch_dir"`
-	LocalDir string             `json:"local_dir"`
-	Paths    []string           `json:"paths"`
-	Jobs     []jobConfigJSON    `json:"jobs"`
+	ID       string          `json:"id"`
+	WatchDir string          `json:"watch_dir"`
+	LocalDir string          `json:"local_dir"`
+	Paths    []string        `json:"paths"`
+	Jobs     []jobConfigJSON `json:"jobs"`
 }
 
 type jobConfigJSON struct {
@@ -356,7 +424,12 @@ func runPush() {
 		os.Exit(1)
 	}
 
-	watchCfg, err := cfg.GetWatchByID(*pushWatch)
+	watchID, err := resolveWorkspaceID(cfg, *pushWatch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+		os.Exit(1)
+	}
+	watchCfg, err := cfg.GetWatchByID(watchID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 		os.Exit(1)
@@ -397,9 +470,19 @@ func runExec() {
 		os.Exit(1)
 	}
 
+	// Fold workspace resolution: an explicit -w wins; otherwise try to infer it
+	// from the cwd basename. Inferring is best-effort for exec — when it can't
+	// resolve, exec keeps its existing no-workspace forwarding behavior.
+	w := *execWatch
+	if w == "" {
+		if inferred, err := resolveWorkspaceID(cfg, ""); err == nil {
+			w = inferred
+		}
+	}
+
 	var execCwd string
-	if *execWatch != "" {
-		watchCfg, err := cfg.GetWatchByID(*execWatch)
+	if w != "" {
+		watchCfg, err := cfg.GetWatchByID(w)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 			os.Exit(1)
@@ -427,8 +510,8 @@ func runExec() {
 	}
 
 	// Health check: verify remote watcher is running
-	if *execWatch != "" {
-		watchCfg, err := cfg.GetWatchByID(*execWatch)
+	if w != "" {
+		watchCfg, err := cfg.GetWatchByID(w)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 			os.Exit(1)
@@ -451,6 +534,41 @@ func runExec() {
 	}
 
 	fmt.Print(result)
+}
+
+func runJobRun() {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	watchID, err := resolveWorkspaceID(cfg, *jobRunWatch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+		os.Exit(1)
+	}
+	watchCfg, err := cfg.GetWatchByID(watchID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+		os.Exit(1)
+	}
+
+	res, err := jobrunner.Run(context.Background(), watchCfg, *jobRunID, *jobRunFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Job error: %v\n", err)
+		if res.Stderr != "" {
+			fmt.Fprint(os.Stderr, res.Stderr)
+		}
+		os.Exit(1)
+	}
+
+	if res.Stdout != "" {
+		fmt.Print(res.Stdout)
+	}
+	if res.Stderr != "" {
+		fmt.Fprint(os.Stderr, res.Stderr)
+	}
 }
 
 func pushFile(ctx context.Context, b backend.FileTransferBackend, src, dest string) {

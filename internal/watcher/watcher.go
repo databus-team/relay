@@ -25,10 +25,10 @@ type Watcher struct {
 	cfg        *config.Config
 	configPath string // path to config file for backup/write operations
 	processed  map[string]bool
-	jobResults  map[string]bool
+	jobResults map[string]bool
 	// pendingConfig holds staged config for next cycle apply
-	pendingConfig     []byte
-	pendingConfigMu   sync.Mutex
+	pendingConfig   []byte
+	pendingConfigMu sync.Mutex
 }
 
 func New(cfg *config.Config, configPath string) (*Watcher, error) {
@@ -584,13 +584,13 @@ func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, file
 
 		switch job.Type {
 		case "exec":
-			cmd := substituteVariables(job.Cmd, vars)
+			cmd := SubstituteVariables(job.Cmd, vars)
 			cwd := job.Cwd
 			if cwd == "" && localDir != "" {
 				cwd = localDir
 			}
 			if cwd != "" {
-				cwd = substituteVariables(cwd, vars)
+				cwd = SubstituteVariables(cwd, vars)
 			}
 
 			// Try backend exec first (file exchange protocol)
@@ -615,7 +615,7 @@ func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, file
 			}
 
 		case "file_delete":
-			delPath := substituteVariables(job.Path, vars)
+			delPath := SubstituteVariables(job.Path, vars)
 			if err := b.Delete(ctx, delPath); err != nil {
 				w.jobResults[job.ID] = false
 				return fmt.Errorf("file_delete job %s failed: %w", job.ID, err)
@@ -686,7 +686,10 @@ func matchPattern(filename, pattern string) bool {
 	return matched
 }
 
-func substituteVariables(s string, vars map[string]string) string {
+// SubstituteVariables replaces {key} tokens in s with values from vars. It is
+// the shared variable substitution used by both the watcher and manual job
+// execution (internal/jobrunner).
+func SubstituteVariables(s string, vars map[string]string) string {
 	result := s
 	for key, val := range vars {
 		result = strings.ReplaceAll(result, "{"+key+"}", val)
