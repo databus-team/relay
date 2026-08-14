@@ -18,7 +18,7 @@ import (
 var (
 	serverCmd = kingpin.Command("server", "Run relay server")
 
-	serverConfigPath = serverCmd.Flag("config", "Path to server config file (YAML)").String()
+	serverConfigPath = serverCmd.Flag("server-config", "Path to server config file (YAML)").String()
 	serverAddr       = serverCmd.Flag("addr", "Server listen address").String()
 	serverWatchDirs  = serverCmd.Flag("watch", "Watch directory (format: id:path)").Strings()
 	serverToken      = serverCmd.Flag("token", "Authentication token").Strings()

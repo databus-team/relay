@@ -174,13 +174,13 @@ Run the relay server that serves file storage and event broadcasting.
 
 ```bash
 # With YAML config file
-relay server --config server.yaml
+relay server --server-config server.yaml
 
 # With CLI flags only
 relay server --addr :8443 --watch web-app:/data/web-app --token secret
 
 # CLI flags override config file values
-relay server --config server.yaml --addr :9000
+relay server --server-config server.yaml --addr :9000
 ```
 
 **Server config** (`server.yaml`):
