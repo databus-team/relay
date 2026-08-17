@@ -44,9 +44,9 @@ clean:
 	rm -f $(BINARY_NAME)
 	rm -f coverage.out coverage.html
 
-## install: Install binary to GOPATH
-install:
-	$(GOCMD) install $(MAIN_PATH)
+## install: Build optimized binary and install to ~/.local/bin (on PATH)
+install: build-release
+	install -m 0755 $(BINARY_NAME) $(HOME)/.local/bin/$(BINARY_NAME)
 
 ## deps: Download dependencies
 deps:
@@ -93,7 +93,7 @@ help:
 	@echo "  make build          Build the binary"
 	@echo "  make test           Run all tests"
 	@echo "  make clean          Clean build artifacts"
-	@echo "  make install        Install binary to GOPATH"
+	@echo "  make install        Build and install to ~/.local/bin"
 	@echo "  make deps           Download dependencies"
 	@echo "  make fmt            Format code"
 	@echo "  make vet            Run go vet"
