@@ -1,14 +1,39 @@
 package watcher
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/config"
 )
+
+// stubBackend records Delete calls so tests can assert what file_delete jobs
+// targeted (remote via the backend, versus local via os.Remove).
+type stubBackend struct {
+	deleted []string
+}
+
+func (b *stubBackend) ListDir(ctx context.Context, path string) ([]backend.FileInfo, error) {
+	return nil, nil
+}
+func (b *stubBackend) Read(ctx context.Context, path string) ([]byte, error) { return nil, nil }
+func (b *stubBackend) Write(ctx context.Context, path string, content []byte) error {
+	return nil
+}
+func (b *stubBackend) Delete(ctx context.Context, path string) error {
+	b.deleted = append(b.deleted, path)
+	return nil
+}
+func (b *stubBackend) SupportsExec() bool { return false }
+func (b *stubBackend) Exec(ctx context.Context, cmd, cwd string, timeout int) (string, error) {
+	return "", nil
+}
+func (b *stubBackend) Ping(ctx context.Context, commandDir, watchID string) error { return nil }
 
 func TestLoadFromBytes(t *testing.T) {
 	// Test that LoadFromBytes parses config correctly
@@ -87,6 +112,93 @@ func TestPendingConfigMutex(t *testing.T) {
 	mu.Lock()
 	_ = pending != nil
 	mu.Unlock()
+}
+
+func TestBuildVariablesRemotePath(t *testing.T) {
+	// {file_remote_path} must always point at the original remote file on the
+	// watch side, even when a local copy is synced into local_dir. {file_path}/
+	// {file_dir} point at the local copy because exec jobs run locally.
+	const remote = "/home/devpod/storage/databus_backend/foo.test"
+	local := filepath.Join("Z:", "Group_Projects", "databus_backend", "foo.test")
+
+	w := &Watcher{}
+	vars := w.buildVariables(remote, local, "foo.test")
+
+	if got := vars["file_remote_path"]; got != remote {
+		t.Errorf("file_remote_path = %q, want %q (must stay the remote path)", got, remote)
+	}
+	if got := vars["file_path"]; got == remote {
+		t.Errorf("file_path = %q, want the local copy path", got)
+	}
+	if got := vars["file_name"]; got != "foo.test" {
+		t.Errorf("file_name = %q, want foo.test", got)
+	}
+}
+
+func TestBuildVariablesNoLocal(t *testing.T) {
+	// Without a local copy the file-bound vars fall back to the remote path.
+	w := &Watcher{}
+	vars := w.buildVariables("/home/dev/storage/x.test", "", "x.test")
+	if got, want := vars["file_remote_path"], "/home/dev/storage/x.test"; got != want {
+		t.Errorf("file_remote_path = %q, want %q", got, want)
+	}
+	if got, want := vars["file_path"], "/home/dev/storage/x.test"; got != want {
+		t.Errorf("file_path = %q, want %q", got, want)
+	}
+}
+
+func TestExecuteJobsLocalDelete(t *testing.T) {
+	tmp := t.TempDir()
+	localPath := filepath.Join(tmp, "foo.test")
+	if err := os.WriteFile(localPath, []byte("hi"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := &Watcher{jobResults: make(map[string]bool)}
+	b := &stubBackend{}
+	jobs := []config.JobConfig{
+		{ID: "rm", Type: "file_delete", Target: "local", Path: "{file_path}"},
+	}
+
+	// target=local must remove the locally-synced copy and NOT call the backend.
+	if err := w.executeJobs(context.Background(), jobs, "/remote/x/foo.test", localPath, "foo.test", tmp, b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(localPath); !os.IsNotExist(err) {
+		t.Error("local file should have been removed by target=local file_delete")
+	}
+	if len(b.deleted) != 0 {
+		t.Errorf("backend.Delete should not be called for target=local, got %v", b.deleted)
+	}
+}
+
+func TestExecuteJobsLocalDeleteMissingIsNoop(t *testing.T) {
+	// Deleting an already-absent local file must not error the job chain.
+	w := &Watcher{jobResults: make(map[string]bool)}
+	b := &stubBackend{}
+	jobs := []config.JobConfig{
+		{ID: "rm", Type: "file_delete", Target: "local", Path: "{file_path}"},
+	}
+	missing := filepath.Join(t.TempDir(), "never-wrote.test")
+	if err := w.executeJobs(context.Background(), jobs, "/remote/x.test", missing, "x.test", "", b); err != nil {
+		t.Fatalf("deleting a missing local file should be a no-op, got: %v", err)
+	}
+}
+
+func TestExecuteJobsRemoteDeleteDefault(t *testing.T) {
+	// Default target (unset) deletes the remote file via the backend.
+	w := &Watcher{jobResults: make(map[string]bool)}
+	b := &stubBackend{}
+	jobs := []config.JobConfig{
+		{ID: "rm", Type: "file_delete", Path: "{file_remote_path}"},
+	}
+	const remote = "/remote/watched/foo.test"
+	if err := w.executeJobs(context.Background(), jobs, remote, "", "foo.test", "", b); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.deleted) != 1 || b.deleted[0] != remote {
+		t.Errorf("deleted = %v, want [%s]", b.deleted, remote)
+	}
 }
 
 func TestBackupPath(t *testing.T) {

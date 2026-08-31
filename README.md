@@ -326,12 +326,30 @@ Execute a shell command when file is detected.
 
 ### file_delete
 
-Delete the detected file (or custom path).
+Delete a file (default: the remote copy on the backend's `watch_dir`).
 
 ```yaml
-- id: cleanup
+- id: cleanup_remote
   type: file_delete
+  target: remote        # optional; "remote" is the default. Deletes {file_remote_path} on the backend's watch_dir.
   path: "{file_remote_path}"
+  if: jobs.apply.success
+```
+
+With `target: local` the job runs `os.Remove` on the local machine (using a
+locally-synced path such as `{file_path}`), so you can clean up both copies:
+
+```yaml
+- id: cleanup_remote
+  type: file_delete
+  target: remote
+  path: "{file_remote_path}"
+  if: jobs.apply.success
+- id: cleanup_local
+  type: file_delete
+  target: local
+  path: "{file_path}"
+  if: jobs.apply.success
 ```
 
 ## Built-in Variables
@@ -341,13 +359,15 @@ Delete the detected file (or custom path).
 | `{file_path}` | Path to the file synced into `local_dir` (exec jobs run locally) |
 | `{file_name}` | Filename without directory |
 | `{file_dir}` | Directory containing the locally-synced file |
-| `{file_remote_path}` | Original remote path (e.g. for `file_delete` cleanup) |
+| `{file_remote_path}` | Original remote path on `watch_dir` (always the remote file, even when a local copy exists) |
 | `{timestamp}` | Current time in RFC3339 format |
 
 When a file matches, the watcher first downloads it into `local_dir` (the
 backend is a pure file-transfer layer and never executes commands), then runs
 the `jobs`/`exec` actions locally on the machine running `relay watch`. Use
-`{file_remote_path}` inside a `file_delete` job to remove the remote copy.
+a `file_delete` job with `path: "{file_remote_path}"` (default `target:
+remote`) to remove the remote copy, and `path: "{file_path}"` with
+`target: local` to remove the locally-synced copy.
 
 ## Conditional Execution
 

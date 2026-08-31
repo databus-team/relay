@@ -628,12 +628,30 @@ func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, remo
 
 		case "file_delete":
 			delPath := SubstituteVariables(job.Path, vars)
-			if err := b.Delete(ctx, delPath); err != nil {
+			delTarget := job.Target
+			if delTarget == "" {
+				delTarget = "remote"
+			}
+			var err error
+			if delTarget == "local" {
+				// Delete the locally-synced copy (see {file_path}/{file_remote_path}).
+				// A missing local file is a no-op, not an error: the sync or a prior
+				// job may have already removed it.
+				err = os.Remove(delPath)
+				if err != nil && os.IsNotExist(err) {
+					err = nil
+				}
+			} else {
+				// Default target is "remote": delete the file on the backend's
+				// watch_dir (the original source of the synced file).
+				err = b.Delete(ctx, delPath)
+			}
+			if err != nil {
 				w.jobResults[job.ID] = false
 				return fmt.Errorf("file_delete job %s failed: %w", job.ID, err)
 			}
 			w.jobResults[job.ID] = true
-			log.Printf("File delete job %s completed: %s", job.ID, delPath)
+			log.Printf("File delete job %s completed (target=%s): %s", job.ID, delTarget, delPath)
 
 		default:
 			return fmt.Errorf("unknown job type: %s", job.Type)
@@ -698,10 +716,13 @@ func (w *Watcher) buildVariables(remoteFilePath, localFilePath, fileName string)
 	// render path vars with forward slashes (D:/Group_Projects/...). No-op on
 	// Unix where ToSlash is the identity.
 	return map[string]string{
-		"file_path":        filepath.ToSlash(filePath),
-		"file_name":        fileName,
-		"file_dir":         filepath.ToSlash(fileDir),
-		"file_remote_path": filePath,
+		"file_path": filepath.ToSlash(filePath),
+		"file_name": fileName,
+		"file_dir":  filepath.ToSlash(fileDir),
+		// {file_remote_path} always points at the original remote file on the
+		// watch_dir, never the local copy. It is what a remote-targeted
+		// file_delete uses to clean up the source file.
+		"file_remote_path": filepath.ToSlash(remoteFilePath),
 		"timestamp":        time.Now().Format(time.RFC3339),
 	}
 }
