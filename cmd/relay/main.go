@@ -113,8 +113,16 @@ func main() {
 }
 
 func runWatch() {
-	ctx := context.Background()
-	cfg, err := config.Load(*configPath)
+	// Resolve a leading ~ so the path stored on the watcher (used later for
+	// config backup during sync) is an absolute filesystem path, not a literal
+	// "~" that os.OpenFile can't read.
+	cfgPath, err := config.ExpandHome(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to expand config path: %v\n", err)
+		os.Exit(1)
+	}
+
+	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
 		os.Exit(1)
@@ -132,7 +140,7 @@ func runWatch() {
 		cancel()
 	}()
 
-	w, err := watcher.New(cfg, *configPath)
+	w, err := watcher.New(cfg, cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create watcher: %v\n", err)
 		os.Exit(1)
