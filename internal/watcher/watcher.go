@@ -693,11 +693,15 @@ func (w *Watcher) buildVariables(remoteFilePath, localFilePath, fileName string)
 		filePath = localFilePath
 		fileDir = filepath.Dir(localFilePath)
 	}
+	// Exec jobs run through a shell command string (sh -c). On Windows a native
+	// backslash path (D:\Group_Projects\...) would be eaten as shell escapes, so
+	// render path vars with forward slashes (D:/Group_Projects/...). No-op on
+	// Unix where ToSlash is the identity.
 	return map[string]string{
-		"file_path":        filePath,
+		"file_path":        filepath.ToSlash(filePath),
 		"file_name":        fileName,
-		"file_dir":         fileDir,
-		"file_remote_path": remoteFilePath,
+		"file_dir":         filepath.ToSlash(fileDir),
+		"file_remote_path": filePath,
 		"timestamp":        time.Now().Format(time.RFC3339),
 	}
 }
