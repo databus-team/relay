@@ -194,11 +194,35 @@ func (b *FsMcpBackend) ListDir(ctx context.Context, path string) ([]FileInfo, er
 				return files, nil
 			}
 
+			// A successful list_directory with no entries just means the
+			// directory is empty (the server returns only a "Directory listing
+			// for: <path>" header) rather than a parse failure.
+			if !result.IsError && isEmptyListing(textContent.Text) {
+				return []FileInfo{}, nil
+			}
+
 			return nil, fmt.Errorf("failed to parse directory listing (raw: %s)", textContent.Text)
 		}
 	}
 
 	return files, nil
+}
+
+// isEmptyListing reports whether a list_directory response carries no entries:
+// a leading "Directory listing for:" header with nothing after it, or only
+// whitespace. This lets ListDir treat an empty directory as an empty result
+// instead of an unparseable one.
+func isEmptyListing(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return true
+	}
+	// The MCP filesystem list_directory returns a single header line like
+	// "Directory listing for: /path" when the directory has no files.
+	if strings.HasPrefix(trimmed, "Directory listing for:") {
+		return true
+	}
+	return false
 }
 
 func (b *FsMcpBackend) listDirTree(ctx context.Context, path string) ([]FileInfo, error) {
