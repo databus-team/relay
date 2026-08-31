@@ -52,14 +52,26 @@ type JobConfig struct {
 	Timeout  int    `yaml:"timeout,omitempty"` // seconds, optional per-job timeout
 }
 
+// ExpandHome expands a leading "~" in path to the user's home directory and
+// returns the absolute filesystem path. Paths without a leading "~" are
+// returned unchanged. This exists so file operations downstream (e.g. the
+// watcher's config backup during sync) get a real path rather than a literal
+// "~", which os.Open/os.WriteFile do not expand.
+func ExpandHome(path string) (string, error) {
+	if !strings.HasPrefix(path, "~") {
+		return path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+	return filepath.Join(home, path[2:]), nil
+}
+
 func Load(path string) (*Config, error) {
-	expanded := path
-	if strings.HasPrefix(expanded, "~") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get home directory: %w", err)
-		}
-		expanded = filepath.Join(home, expanded[2:])
+	expanded, err := ExpandHome(path)
+	if err != nil {
+		return nil, err
 	}
 
 	data, err := os.ReadFile(expanded)
