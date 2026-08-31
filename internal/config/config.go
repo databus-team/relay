@@ -43,7 +43,8 @@ type AuthConfig struct {
 
 type JobConfig struct {
 	ID       string `yaml:"id"`
-	Type     string `yaml:"type"` // exec, file_delete
+	Type     string `yaml:"type"`             // exec, file_delete
+	Target   string `yaml:"target,omitempty"` // file_delete only: remote (default) | local
 	Cmd      string `yaml:"cmd,omitempty"`
 	Cwd      string `yaml:"cwd,omitempty"`
 	Path     string `yaml:"path,omitempty"`
