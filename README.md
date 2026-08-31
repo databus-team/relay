@@ -75,6 +75,11 @@ interval_seconds: 60
 
 **Windows note:** When running on Windows (MSYS/Git Bash), `local_dir` can be written as `/d/...` and will be normalized to `D:\...` automatically.
 
+In the example above, whenever a file matching `*.patch` appears in
+`watch_dir`, the watcher syncs it into `local_dir` and runs the `exec` jobs
+**locally** (the backend only transfers files). `{file_path}` therefore points
+to the local copy; `{file_remote_path}` refers to the remote file for cleanup.
+
 ## Usage
 
 All commands load config via `-c` / `--config` (default: `~/.relay/config.yaml`). Enable debug output with `--debug`.
@@ -333,11 +338,16 @@ Delete the detected file (or custom path).
 
 | Variable | Description |
 |----------|-------------|
-| `{file_path}` | Full path to the watched file |
+| `{file_path}` | Path to the file synced into `local_dir` (exec jobs run locally) |
 | `{file_name}` | Filename without directory |
-| `{file_dir}` | Directory containing the file |
-| `{file_remote_path}` | Remote path |
+| `{file_dir}` | Directory containing the locally-synced file |
+| `{file_remote_path}` | Original remote path (e.g. for `file_delete` cleanup) |
 | `{timestamp}` | Current time in RFC3339 format |
+
+When a file matches, the watcher first downloads it into `local_dir` (the
+backend is a pure file-transfer layer and never executes commands), then runs
+the `jobs`/`exec` actions locally on the machine running `relay watch`. Use
+`{file_remote_path}` inside a `file_delete` job to remove the remote copy.
 
 ## Conditional Execution
 
