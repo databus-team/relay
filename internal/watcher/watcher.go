@@ -141,7 +141,17 @@ func (w *Watcher) runEventDriven(ctx context.Context, eb backend.EventBackend) e
 					return
 				}
 
-				if err := w.executeJobs(ctx, watchCfg.Jobs, filePath, fi.Name, watchCfg.WatchDir, watchCfg.LocalDir, b); err != nil {
+				localPath := ""
+				if watchCfg.LocalDir != "" {
+					localPath = filepath.Join(watchCfg.LocalDir, fi.Name)
+					if err := w.syncRemoteFile(ctx, b, filePath, localPath); err != nil {
+						log.Printf("Event sync failed for %s: %v", filePath, err)
+						delete(w.processed, filePath)
+						return
+					}
+				}
+
+				if err := w.executeJobs(ctx, watchCfg.Jobs, filePath, localPath, fi.Name, watchCfg.LocalDir, b); err != nil {
 					log.Printf("Event job failed for %s: %v", filePath, err)
 					delete(w.processed, filePath)
 				} else if watchCfg.AutoCleanup {
@@ -545,7 +555,17 @@ func (w *Watcher) processWatch(ctx context.Context, watchCfg config.WatchConfig)
 		w.processed[filePath] = true
 		w.jobResults = make(map[string]bool)
 
-		if err := w.executeJobs(ctx, watchCfg.Jobs, filePath, file.Name, watchCfg.WatchDir, watchCfg.LocalDir, b); err != nil {
+		localPath := ""
+		if watchCfg.LocalDir != "" {
+			localPath = filepath.Join(watchCfg.LocalDir, file.Name)
+			if err := w.syncRemoteFile(ctx, b, filePath, localPath); err != nil {
+				log.Printf("Sync failed for %s: %v", filePath, err)
+				delete(w.processed, filePath)
+				continue
+			}
+		}
+
+		if err := w.executeJobs(ctx, watchCfg.Jobs, filePath, localPath, file.Name, watchCfg.LocalDir, b); err != nil {
 			log.Printf("Job failed for %s: %v (file left untouched)", filePath, err)
 			delete(w.processed, filePath)
 		} else if watchCfg.AutoCleanup {
@@ -569,8 +589,8 @@ func (w *Watcher) matchAnyPattern(filename string, patterns []string) bool {
 	return false
 }
 
-func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, filePath, fileName, watchDir, localDir string, b backend.FileTransferBackend) error {
-	vars := w.buildVariables(filePath, fileName, watchDir)
+func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, remoteFilePath, localFilePath, fileName, localDir string, b backend.FileTransferBackend) error {
+	vars := w.buildVariables(remoteFilePath, localFilePath, fileName)
 
 	for _, job := range jobs {
 		if job.If != "" {
@@ -595,26 +615,16 @@ func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, file
 				cwd = SubstituteVariables(cwd, vars)
 			}
 
-			// Try backend exec first (file exchange protocol)
-			if b.SupportsExec() {
-				// Use job timeout if provided
-				timeout := job.Timeout
-				output, err := b.Exec(ctx, cmd, cwd, timeout)
-				if err != nil {
-					w.jobResults[job.ID] = false
-					return fmt.Errorf("exec job %s failed: %w", job.ID, err)
-				}
-				w.jobResults[job.ID] = true
-				log.Printf("Exec job %s completed successfully: %s", job.ID, output)
-			} else {
-				// Fallback to local command execution
-				if err := w.runLocalCommand(cmd, cwd); err != nil {
-					w.jobResults[job.ID] = false
-					return fmt.Errorf("exec job %s failed: %w", job.ID, err)
-				}
-				w.jobResults[job.ID] = true
-				log.Printf("Exec job %s completed successfully (local)", job.ID)
+			// Jobs always execute locally on this (watch) machine. The backend is
+			// a pure file-transfer layer and never runs commands, so {file_path}
+			// must point at the locally-synced copy rather than the remote one.
+			stdout, stderr, exitCode := RunLocalCommandCapture(cmd, cwd, job.Timeout)
+			if exitCode != 0 {
+				w.jobResults[job.ID] = false
+				return fmt.Errorf("exec job %s failed (exit %d): %s", job.ID, exitCode, strings.TrimSpace(stderr))
 			}
+			w.jobResults[job.ID] = true
+			log.Printf("Exec job %s completed: %s", job.ID, stdout)
 
 		case "file_delete":
 			delPath := SubstituteVariables(job.Path, vars)
@@ -673,14 +683,39 @@ func (w *Watcher) evaluateCondition(cond string) (bool, error) {
 	return false, fmt.Errorf("invalid state: %s (expected success or failure)", state)
 }
 
-func (w *Watcher) buildVariables(filePath, fileName, watchDir string) map[string]string {
+func (w *Watcher) buildVariables(remoteFilePath, localFilePath, fileName string) map[string]string {
+	// When a local copy is available, the file-bound vars ({file_path}/
+	// {file_dir}) point at it, since exec jobs run locally. {file_remote_path}
+	// always refers to the original remote file (e.g. for cleanup deletes).
+	filePath := remoteFilePath
+	fileDir := filepath.Dir(remoteFilePath)
+	if localFilePath != "" {
+		filePath = localFilePath
+		fileDir = filepath.Dir(localFilePath)
+	}
 	return map[string]string{
 		"file_path":        filePath,
 		"file_name":        fileName,
-		"file_dir":         filepath.Dir(filePath),
-		"file_remote_path": filePath,
+		"file_dir":         fileDir,
+		"file_remote_path": remoteFilePath,
 		"timestamp":        time.Now().Format(time.RFC3339),
 	}
+}
+
+// syncRemoteFile downloads a matched remote file into localPath so the local
+// exec jobs can operate on the same file that arrived on the watch side.
+func (w *Watcher) syncRemoteFile(ctx context.Context, b backend.FileTransferBackend, remotePath, localPath string) error {
+	data, err := b.Read(ctx, remotePath)
+	if err != nil {
+		return fmt.Errorf("read remote file: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+		return fmt.Errorf("create local dir: %w", err)
+	}
+	if err := os.WriteFile(localPath, data, 0644); err != nil {
+		return fmt.Errorf("write local file: %w", err)
+	}
+	return nil
 }
 
 func matchPattern(filename, pattern string) bool {
