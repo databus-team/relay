@@ -78,8 +78,12 @@ func unifiedServerBase(data []byte) (serverBaseConfig, error) {
 	watchDirs := make([]server.WatchDirConfig, 0, len(cfg.Watch))
 	if sc != nil && sc.WatchRoot != "" {
 		// 单根模式:一个 watch_id 覆盖整个 watch_root,workspace 目录只是到时 root 下相对
-		// 子路径(供客户端路由),不再各自建服务器 watch。
-		id, _ := cfg.Backend.Config["watch_id"].(string)
+		// 子路径(供客户端),不再各自建服务器 watch。优先级:server.watch_id > backend.config.watch_id
+		// > 首个 workspace id > "relay"。
+		id := sc.WatchID
+		if id == "" {
+			id, _ = cfg.Backend.Config["watch_id"].(string)
+		}
 		if id == "" && len(cfg.Watch) > 0 {
 			id = cfg.Watch[0].ID
 		}

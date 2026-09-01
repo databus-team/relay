@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,13 +37,14 @@ var (
 )
 
 type Config struct {
-	URL         string `mapstructure:"url" yaml:"url"`
-	Token       string `mapstructure:"token" yaml:"token"`
-	WatchID     string `mapstructure:"watch_id" yaml:"watch_id"`
-	WatchDir    string `mapstructure:"watch_dir" yaml:"watch_dir"`
-	CommandDir  string `mapstructure:"command_dir" yaml:"command_dir"`
-	ExecutorDir string `mapstructure:"executor_dir" yaml:"executor_dir"`
-	Executor    bool   `mapstructure:"executor" yaml:"executor"`
+	URL         string            `mapstructure:"url" yaml:"url"`
+	Token       string            `mapstructure:"token" yaml:"token"`
+	WatchID     string            `mapstructure:"watch_id" yaml:"watch_id"`
+	WatchDir    string            `mapstructure:"watch_dir" yaml:"watch_dir"`
+	CommandDir  string            `mapstructure:"command_dir" yaml:"command_dir"`
+	ExecutorDir string            `mapstructure:"executor_dir" yaml:"executor_dir"`
+	Executor    bool              `mapstructure:"executor" yaml:"executor"`
+	Headers     map[string]string `mapstructure:"headers" yaml:"headers"` // WS 握手自定义头(中转前置鉴权)
 }
 
 func NewRelayBackend(config map[string]interface{}) (backend.FileTransferBackend, error) {
@@ -69,6 +71,14 @@ func NewRelayBackend(config map[string]interface{}) (backend.FileTransferBackend
 	if dir, ok := config["executor_dir"].(string); ok {
 		cfg.ExecutorDir = dir
 	}
+	if raw, ok := config["headers"].(map[string]interface{}); ok {
+		cfg.Headers = make(map[string]string, len(raw))
+		for k, v := range raw {
+			if s, ok := v.(string); ok {
+				cfg.Headers[k] = s
+			}
+		}
+	}
 
 	if cfg.WatchDir == "" {
 		cfg.WatchDir = "."
@@ -80,7 +90,16 @@ func NewRelayBackend(config map[string]interface{}) (backend.FileTransferBackend
 		cfg.WatchID = "default"
 	}
 
-	c, err := client.GetOrConnect(context.Background(), cfg.URL, cfg.Token, cfg.WatchID)
+	var opts []client.Option
+	if len(cfg.Headers) > 0 {
+		h := make(http.Header, len(cfg.Headers))
+		for k, v := range cfg.Headers {
+			h.Set(k, v)
+		}
+		opts = append(opts, client.WithHeaders(h))
+	}
+
+	c, err := client.GetOrConnect(context.Background(), cfg.URL, cfg.Token, cfg.WatchID, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("create client: %w", err)
 	}

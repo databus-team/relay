@@ -28,6 +28,9 @@ backend:
   config:
     url: ${RELAY_SERVER_URL}          # ws://host:port/relay or wss://...
     token: ${RELAY_TOKEN}
+    # headers:                          # 可选:WebSocket 握手携带的 HTTP 头(中转前置鉴权)
+    #   Cookie: "code-server-session=..."
+    #   X-Api-Key: ${RELAY_API_KEY}
     watch_id: web-app-patches          # subscribe to this watch on server
     watch_dir: .                       # remote watch directory (relative to server's watch dir)
     command_dir: /tmp/relay-commands   # shared command directory for hot-reload
