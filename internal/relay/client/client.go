@@ -40,6 +40,9 @@ type Client struct {
 	pushJobHandlerM sync.RWMutex
 	execHandlerM    sync.RWMutex
 
+	pushRecvMu sync.RWMutex
+	pushRecv   map[string]*inboundPushReceive // streamID -> 入站流式 push 接收状态
+
 	onReconnect   func() // 重连成功后的回调(执行方用于重新注册)
 	onReconnectMu sync.Mutex
 }
@@ -58,6 +61,7 @@ func New(url, token, watchID string) (*Client, error) {
 		streams:      make(map[string]*receiveStream),
 		streamDone:   make(map[string]chan error),
 		execStreams:  make(map[string]chan *protocol.Message),
+		pushRecv:     make(map[string]*inboundPushReceive),
 	}, nil
 }
 
@@ -201,6 +205,11 @@ func (c *Client) sendMessage(msg *protocol.Message) error {
 func (c *Client) handleMessage(msg protocol.Message) {
 	// 请求方流式 exec:命中 execStreams 的输出/收尾帧直接投递,不落入 pending
 	if c.routeExecStream(&msg) {
+		return
+	}
+
+	// 执行方入站流式 push:命中 pushRecv 的内容/结束帧直接写盘消费。
+	if c.routeInboundPushStream(&msg) {
 		return
 	}
 

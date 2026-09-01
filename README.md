@@ -112,9 +112,10 @@ relay push -w web-app-patches ./my.patch
 Pushes file or directory to the watch's `watch_dir` on the remote backend.
 
 With the **relay** backend, a single-file push is **transparent**: the file is delivered directly to the online remote executor's project
-directory (`executor_dir`), and the remote runs that workspace's **jobs automatically**, streaming job output back to the local command.
-If no executor is online, `push` falls back to staging the file on the transit server's `watch_dir` (the classic watch-and-pull flow) and
-prints a `[staged to transit; no online executor, jobs not run]` notice. Directories still use the plain staging path.
+directory (`executor_dir`), and the executor runs that file's **jobs automatically**, streaming job output back to the local command.
+Arbitrarily large files (a multi-MB `relay` binary, a big patch) are handled: the content is streamed hop-by-hop in 64KB zstd-compressed
+binary chunks instead of being sent as one giant base64 message. If no executor is online, `push` falls back to staging the file on the
+transit server's `watch_dir` (the classic watch-and-pull flow) and prints a `[staged ...]` notice. Directories still use the plain staging path.
 
 ### pull — Download File
 

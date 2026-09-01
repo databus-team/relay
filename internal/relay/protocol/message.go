@@ -128,12 +128,14 @@ type RegisterExecutorRequest struct {
 }
 
 // PushJobRequest push 一个文件直达远端执行方并在其本地跑 jobs。
-// Content 为 base64 内联文本,避免再引入双向字节流转发。
+// 这是流式 push 的元数据头:文件内容分块走 MsgStreamData(二进制)/MsgStreamEnd。
 type PushJobRequest struct {
-	WatchID string `json:"watch_id"`
-	RelPath string `json:"rel_path"` // 相对执行方项目根的路径
-	Mode    uint32 `json:"mode"`
-	Content []byte `json:"content"`
+	WatchID  string `json:"watch_id"`
+	RelPath  string `json:"rel_path"` // 相对执行方项目根的路径
+	Mode     uint32 `json:"mode"`
+	Size     int64  `json:"size"`
+	Digest   string `json:"digest"` // sha256 十六进制,落盘后校验
+	StreamID string `json:"stream_id"`
 }
 
 // PushRequest 上传文件请求
