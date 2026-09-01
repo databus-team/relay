@@ -63,6 +63,10 @@ var (
 	execWatch  = execCmd.Flag("watch", "Target watch ID").Short('w').String()
 	execCmdStr = execCmd.Arg("command", "Command to execute").Required().String()
 
+	// Ping command - check remote watcher liveness
+	pingCmd   = kingpin.Command("ping", "Ping the remote watcher to check if it is alive")
+	pingWatch = pingCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
+
 	// Cleanup command - remove stale command files
 	cleanupCmd   = kingpin.Command("cleanup", "Remove stale command and result files from remote")
 	cleanupWatch = cleanupCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
@@ -98,6 +102,8 @@ func main() {
 		runPush()
 	case execCmd.FullCommand():
 		runExec()
+	case pingCmd.FullCommand():
+		runPing()
 	case listCmd.FullCommand():
 		runList()
 	case cleanupCmd.FullCommand():
@@ -628,6 +634,51 @@ func runExec() {
 	}
 
 	fmt.Print(result)
+}
+
+// runPing 探活远端 watcher。workspace 解析:显式 -w 优先,否则按 cwd 推断,
+// 推断失败则报可用清单退出(与 exec 的折叠逻辑一致)。
+func runPing() {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	w := *pingWatch
+	if w == "" {
+		if inferred, err := resolveWorkspaceID(cfg, ""); err == nil {
+			w = inferred
+		}
+	}
+	if w == "" {
+		fmt.Fprintf(os.Stderr, "Specify -w. Available: %s\n", joinAvailable(cfg.Watch))
+		os.Exit(1)
+	}
+	watchCfg, err := cfg.GetWatchByID(w)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+		os.Exit(1)
+	}
+
+	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
+		os.Exit(1)
+	}
+
+	commandDir := "/tmp/relay-commands"
+	if dir, ok := cfg.Backend.Config["command_dir"].(string); ok && dir != "" {
+		commandDir = dir
+	}
+
+	start := time.Now()
+	if err := b.Ping(context.Background(), commandDir, watchCfg.ID); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	// 探活成功。relay 后端 Ping 忽略 watchID,输出上仍标注目标 workspace 便于区分。
+	fmt.Printf("OK — remote watcher %q reachable via %s (%s)\n", watchCfg.ID, cfg.Backend.Type, time.Since(start).Round(time.Millisecond))
 }
 
 func runJobRun() {
