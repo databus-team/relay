@@ -734,6 +734,20 @@ func runLocalJobsForPush(watchID, absPath string, out func(backend.ExecChunk)) i
 		}
 		dur := r.Duration.Round(time.Millisecond)
 		out(backend.ExecChunk{Stdout: r.Err == nil, Data: fmt.Sprintf("[jobs %d/%d] %s %s %s (exit=%d, %s)\n", step, st.Total, mark, r.JobID, okc, r.ExitCode, dur)})
+		// 失败时把该 job 捕获到的输出(stdout/stderr)一并回显,缓冲即为此用,便于定位根因
+		if r.Err != nil {
+			for _, b := range []struct {
+				stdout bool
+				s      string
+			}{{true, r.Stdout}, {false, r.Stderr}} {
+				for _, line := range strings.Split(b.s, "\n") {
+					if strings.TrimSpace(line) == "" {
+						continue
+					}
+					out(backend.ExecChunk{Stdout: b.stdout, Data: "      │ " + line + "\n"})
+				}
+			}
+		}
 	})
 	return exit
 }
