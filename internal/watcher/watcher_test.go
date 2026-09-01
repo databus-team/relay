@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/config"
+	"github.com/user/relay/internal/exchange"
 )
 
 // stubBackend records Delete calls so tests can assert what file_delete jobs
@@ -247,6 +249,42 @@ func TestApplyPendingConfigAtomic(t *testing.T) {
 	}
 	if string(data) != "new config" {
 		t.Errorf("config content: got %q, want %q", string(data), "new config")
+	}
+}
+
+// sync 指令一旦被处理就应立刻落盘:事件驱动模式(relay 后端)的主循环从不调用
+// runOnce/applyPendingConfig,若只"stage 到下一周期"则配置永远不会写盘
+// (此前表现:日志显示同步成功但配置文件仍旧)。回归用例验证立即生效。
+func TestHandleConfigSyncAppliesImmediately(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("name: old\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := &Watcher{cfg: &config.Config{}, configPath: configPath}
+
+	payload := []byte("name: relay\nversion: 2\nbackend:\n  type: relay\ninterval_seconds: 10\n")
+	cmd := exchange.CmdFile{
+		ID:      "sync-1",
+		Op:      exchange.ConfigSyncOp,
+		Payload: base64.StdEncoding.EncodeToString(payload),
+	}
+
+	res, err := w.handleConfigSync(context.Background(), cmd, nil)
+	if err != nil {
+		t.Fatalf("handleConfigSync: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("exit=%d stderr=%s", res.ExitCode, res.Stderr)
+	}
+
+	got, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read applied config: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Errorf("config not applied to disk:\n got=%q\nwant=%q", got, payload)
 	}
 }
 
