@@ -1,16 +1,20 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -136,6 +140,9 @@ func (c *Client) handleMessage(msg protocol.Message) {
 	case protocol.MsgConfigSync:
 		c.handleConfigSync(msg)
 
+	case protocol.MsgServerUpgrade:
+		c.handleServerUpgrade(msg)
+
 	case protocol.MsgSubscribe:
 		c.handleSubscribe(msg)
 
@@ -234,6 +241,114 @@ func (c *Client) handleExec(msg protocol.Message) {
 // 记录请求方 → 原样转发);config 必须只在真执行方上落盘,无执行方时直接 fail-fast,不透传暂存。
 func (c *Client) handleConfigSync(msg protocol.Message) {
 	c.forwardToExecutor(msg)
+}
+
+// handleServerUpgrade 处理「服务器自升级」消息,由中转本地处理,绝不转发执行方。
+// 鉴权硬约束(KTD5/R2):仅当服务器显式配置了 token 时升级通道才可用;未配置 token 时
+// 通道默认关闭——与既有「无 token 即放行」的文件交换姿态显式区分。自检通过后先回执
+// 成功 ACK,再进入 U3 的换装(停旧 → .prev 备份 → 替换 → 重启)。
+func (c *Client) handleServerUpgrade(msg protocol.Message) {
+	if len(c.server.auth.Tokens) == 0 {
+		c.SendError(msg.ID, "server upgrade: token auth not configured; channel disabled")
+		return
+	}
+
+	var req protocol.ServerUpgradeRequest
+	if b, err := json.Marshal(msg.Payload); err == nil {
+		_ = json.Unmarshal(b, &req)
+	}
+	streamID := req.StreamID
+	if streamID == "" {
+		payload, _ := msg.Payload.(map[string]interface{})
+		streamID = toString(payload["stream_id"])
+	}
+	if streamID == "" {
+		c.SendError(msg.ID, "server upgrade: missing stream_id")
+		return
+	}
+
+	// 落盘路径完全由服务端生成(随机 uuid),绝不使用客户端提供的路径/字段;并 O_EXCL
+	// 独占创建,防覆盖/防路径穿越。内容被子继承流式接收落盘,收尾(rename 完成)再校验+自检。
+	tmpBin := filepath.Join(os.TempDir(), "relay-upgrade-"+uuid.New().String()+".bin")
+	partPath := tmpBin + ".incoming"
+	f, err := os.OpenFile(partPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		c.SendError(msg.ID, "server upgrade: create temp: "+err.Error())
+		return
+	}
+	f.Close()
+
+	reqID := msg.ID
+	c.streamMu.Lock()
+	c.streams[streamID] = &ReceiveStream{
+		streamID: streamID,
+		path:     tmpBin,
+		tmpPath:  partPath,
+		onDone: func() {
+			c.finishServerUpgrade(reqID, tmpBin, req.Digest)
+		},
+	}
+	c.streamMu.Unlock()
+}
+
+// finishServerUpgrade 流式收盘后在 onDone 上执行:sha256 摘要比对 → 本地自检 → 自检通过
+// 则先回执成功 ACK(此时换装尚未开始),随后由 swapServerUpgrade(U3) 接手停旧/备份/换装/重启。
+func (c *Client) finishServerUpgrade(reqID, tmpBin, expectedDigest string) {
+	// 1) 摘要与请求声明比对;不一致即中止,不触碰现行二进制。
+	if err := verifyFileDigest(tmpBin, expectedDigest); err != nil {
+		os.Remove(tmpBin)
+		c.SendError(reqID, "server upgrade: digest mismatch: "+err.Error())
+		return
+	}
+	// 1.5) 落盘二进制需可执行才能做子进程自检;置 0755(不影响真相校验)。
+	_ = os.Chmod(tmpBin, 0o755)
+	// 2) 自检:子进程 `version` 探测是否可启动(超时 10s)。语义上限为防损坏/防不可启动。
+	if err := selfCheckBinary(context.Background(), tmpBin); err != nil {
+		os.Remove(tmpBin)
+		c.SendError(reqID, "server upgrade: self-check failed: "+err.Error())
+		return
+	}
+	// 3) 自检通过 → 先回执成功 ACK(AE4):请求方以这里为成功结算点,随后才换装。
+	_ = c.SendResponse(reqID, map[string]interface{}{"ok": true, "verified": true})
+	// U3 在此接入换装(停旧 → .prev 备份 → 替换 → 重启)。
+}
+
+// verifyFileDigest 计算文件 sha256 并与期望值比对;期望为空视为缺失摘要而拒绝。
+func verifyFileDigest(path, expected string) error {
+	if expected == "" {
+		return fmt.Errorf("missing expected digest")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if got != expected {
+		return fmt.Errorf("sha256 %s != expected %s", got, expected)
+	}
+	return nil
+}
+
+// selfCheckBinary 用待装二进制自带的 version 子命令做「可启动」探测:子进程在超时内
+// 以退出码 0 且产出非空解析输出方判定通过。语义上限为防损坏/防不可启动;真实性由 R2 的
+// token 承担,此处不校验来源。
+func selfCheckBinary(ctx context.Context, binPath string) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binPath, "version")
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("spawn binary: %w", err)
+	}
+	if strings.TrimSpace(string(out)) == "" {
+		return fmt.Errorf("binary produced no parseable version output")
+	}
+	return nil
 }
 
 // handleRegisterExecutor 处理执行方注册/注销。

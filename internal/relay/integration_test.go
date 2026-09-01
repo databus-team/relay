@@ -7,18 +7,21 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/user/relay/internal/relay/client"
 	"github.com/user/relay/internal/relay/protocol"
 	"github.com/user/relay/internal/relay/server"
 )
 
-func setupTestServer(t *testing.T, watchDir string) (*httptest.Server, string) {
+func setupTestServerAuth(t *testing.T, watchDir string, tokens []string) (*httptest.Server, string) {
 	t.Helper()
 
 	cfg := server.Config{
@@ -28,7 +31,7 @@ func setupTestServer(t *testing.T, watchDir string) (*httptest.Server, string) {
 		},
 		Auth: server.AuthConfig{
 			Type:   "token",
-			Tokens: []string{"test-token"},
+			Tokens: tokens,
 		},
 	}
 
@@ -41,6 +44,11 @@ func setupTestServer(t *testing.T, watchDir string) (*httptest.Server, string) {
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/relay"
 
 	return ts, wsURL
+}
+
+func setupTestServer(t *testing.T, watchDir string) (*httptest.Server, string) {
+	t.Helper()
+	return setupTestServerAuth(t, watchDir, []string{"test-token"})
 }
 
 func connectTestClient(t *testing.T, wsURL string) *client.Client {
@@ -538,4 +546,175 @@ func TestIntegration_ReconnectConcurrentWrites(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// upgradeOverWS 用裸 websocket 驱动一次「服务器自升级」协议交互:连接 → 发 MsgServerUpgrade
+// 头 → 流式上传 content(分块 + 摘要)→ 回读直到 MsgResponse(成功)/MsgError(失败)。
+// 返回 (ok, errMsg);ok=true 表示收到成功 ACK(AE4 的 ACK 早于换装)。
+func upgradeOverWS(t *testing.T, wsURL, token string, content []byte, digest string) (bool, string) {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// 握手:connect + token
+	if err := conn.WriteJSON(protocol.Message{Type: protocol.MsgConnect, ID: "up-conn", Payload: protocol.ConnectRequest{ClientID: "upgrade-client", Token: token, Version: 1}}); err != nil {
+		t.Fatalf("write connect: %v", err)
+	}
+	var ack protocol.Message
+	if err := conn.ReadJSON(&ack); err != nil {
+		t.Fatalf("read connect ack: %v", err)
+	}
+
+	streamID := "stream-up-" + fmt.Sprint(time.Now().UnixNano())
+	header := protocol.Message{
+		Type:     protocol.MsgServerUpgrade,
+		ID:       "up-1",
+		StreamID: streamID,
+		Payload: protocol.ServerUpgradeRequest{
+			WatchID:  "test-watch",
+			Size:     int64(len(content)),
+			Digest:   digest,
+			StreamID: streamID,
+		},
+	}
+	if err := conn.WriteJSON(header); err != nil {
+		t.Fatalf("write upgrade header: %v", err)
+	}
+
+	// 分块流式上传内容(压缩二进制帧)。
+	if len(content) > 0 {
+		chunkSize := protocol.DefaultChunkSize
+		var offset int64
+		chunk := 0
+		for offset < int64(len(content)) {
+			end := offset + int64(chunkSize)
+			if end > int64(len(content)) {
+				end = int64(len(content))
+			}
+			piece := content[offset:end]
+			if err := conn.WriteJSON(protocol.Message{
+				Type:     protocol.MsgStreamData,
+				ID:       uuid.New().String(),
+				StreamID: streamID,
+				Payload:  protocol.StreamData{StreamID: streamID, Offset: offset, Chunk: chunk},
+			}); err != nil {
+				t.Fatalf("write stream data: %v", err)
+			}
+			if err := conn.WriteMessage(websocket.BinaryMessage, protocol.Compress(piece)); err != nil {
+				t.Fatalf("write binary: %v", err)
+			}
+			offset = end
+			chunk++
+		}
+	}
+
+	endMsg := protocol.Message{
+		Type:     protocol.MsgStreamEnd,
+		ID:       uuid.New().String(),
+		StreamID: streamID,
+		Payload:  protocol.StreamEnd{StreamID: streamID, OK: true, Received: int64(len(content)), Digest: digest},
+	}
+	if err := conn.WriteJSON(endMsg); err != nil {
+		t.Fatalf("write stream end: %v", err)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	for {
+		var m protocol.Message
+		if err := conn.ReadJSON(&m); err != nil {
+			t.Fatalf("read reply: %v", err)
+		}
+		switch m.Type {
+		case protocol.MsgResponse:
+			return true, ""
+		case protocol.MsgError:
+			errMsg, _ := m.Payload.(string)
+			return false, errMsg
+		}
+	}
+}
+
+// TestIntegration_ServerUpgrade_NoToken:服务器未配置 token → 升级通道默认关闭(AE3)。
+func TestIntegration_ServerUpgrade_NoToken(t *testing.T) {
+	watchDir := t.TempDir()
+	ts, wsURL := setupTestServerAuth(t, watchDir, nil)
+	defer ts.Close()
+
+	ok, errMsg := upgradeOverWS(t, wsURL, "", []byte("x"), "abc")
+	if ok {
+		t.Fatal("expected upgrade channel to be disabled without token, got ACK")
+	}
+	if !strings.Contains(errMsg, "disabled") {
+		t.Errorf("unexpected error: %q", errMsg)
+	}
+}
+
+// TestIntegration_ServerUpgrade_DigestMismatch:摘要不符 → 中止(AE1)。
+func TestIntegration_ServerUpgrade_DigestMismatch(t *testing.T) {
+	watchDir := t.TempDir()
+	ts, wsURL := setupTestServer(t, watchDir)
+	defer ts.Close()
+
+	// 内容合法但用错误摘要声明。
+	content := []byte("some-bytes")
+	ok, errMsg := upgradeOverWS(t, wsURL, "test-token", content, "0000000000000000000000000000000000000000000000000000000000000000")
+	if ok {
+		t.Fatal("expected digest mismatch to abort, got ACK")
+	}
+	if !strings.Contains(errMsg, "digest") {
+		t.Errorf("unexpected error: %q", errMsg)
+	}
+}
+
+// TestIntegration_ServerUpgrade_SelfCheckFail:自检失败 → 不换装、保留现行二进制(AE2)。
+func TestIntegration_ServerUpgrade_SelfCheckFail(t *testing.T) {
+	watchDir := t.TempDir()
+	ts, wsURL := setupTestServer(t, watchDir)
+	defer ts.Close()
+
+	// 正确的摘要,但内容是不可启动的垃圾字节(bin 非可执行/不能以 version 启动)。
+	content := []byte("#!/bin/sh\nexit 3\n")
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+
+	ok, errMsg := upgradeOverWS(t, wsURL, "test-token", content, digest)
+	if ok {
+		t.Fatal("expected self-check failure to abort, got ACK")
+	}
+	if !strings.Contains(errMsg, "self-check") {
+		t.Errorf("unexpected error: %q", errMsg)
+	}
+}
+
+// TestIntegration_ServerUpgrade_ACK:自检通过 → 先回执成功 ACK(AE4,换装前 U2 结算)。
+func TestIntegration_ServerUpgrade_ACK(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds real relay binary")
+	}
+	watchDir := t.TempDir()
+	ts, wsURL := setupTestServer(t, watchDir)
+	defer ts.Close()
+
+	// 构建一份真实 relay 二进制作为「可启动」负载,供自检通过路径使用。
+	bin := filepath.Join(t.TempDir(), "relay-upgrade-test")
+	build := exec.Command("go", "build", "-o", bin, "github.com/user/relay/cmd/relay")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build relay for upgrade test: %v\n%s", err, out)
+	}
+	content, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatalf("read built binary: %v", err)
+	}
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+
+	ok, errMsg := upgradeOverWS(t, wsURL, "test-token", content, digest)
+	if !ok {
+		t.Fatalf("expected self-check pass + ACK, got error: %s", errMsg)
+	}
 }
