@@ -494,14 +494,24 @@ func (w *Watcher) handleConfigSync(ctx context.Context, cmd exchange.CmdFile, b 
 	}
 	log.Printf("[commands] Config backed up to: %s", backupPath)
 
-	// Stage pending config for next cycle
+	// 立刻落盘,而不是"stage 到下一次 runOnce":事件驱动模式(relay 后端)的主循环
+	// 从不调用 runOnce → applyPending 只在 interval 模式被调用,导致 sync 后配置
+	// 永远不落盘(日志显示成功但文件仍旧)。这里先存入 pending 再立即 apply 原子写盘,
+	// 两种模式对同步发起的配置变更都即时生效。
 	w.pendingConfigMu.Lock()
 	w.pendingConfig = payload
 	w.pendingConfigMu.Unlock()
 
+	if err := w.applyPendingConfig(); err != nil {
+		result.ExitCode = 1
+		result.Stderr = "failed to apply config: " + err.Error()
+		log.Printf("[commands] Config sync apply failed: %v", err)
+		return result, nil
+	}
+
 	result.ExitCode = 0
-	result.Stdout = "config staged for next cycle; backup at " + backupPath
-	log.Printf("[commands] Config sync succeeded; staging %d bytes for next cycle", len(payload))
+	result.Stdout = "config applied; backup at " + backupPath
+	log.Printf("[commands] Config sync applied %d bytes", len(payload))
 
 	return result, nil
 }
