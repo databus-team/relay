@@ -109,16 +109,23 @@ restart_binary() {
   local w="$1" st dest
   st="${REMOTE_NEW:-${REMOTE_BIN_PATH}.new}"
   dest="${REMOTE_BIN_PATH:-}"
-  log "触发 daemon 自升级换装 (st=$st -> dest=${dest:-<远端 command -v relay>}, RESTART=1) ..."
-  # 复用 relay 自身的 `watch upgrade`:停 daemon -> 原子替换二进制 -> 以守护进程重启。
-  # 相比手写 taskkill + nohup 拉起:upgrade 走 daemonStart(detach + HideWindow,无黑窗),
-  # 并写 ~/.relay/watch.pid,`relay watch status` 才能正确显示运行态。
-  # 注意:upgrade 会先停掉正在服务本 exec 的 daemon,本命令的回包可能被切断;
-  # 但停->换->起在远端执行,由后续 verify()(relay version -r)兜底核对。
-  relay exec -c "$CONFIG" -w "$w" "\"$dest\" watch upgrade \"$st\" -c \"\$HOME/.relay/config.yaml\"" \
-    && log "daemon 自升级完成" \
-    || warn "exec 回包断开是预期(服务 daemon 被替换);结果以 verify 为准"
-  log "daemon 自升级已触发;日志: ~/.relay/watch.log"
+  log "换装 $st -> $dest (RESTART=1)..."
+  # 不用 `watch upgrade` 换装:它会对「运行中的 exe」做自覆盖,Windows 下失败,
+  # 会旧 daemon 已停、新的又没起来 -> watch 卡在 stopped。
+  # 改用外部 sh 一次完成「停旧 -> 挪走旧 -> 挪入新 -> 起新」,与自替换无关:
+  #   watch stop   停旧 daemon(释放仍映射旧 exe 的进程)
+  #   mv dest -> dest.prev / st -> dest(旧换出、新的就位)
+  #   watch start  以守护进程重启新 daemon(detach + 写 pid,无黑窗)
+  # 注意:该 exec 由旧 daemon 服务,watch stop 停掉它后回包会断,链仍随 exec
+  # 解耦继续完成(detached),结果由 verify(relay version -r) 兜底核对。
+  local script
+  script="\"\$dest\" watch stop -c \"\$HOME/.relay/config.yaml\" ; "
+  script+="mv -f \"\$dest\" \"\$dest.prev\" ; "
+  script+="mv -f \"\$st\" \"\$dest\" ; "
+  script+="nohup \"\$dest\" watch start -c \"\$HOME/.relay/config.yaml\" >/dev/null 2>&1 &"
+  relay exec -c "$CONFIG" -w "$w" "$script" \
+    || warn "watch 停止后 exec 回包断是预期;换装结果以 verify (relay version -r) 为准"
+  log "换装已触发;远端日志: ~/.relay/watch.log"
 }
 
 # ---- 6) 中转手工清单 ----

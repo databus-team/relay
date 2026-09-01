@@ -2,6 +2,7 @@
 /relay
 /relay-linux
 *.exe
+*.staged
 *.dll
 *.so
 *.dylib
