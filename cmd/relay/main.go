@@ -1055,7 +1055,7 @@ func runServerRemote() {
 	fmt.Printf("[server-remote] 上传 %s (%d bytes) 到中转并触发自升级 ...\n", bin, len(data))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	if err := rb.UpgradeServer(ctx, bin, data); err != nil {
+	if err := rb.UpgradeServer(ctx, data); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: server upgrade failed: %v\n", err)
 		fmt.Fprintf(os.Stderr, "提示: 中转已保留 .prev 备件;请人工回退(如经 code-server 上传 + `relay server upgrade`)后再重试。\n")
 		os.Exit(1)

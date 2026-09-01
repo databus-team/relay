@@ -259,10 +259,6 @@ func (c *Client) handleServerUpgrade(msg protocol.Message) {
 	}
 	streamID := req.StreamID
 	if streamID == "" {
-		payload, _ := msg.Payload.(map[string]interface{})
-		streamID = toString(payload["stream_id"])
-	}
-	if streamID == "" {
 		c.SendError(msg.ID, "server upgrade: missing stream_id")
 		return
 	}
@@ -526,6 +522,25 @@ func (c *Client) maybeRelayExecReply(msg protocol.Message) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// cleanupStreams 断连时清理该客户端未完成流的临时文件(如自升级暂存 .incoming),
+// 避免客户端中途掉线(未发 MsgStreamEnd)留下孤儿临时文件。
+func (c *Client) cleanupStreams() {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+	for id, stream := range c.streams {
+		if stream == nil {
+			continue
+		}
+		if stream.tmpPath != "" {
+			os.Remove(stream.tmpPath)
+		}
+		if stream.path != "" && stream.path != stream.tmpPath {
+			os.Remove(stream.path)
+		}
+		delete(c.streams, id)
 	}
 }
 
