@@ -9,7 +9,7 @@ GOTEST := $(GOCMD) test
 GOCLEAN := $(GOCMD) clean
 GOMOD := $(GOCMD) mod
 
-.PHONY: all build test clean install fmt vet help
+.PHONY: all build build-release build-linux build-windows build-debug test test-coverage clean install deps fmt vet run help
 
 all: build
 
@@ -20,6 +20,10 @@ build:
 ## build-release: Build optimized binary for production
 build-release:
 	CGO_ENABLED=0 $(GOBUILD) -ldflags="-s -w" -o $(BINARY_NAME) $(MAIN_PATH)
+
+## build-linux: Cross-compile for Linux x64
+build-linux:
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GOBUILD) -ldflags="-s -w" -o $(BINARY_NAME)-linux $(MAIN_PATH)
 
 ## build-windows: Cross-compile for Windows x64
 build-windows:
@@ -91,6 +95,8 @@ help:
 	@echo ""
 	@echo "Usage:"
 	@echo "  make build          Build the binary"
+	@echo "  make build-linux    Cross-compile for Linux x64"
+	@echo "  make build-windows  Cross-compile for Windows x64"
 	@echo "  make test           Run all tests"
 	@echo "  make clean          Clean build artifacts"
 	@echo "  make install        Build and install to ~/.local/bin"
