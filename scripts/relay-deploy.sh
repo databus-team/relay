@@ -137,10 +137,11 @@ transit() {
 === 中转服务器更新(半自动:经 code-server web 人工) ===
 中转无程序化通道,需手工:
   1. 已生成 relay-linux,经 code-server web 上传到中转可达目录(e.g. $HOME/relay/)
-  2. 停掉当前中转前台进程(Ctrl-C 或 kill)
-  3. 替换并重启:
-       cp relay-linux ~/.local/bin/relay && chmod +x ~/.local/bin/relay
-       relay server -c ~/.relay/config.yaml
+  2. 替换二进制并重启(可用新 daemon 形式):
+       cp -f relay-linux ~/.local/bin/relay && chmod +x ~/.local/bin/relay
+       relay server restart -c ~/.relay/config.yaml   # daemon 重启(旧进程被 SIGTERM)
+       # 或前台: relay server -c ~/.relay/config.yaml
+  状态查看: relay server status -c ~/.relay/config.yaml
 EOF
 }
 

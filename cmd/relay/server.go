@@ -19,6 +19,9 @@ import (
 var (
 	serverCmd = kingpin.Command("server", "Run relay server")
 
+	// 位置参数 action:默认前台;run=前台;start/stop/status/restart 为 daemon 控制。
+	serverAction = serverCmd.Arg("action", "run|start|stop|status|restart (default: run)").HintOptions("run", "start", "stop", "status", "restart").String()
+
 	serverConfigPath = serverCmd.Flag("server-config", "Path to server config file (YAML)").String()
 	serverAddr       = serverCmd.Flag("addr", "Server listen address").String()
 	serverWatchDirs  = serverCmd.Flag("watch", "Watch directory (format: id:path)").Strings()
