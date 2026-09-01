@@ -483,6 +483,8 @@ func runStream(cmdStr, cwd string, timeout int, emit func(stdout bool, data stri
 	shell, env := relayExecShell()
 	c := exec.CommandContext(ctx, shell, "-c", cmdStr)
 	c.Env = env
+	// Windows 后台 daemon 下 spawn sh 默认会带出 cmd 控制台窗口闪烁,这里压掉。
+	backend.HideConsoleWindow(c)
 	// cwd 可能来自远端/本地 client(config 里 MSYS 风格 /d/...)。执行方要用自己平台
 	// 能 chdir 的原生路径:在 Windows 上转成 D:\...。
 	c.Dir = normalizeExecDir(cwd)

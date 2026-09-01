@@ -557,6 +557,7 @@ func RunLocalCommandCapture(cmdStr, cwd string, timeout int) (string, string, in
 	if cwd != "" {
 		execCmd.Dir = cwd
 	}
+	backend.HideConsoleWindow(execCmd)
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	execCmd.Stdout = &stdoutBuf
