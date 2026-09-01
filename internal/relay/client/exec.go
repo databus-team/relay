@@ -119,8 +119,79 @@ func (c *Client) Exec(ctx context.Context, cmd string, cwd string, timeout int) 
 	return c.ExecStream(ctx, cmd, cwd, timeout, nil)
 }
 
-// ConfigSync 把一份新配置(latest 端经 ExpandEnv 后)经中转直达执行方落盘(单次应答,
-// 与 ExecStream 复用同一 execStreams/execRoundTrip 回包管道)。返回执行方 exit code。
+// UpgradeServer 把本地构建的 relay 二进制以流式分块 + sha256 摘要交付给中转(请求方视角),
+// 触发中转「服务器自升级」。本方法以中转自检通过后的成功 ACK 为结算点返回 nil;此后中转
+// 才停旧/换装/重启,断线重连与 `relay version -r` 的最终核验由上层 CLI 负责。
+func (c *Client) UpgradeServer(ctx context.Context, binaryPath string, content []byte) error {
+	if len(content) == 0 {
+		content = []byte{}
+	}
+
+	reqID, ch := c.registerInStream()
+	defer c.unregisterInStream(reqID)
+	streamID := uuid.New().String()
+
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+	total := int64(len(content))
+
+	header := &protocol.Message{
+		Type: protocol.MsgServerUpgrade,
+		ID:   reqID,
+		Payload: protocol.ServerUpgradeRequest{
+			WatchID:  c.watchID,
+			Size:     total,
+			Digest:   digest,
+			StreamID: streamID,
+		},
+	}
+	select {
+	case c.sendCh <- sendMsg{Message: header}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	// 分块流式发送内容(压缩二进制帧),与 PushJob/Transport 块语义一致。
+	chunkSize := protocol.DefaultChunkSize
+	var offset int64
+	chunk := 0
+	for offset < total {
+		end := offset + int64(chunkSize)
+		if end > total {
+			end = total
+		}
+		piece := content[offset:end]
+		dataMsg := &protocol.Message{
+			Type:     protocol.MsgStreamData,
+			ID:       uuid.New().String(),
+			StreamID: streamID,
+			Payload:  protocol.StreamData{StreamID: streamID, Offset: offset, Chunk: chunk},
+		}
+		select {
+		case c.sendCh <- sendMsg{Message: dataMsg, Raw: protocol.Compress(piece)}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		offset = end
+		chunk++
+	}
+
+	endMsg := &protocol.Message{
+		Type:     protocol.MsgStreamEnd,
+		ID:       uuid.New().String(),
+		StreamID: streamID,
+		Payload:  protocol.StreamEnd{StreamID: streamID, OK: true, Received: total, Digest: digest},
+	}
+	select {
+	case c.sendCh <- sendMsg{Message: endMsg}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	// 传输副作用以收尾 ACK(MsgResponse)为结算点;失败(摘要/自检不过)会经 MsgError 返回。
+	_, err := c.execRoundTrip(ctx, ch, nil)
+	return err
+}
 func (c *Client) ConfigSync(ctx context.Context, payload []byte) (*protocol.ExecResponse, error) {
 	reqID, ch := c.registerInStream()
 	defer c.unregisterInStream(reqID)

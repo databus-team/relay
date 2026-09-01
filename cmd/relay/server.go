@@ -259,6 +259,8 @@ func transitSelfUpgrade(newBin string) {
 		log.Printf("[upgrade] swap failed, .prev retained: %v", err)
 		return
 	}
+	// 换装完成即清理暂存二进制(无灰烬);随后原地重启，不保留 .tmp 文件。
+	os.Remove(newBin)
 	if err := syscall.Exec(exe, os.Args, os.Environ()); err != nil {
 		log.Printf("[upgrade] in-place restart failed: %v", err)
 	}

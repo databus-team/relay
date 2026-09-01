@@ -7,14 +7,15 @@
 #                    自动探测执行器 OS/arch 并交叉编译对应版本。
 #                    RESTART=1 时自动 detached 换装并重启(先停->换->起,且不能砍
 #                    掉正在服务本连接的 relay,故延迟后分离执行)。
-#   中转(transit) —— 半自动:中转无任何程序化通道(SSH 不可达、非 executor、relay 只
-#                  做文件交换),只能经 code-server web 人工上传替换。脚本构建 linux
-#                  二进制并打印精确手工步骤。
+#   中转(transit) —— 一键:经 `relay server-remote` 受控自升级通道把新构建的 relay-linux
+#                  流式交付中转(中转本地自检 → 回执 → 换装 .prev备份/重启),本地断连
+#                  重连轮询版本核验。仅放开「自我升级」一条窄径,中转不获得任意执行能力。
+#                  首跳依赖:在跑旧构建的中转需一次手工 seed(relay server upgrade)。
 #
 # 用法:
 #   RESTART=1 make deploy-remote    # 部署远端 + 自动替换重启
 #   make deploy-remote              # 只下发,不重启(安全)
-#   make deploy-transit             # 只出中转手工清单
+#   make deploy-transit             # 一键部署中转(受控自升级 + 版本核验)
 #   make deploy                     # 全跑
 #
 # 依赖:`relay` CLI 在 PATH;配置为共享 config;远端用同一 config 以 executor 跑 relay watch。
@@ -138,25 +139,22 @@ restart_binary() {
   log "换装已后台触发;远端日志: ~/.relay/watch.log"
 }
 
-# ---- 6) 中转手工清单 ----
-# 中转的 relay 安装路径无法经 relay 探测(中转非 executor、relay 只做文件交换),
-# 由 TRANSIT_BIN 指定(默认 ~/.local/bin/relay);部署后可用 relay version -r 核验。
+# ---- 6) 中转一键部署(受控自升级) ----
+# 构建 relay-linux 并经 `relay server-remote` 经受控自升级通道流式交付中转,由中转本地
+# 自检 → 回执 → 换装(.prev 备份 + 重启),本地断连后重连轮询 relay version 核验。
 transit() {
   log "构建中转二进制 relay-linux ..."
   env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w $STAMP" -o relay-linux ./cmd/relay
-  TRANSIT_BIN="${TRANSIT_BIN:-$HOME/.local/bin/relay}"
-  cat <<EOF
+  [[ -f relay-linux ]] || die "构建中转二进制失败: relay-linux"
 
-=== 中转服务器更新(半自动:经 code-server web 人工) ===
-中转无程序化通道,需手工:
-  1. 已生成 relay-linux,经 code-server web 上传到中转可达目录(e.g. $HOME/relay/)
-  2. 用 self-update + reboot 一键替换重启(新二进制已带 relay server upgrade):
-       cp -f relay-linux $TRANSIT_BIN && chmod +x $TRANSIT_BIN
-       relay server upgrade $TRANSIT_BIN -c $HOME/.relay/config.yaml
-     # 或仅重启不换版本: relay server restart -c $HOME/.relay/config.yaml
-  状态: relay server status -c $HOME/.relay/config.yaml
-  说明: 中转路径无法经 relay 自动探测(无命令通道),如需换目录请 export TRANSIT_BIN=<path> 重跑。
-EOF
+  log "经受控自升级把 relay-linux 一键部署到中转(自检→换装→核验)..."
+  # server-remote 内含:上传 → 中转自检/回执 → 换装重启 → 断线重连 → 轮询版本核验。
+  if ! relay server-remote -c "$CONFIG" --binary relay-linux; then
+    warn "中转一键部署失败(运行中实例不受影响、.prev 备件已保留)。请人工回退后重试:"
+    warn "  兜底:经 code-server 上传 relay-linux,再执行 relay server upgrade $HOME/.local/bin/relay -c $CONFIG"
+    return 1
+  fi
+  log "中转已运行新版本 ✔"
 }
 
 # ---- 7) 部署后核验:三端版本台账 ----

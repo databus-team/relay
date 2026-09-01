@@ -98,6 +98,9 @@ var (
 	versionWatch   = versionCmd.Flag("watch", "Limit remote comparison to a specific watch ID").Short('w').String()
 	versionJSONOut = versionCmd.Flag("json", "Output as JSON").Bool()
 
+	// server-remote command - 一键部署中转(受控自升级):上传新二进制 → 中转自检 → 换装 → 核验。
+	serverRemoteCmd = kingpin.Command("server-remote", "一键部署中转:上传新 relay 二进制并经中转受控自升级,断线重连后核验版本")
+	serverRemoteBin = serverRemoteCmd.Flag("binary", "Path to the new relay binary to send (default: current executable)").String()
 	)
 
 func main() {
@@ -179,6 +182,8 @@ func main() {
 		runWorkspaces()
 	case versionCmd.FullCommand():
 		runVersion()
+	case serverRemoteCmd.FullCommand():
+		runServerRemote()
 	case jobRun.FullCommand():
 		runJobRun()
 	default:
@@ -1008,6 +1013,95 @@ func queryRemoteVersions() (protocol.VersionResponse, error) {
 		return vr, err
 	}
 	return vr, nil
+}
+
+// runServerRemote 一键部署中转:读取本地 relay 二进制,经 `server-remote` 受控自升级
+// 发到中转(自检/换装在服务端内完成),等待成功 ACK 后断线重连、轮询版本台账核验。
+// 失败时非零退出并给出人工回退提示(中转保留 .prev 备件)。
+func runServerRemote() {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: create backend: %v\n", err)
+		os.Exit(1)
+	}
+	rb, ok := b.(*relaybackend.RelayBackend)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Error: server-remote requires relay backend (backend.type=relay), got %q\n", cfg.Backend.Type)
+		os.Exit(1)
+	}
+
+	bin := *serverRemoteBin
+	if bin == "" {
+		if exe, err := os.Executable(); err == nil {
+			bin = exe
+		}
+	}
+	if bin == "" {
+		fmt.Fprintf(os.Stderr, "Error: cannot determine binary to send; pass --binary\n")
+		os.Exit(1)
+	}
+	data, err := os.ReadFile(bin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: read binary %s: %v\n", bin, err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("[server-remote] 上传 %s (%d bytes) 到中转并触发自升级 ...\n", bin, len(data))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if err := rb.UpgradeServer(ctx, bin, data); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: server upgrade failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "提示: 中转已保留 .prev 备件;请人工回退(如经 code-server 上传 + `relay server upgrade`)后再重试。\n")
+		os.Exit(1)
+	}
+
+	fmt.Println("[server-remote] 中转已回 ACK(自检通过); 正在轮询账户版本核验 ...")
+	if err := pollTransitVersion(rb, version.String()); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: 版本核验失败: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("[server-remote] 中转已运行新版本 ✔")
+}
+
+// pollTransitVersion 轮询中转版本台账,等待其 transit 节点构建与本地一致。中转换装会
+// 短时断连,这里经重连持续轮询,直到对账一致或超时。
+func pollTransitVersion(rb *relaybackend.RelayBackend, want string) error {
+	deadline := time.Now().Add(90 * time.Second)
+	var lastErr error = fmt.Errorf("no transit node matched yet")
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		vr, verr := rb.Version(ctx)
+		cancel()
+		if verr == nil {
+			found := false
+			for _, n := range vr.Nodes {
+				if n.Role == "transit" {
+					found = true
+					got := n.Version
+					if n.Commit != "" {
+						got = n.Version + "+" + n.Commit
+					}
+					if got == want {
+						return nil
+					}
+					lastErr = fmt.Errorf("transit 版本 %s != 本地 %s", got, want)
+				}
+			}
+			if !found {
+				lastErr = fmt.Errorf("台账中无 transit 节点(中转可能仍不可达)")
+			}
+		} else {
+			lastErr = verr
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("timed out awaiting transit 与本地版本一致: %w", lastErr)
 }
 
 // orDash 空串显示为 "-"。
