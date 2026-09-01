@@ -18,6 +18,7 @@ import (
 	"github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/relay/client"
 	"github.com/user/relay/internal/relay/protocol"
+	"github.com/user/relay/internal/version"
 )
 
 type RelayBackend struct {
@@ -309,7 +310,7 @@ func (b *RelayBackend) writePushedFile(relPath, srcPath string) (string, error) 
 func (b *RelayBackend) registerExecutor() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := b.client.RegisterExecutor(ctx, b.watchID, "add"); err != nil {
+	if err := b.client.RegisterExecutor(ctx, b.watchID, "add", version.String()); err != nil {
 		log.Printf("[relay] register executor for %s: %v", b.watchID, err)
 		return
 	}
@@ -425,6 +426,15 @@ func (b *RelayBackend) Ping(ctx context.Context, commandDir, watchID string) err
 		return fmt.Errorf("not connected")
 	}
 	return b.client.Ping(ctx)
+}
+
+// Version 向中转查询版本台账(中转 + 各执行方),供 relay version 跨机对比。
+// 该方法是 relay 后端特有;其它后端(如 local)不支持,由调用方按类型断言判断。
+func (b *RelayBackend) Version(ctx context.Context) (protocol.VersionResponse, error) {
+	if err := b.ensureConnected(ctx); err != nil {
+		return protocol.VersionResponse{}, err
+	}
+	return b.client.Version(ctx)
 }
 
 func (b *RelayBackend) Events() <-chan backend.FileInfo {

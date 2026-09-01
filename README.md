@@ -229,6 +229,28 @@ relay ws --json       # output as JSON
 relay ws -w web-app   # details for a specific workspace
 ```
 
+### version — Build Version & Cross-Machine Check
+
+Show the local binary's build info, and with `-r` query the transit server + online executors to catch version drift across the fleet.
+
+```bash
+relay version           # local build info only
+relay version -r        # compare against transit server + registered executors
+relay version -r --json # same, machine-readable
+```
+
+Output marks each remote node `== local ok` or `!! MISMATCH` so the transit / executor / local caller mismatch is visible in one glance:
+
+```
+relay 4e6f926+4e6f926 (2026-09-01T06:37:33Z)
+  local  linux/amd64  commit=4e6f926  built=2026-09-01T06:37:33Z  go=go1.27.0
+  remote:
+    transit                 linux/amd64        4e6f926+4e6f926      == local ok
+    executor  watch=storage  windows/amd64      3f1c9aa+3f1c9aa      !! MISMATCH
+```
+
+The version string is stamped at build time (`make build-release` / `build-linux` / `build-windows`) from `git describe`, so every binary built from the same source carries the same identifier — making drift obvious. Run `make install` to rebuild with the stamp. Executors report their version when they register (they re-register on (re)connect), so an executor that has *not* yet been swapped still shows its old build.
+
 ## Relay Backend Configuration
 
 When using the `relay` backend, configure the WebSocket connection to the relay server:

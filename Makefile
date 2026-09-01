@@ -9,6 +9,12 @@ GOTEST := $(GOCMD) test
 GOCLEAN := $(GOCMD) clean
 GOMOD := $(GOCMD) mod
 
+# 版本元信息:stamp 进 internal/version(所有平台产物共享同一递交信息,便于 relay version 跨机对比)。
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "")
+DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS_STAMP := -X github.com/user/relay/internal/version.Version=$(VERSION) -X github.com/user/relay/internal/version.Commit=$(COMMIT) -X github.com/user/relay/internal/version.Date=$(DATE)
+
 .PHONY: all build build-release build-linux build-windows build-debug test test-coverage clean install deps fmt vet run deploy deploy-remote deploy-transit help
 
 all: build
@@ -17,17 +23,17 @@ all: build
 build:
 	$(GOBUILD) -o $(BINARY_NAME) $(MAIN_PATH)
 
-## build-release: Build optimized binary for production
+## build-release: Build optimized binary for production (stamped with version)
 build-release:
-	CGO_ENABLED=0 $(GOBUILD) -ldflags="-s -w" -o $(BINARY_NAME) $(MAIN_PATH)
+	CGO_ENABLED=0 $(GOBUILD) -ldflags="-s -w $(LDFLAGS_STAMP)" -o $(BINARY_NAME) $(MAIN_PATH)
 
-## build-linux: Cross-compile for Linux x64
+## build-linux: Cross-compile for Linux x64 (stamped)
 build-linux:
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GOBUILD) -ldflags="-s -w" -o $(BINARY_NAME)-linux $(MAIN_PATH)
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GOBUILD) -ldflags="-s -w $(LDFLAGS_STAMP)" -o $(BINARY_NAME)-linux $(MAIN_PATH)
 
-## build-windows: Cross-compile for Windows x64
+## build-windows: Cross-compile for Windows x64 (stamped)
 build-windows:
-	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GOBUILD) -ldflags="-s -w" -o $(BINARY_NAME).exe $(MAIN_PATH)
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GOBUILD) -ldflags="-s -w $(LDFLAGS_STAMP)" -o $(BINARY_NAME).exe $(MAIN_PATH)
 
 ## build-debug: Build with debug symbols
 build-debug:
