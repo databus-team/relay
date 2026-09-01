@@ -127,7 +127,7 @@ DEST='$dest'
   mv -f "\$STG" "\$DEST" && chmod +x "\$DEST"
   nohup "\$DEST" watch -c "\$HOME/.relay/config.yaml" >>"\$HOME/.relay/relay.log" 2>&1 &
   echo "restarted \$DEST"
-) &
+) >/dev/null 2>&1 </dev/null &
 echo "swap scheduled; new staged at \$STG"
 EOF
   relay exec -c "$CONFIG" -w "$w" "$RCMD"
@@ -157,8 +157,16 @@ EOF
 
 # ---- 7) 部署后核验:三端版本台账 ----
 verify() {
-  log "核验版本台账 (relay version -r) ..."
-  relay version -r -c "$CONFIG"
+  # RESTART=1 换装后 daemon 约 3s 后被杀重启,给足时间并容忍瞬时不可达。
+  sleep 4
+  log "核验版本台账 (relay version -r, 重试至多 ~30s) ..."
+  for i in $(seq 1 15); do
+    if relay version -r -c "$CONFIG" 2>&1; then
+      return 0  # version 查询成功即打印并返回
+    fi
+    log "  重试 $i/15 账本查询 ..."
+    sleep 2
+  done
 }
 
 cmd="${1:-all}"
