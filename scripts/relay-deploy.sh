@@ -90,13 +90,13 @@ build_binary() {
   cp -f "$REMOTE_BIN" "$REMOTE_STAGED"
 }
 
-# ---- 3) 经中转 relay transport 纯下发到执行端二进制旁(绝对路径,不跑 workspace job) ----
+# ---- 3) 经中转 relay push --no-jobs --dest 纯下发到执行端二进制旁(绝对路径,不跑 workspace job) ----
 push_binary() {
   # 目标:自动探测到的运行二进制旁的新文件(独立名,避免覆盖运行中的同名 exe)
   local dest="${REMOTE_BIN_PATH}.new"
-  log "经中转 transport 下发 $REMOTE_STAGED -> 执行端 $dest ..."
-  # transport 不传 -w(自动从版本台账挑执行方 watch);不触发 workspace job。
-  relay transport -c "$CONFIG" "$REMOTE_STAGED" "$dest"
+  log "经中转 push --no-jobs 下发 $REMOTE_STAGED -> 执行端 $dest ..."
+  # push --no-jobs 不走 workspace job;--dest 为绝对落盘路径。-w 用当前工作区即可。
+  relay push --no-jobs -c "$CONFIG" -w "$W" --dest "$dest" "$REMOTE_STAGED"
   REMOTE_NEW="$dest"
 }
 

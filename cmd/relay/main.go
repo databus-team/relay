@@ -53,10 +53,12 @@ var (
 	listCmd   = kingpin.Command("list", "List files in remote watch directory")
 	listWatch = listCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
 
-	// Push command - upload files
-	pushCmd   = kingpin.Command("push", "Push file to remote watch directory")
+	// Push command - upload files, optionally without running workspace jobs
+	pushCmd   = kingpin.Command("push", "Push file to remote (optionally run/wait workspace jobs)")
 	pushWatch = pushCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
 	pushSrc   = pushCmd.Arg("source", "Source file to push").Required().String()
+	pushDest  = pushCmd.Flag("dest", "Destination absolute path on the executor (defaults to <watch_dir>/<filename>; requires --no-jobs)").String()
+	pushNoJobs = pushCmd.Flag("no-jobs", "Transfer only; do not run workspace jobs on the remote").Bool()
 
 	// Job command - run config-defined jobs locally
 	jobCmd      = kingpin.Command("job", "Run config-defined jobs on the local machine")
@@ -96,12 +98,7 @@ var (
 	versionWatch   = versionCmd.Flag("watch", "Limit remote comparison to a specific watch ID").Short('w').String()
 	versionJSONOut = versionCmd.Flag("json", "Output as JSON").Bool()
 
-	// Transport command - 纯下发(不触发 workspace job),用于部署二进制等
-	transportCmd   = kingpin.Command("transport", "Pure file transfer to the remote executor at an absolute path (no workspace jobs)")
-	transportWatch = transportCmd.Flag("watch", "Executor watch id (the root watch the executor registered)").Short('w').String()
-	transportSrc   = transportCmd.Arg("src", "Local source file").Required().String()
-	transportDest  = transportCmd.Arg("dest", "Absolute destination path on the executor").Required().String()
-)
+	)
 
 func main() {
 	kingpin.CommandLine.HelpFlag.Short('h')
@@ -182,8 +179,6 @@ func main() {
 		runWorkspaces()
 	case versionCmd.FullCommand():
 		runVersion()
-	case transportCmd.FullCommand():
-		runTransport()
 	case jobRun.FullCommand():
 		runJobRun()
 	default:
@@ -638,7 +633,12 @@ func runPush() {
 
 	watchDir := watchCfg.WatchDir
 	filename := filepath.Base(src)
-	dest := watchDir + "/" + filename
+
+	// --dest 只能与 --no-jobs 一起用(true 时路径可越过 watch_dir 到达执行方任何位置)。
+	if *pushDest != "" && !*pushNoJobs {
+		fmt.Fprintf(os.Stderr, "Error: --dest requires --no-jobs (a push with workspace jobs has a fixed <watch_dir>/<filename> target)\n")
+		os.Exit(1)
+	}
 
 	info, err := os.Stat(src)
 	if err != nil {
@@ -652,13 +652,37 @@ func runPush() {
 		return
 	}
 
+	content, rerr := os.ReadFile(src)
+	if rerr != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read source: %v\n", rerr)
+		os.Exit(1)
+	}
+
+	// 纯下发(不跑 workspace job): 走 Jobs=false 通道,落到 dest(绝对)或 watch_dir 目录。
+	if *pushNoJobs {
+		if tn, ok := b.(backend.PushNoJobsSender); ok {
+			dest := *pushDest
+			if dest == "" {
+				dest = watchDir + "/" + filename
+			}
+			exit, perr := tn.PushNoJobs(ctx, dest, content)
+			if perr != nil {
+				fmt.Fprintf(os.Stderr, "Push error: %v\n", perr)
+				os.Exit(1)
+			}
+			if exit != 0 {
+				os.Exit(exit)
+			}
+			fmt.Println("Push completed successfully")
+			return
+		}
+		fmt.Fprintf(os.Stderr, "Error: backend %q has no transport-only push\n", cfg.Backend.Type)
+		os.Exit(1)
+	}
+
 	// 直达后端(relay):把文件直达远端执行方并触发其本地 jobs;输出流式显示。
 	if pj, ok := b.(backend.PushJobSender); ok {
-		content, rerr := os.ReadFile(src)
-		if rerr != nil {
-			fmt.Fprintf(os.Stderr, "Failed to read source: %v\n", rerr)
-			os.Exit(1)
-		}
+		dest := watchDir + "/" + filename
 		exit, perr := pj.PushJob(ctx, dest, content, func(c backend.ExecChunk) {
 			if c.Stdout {
 				os.Stdout.WriteString(c.Data)
@@ -677,7 +701,7 @@ func runPush() {
 		return
 	}
 
-	pushFile(ctx, b, src, dest)
+	pushFile(ctx, b, src, watchDir+"/"+filename)
 	fmt.Println("Push completed successfully")
 }
 
@@ -967,60 +991,6 @@ func queryRemoteVersions() (protocol.VersionResponse, error) {
 		return vr, err
 	}
 	return vr, nil
-}
-
-// runTransport 纯下发:把本地文件流式写到执行端的绝对路径 dest(不触发 workspace job)。
-// 目标 -w 应为执行方注册的 watch(通常是根 watch,如 "storage");省略时自动从版本台账找一个执行方。
-func runTransport() {
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
-		os.Exit(1)
-	}
-	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
-		os.Exit(1)
-	}
-	rb, ok := b.(*relaybackend.RelayBackend)
-	if !ok {
-		fmt.Fprintf(os.Stderr, "Error: backend %q has no transport (relay backend only)\n", cfg.Backend.Type)
-		os.Exit(1)
-	}
-
-	content, err := os.ReadFile(*transportSrc)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read source %q: %v\n", *transportSrc, err)
-		os.Exit(1)
-	}
-
-	// 未指定 -w 时,自动从版本台账里挑一个执行方 watch。
-	watch := *transportWatch
-	if watch == "" {
-		wr, verr := queryRemoteVersions()
-		if verr != nil {
-			fmt.Fprintf(os.Stderr, "Error: resolve executor watch: %v (pass -w <executor watch>)\n", verr)
-			os.Exit(1)
-		}
-		for _, n := range wr.Nodes {
-			if n.Role == "executor" {
-				watch = n.WatchID
-				break
-			}
-		}
-		if watch == "" {
-			fmt.Fprintf(os.Stderr, "Error: no online executor to transport to; pass -w <executor watch>\n")
-			os.Exit(1)
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-	if err := rb.Transport(ctx, watch, *transportDest, content); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("Transferred %s -> %s (executor watch %s)\n", *transportSrc, *transportDest, watch)
 }
 
 // orDash 空串显示为 "-"。

@@ -68,6 +68,13 @@ type PushJobSender interface {
 	PushJob(ctx context.Context, relPath string, content []byte, on func(ExecChunk)) (int, error)
 }
 
+// PushNoJobsSender 可选接口：把文件纯下发到执行方 ddest 绝对路径,但不触发任何
+// workspace job(relay backend 经 client.Transport 的 Jobs=false 通道实现)。
+// 对应 `relay push --no-jobs [--dest <abs>]`(部署二进制等场景)。
+type PushNoJobsSender interface {
+	PushNoJobs(ctx context.Context, dest string, content []byte) (int, error)
+}
+
 // ConfigSyncCapable 可选接口：后端支持经其原生通道(relay 为 WS 流式)把配置直接同步
 // 到执行方落盘。runSync 据此决定走流式还是退回通用文件命令交换。
 type ConfigSyncCapable interface {
