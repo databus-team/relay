@@ -72,6 +72,12 @@ detect_remote() {
   esac
   # 自动探测远端正在运行的 relay 二进制路径(换装目标),不猜安装目录。
   REMOTE_BIN_PATH="$(remote_cmd "command -v relay" | tail -1 | tr -d '\r')"
+  # Windows:git-bash 的 `command -v relay` 常回显不带扩展名的 "…/relay",
+  # 但真正能起 daemon 的必须是 relay.exe。缺 .exe 时补上,否则换装后
+  # `watch start` 起不来(executable file not found in $PATH)。
+  if [[ "$REMOTE_OS" == windows && -n "$REMOTE_BIN_PATH" && "${REMOTE_BIN_PATH##*.}" != "exe" ]]; then
+    REMOTE_BIN_PATH="${REMOTE_BIN_PATH}.exe"
+  fi
   log "远端: $REMOTE_OS ($arch) -> 目标二进制 $REMOTE_BIN (running at: ${REMOTE_BIN_PATH:-未知})"
 }
 
