@@ -119,10 +119,11 @@ restart_binary() {
   # 注意:该 exec 由旧 daemon 服务,watch stop 停掉它后回包会断,链仍随 exec
   # 解耦继续完成(detached),结果由 verify(relay version -r) 兜底核对。
   local script
-  script="\"\$dest\" watch stop -c \"\$HOME/.relay/config.yaml\" ; "
-  script+="mv -f \"\$dest\" \"\$dest.prev\" ; "
-  script+="mv -f \"\$st\" \"\$dest\" ; "
-  script+="nohup \"\$dest\" watch start -c \"\$HOME/.relay/config.yaml\" >/dev/null 2>&1 &"
+  # $dest/$st 在本地展开成路径值;$HOME 留给远端展开,故写成 \$HOME。
+  script="\"$dest\" watch stop -c \"\$HOME/.relay/config.yaml\" ; "
+  script+="mv -f \"$dest\" \"$dest.prev\" ; "
+  script+="mv -f \"$st\" \"$dest\" ; "
+  script+="nohup \"$dest\" watch start -c \"\$HOME/.relay/config.yaml\" >/dev/null 2>&1 &"
   relay exec -c "$CONFIG" -w "$w" "$script" \
     || warn "watch 停止后 exec 回包断是预期;换装结果以 verify (relay version -r) 为准"
   log "换装已触发;远端日志: ~/.relay/watch.log"
