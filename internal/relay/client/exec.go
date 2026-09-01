@@ -122,7 +122,7 @@ func (c *Client) Exec(ctx context.Context, cmd string, cwd string, timeout int) 
 // UpgradeServer 把本地构建的 relay 二进制以流式分块 + sha256 摘要交付给中转(请求方视角),
 // 触发中转「服务器自升级」。本方法以中转自检通过后的成功 ACK 为结算点返回 nil;此后中转
 // 才停旧/换装/重启,断线重连与 `relay version -r` 的最终核验由上层 CLI 负责。
-func (c *Client) UpgradeServer(ctx context.Context, binaryPath string, content []byte) error {
+func (c *Client) UpgradeServer(ctx context.Context, content []byte) error {
 	if len(content) == 0 {
 		content = []byte{}
 	}

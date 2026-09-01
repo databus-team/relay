@@ -272,6 +272,7 @@ func (s *Server) handleConnection(conn *websocket.Conn) {
 	go client.Run()
 	<-client.CloseCh()
 
+	client.cleanupStreams() // 清理断连时未完成流的临时文件(如自升级 .incoming)
 	s.UnsubscribeAll(clientID)
 	s.cleanupClientState(clientID)
 

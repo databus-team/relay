@@ -812,7 +812,7 @@ func TestIntegration_ClientUpgradeServer(t *testing.T) {
 	c := connectTestClient(t, wsURL)
 	defer c.Disconnect()
 
-	if err := c.UpgradeServer(ctx, bin, content); err != nil {
+	if err := c.UpgradeServer(ctx, content); err != nil {
 		t.Fatalf("UpgradeServer: %v", err)
 	}
 }
@@ -828,7 +828,7 @@ func TestIntegration_ClientUpgradeServer_NoToken(t *testing.T) {
 	c := connectTestClient(t, wsURL)
 	defer c.Disconnect()
 
-	err := c.UpgradeServer(ctx, "unused.bin", []byte{0x00, 0x01})
+	err := c.UpgradeServer(ctx, []byte{0x00, 0x01})
 	if err == nil {
 		t.Fatal("expected error when transit has no token, got nil")
 	}

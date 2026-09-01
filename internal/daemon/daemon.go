@@ -125,42 +125,8 @@ func ReplaceBinary(dst, src string) error { return replaceBinary(dst, src) }
 // BackupBinary 把 dst 现行二进制原子复制为 `<dst>.prev`,作为换装前的人工回退备件。
 // 现有 replaceBinary 只做 temp+rename、不产生旧文件备份,故 `.prev` 由本函数显式产生。
 func BackupBinary(dst string) error {
-	info, err := os.Stat(dst)
-	if err != nil {
-		return fmt.Errorf("stat current binary: %w", err)
-	}
-	if info.IsDir() || info.Size() == 0 {
-		return fmt.Errorf("current binary is empty or a directory")
-	}
-
-	prev := dst + ".prev"
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".relay-prev-*")
-	if err != nil {
-		return fmt.Errorf("create prev temp: %w", err)
-	}
-	tmpName := tmp.Name()
-	in, err := os.Open(dst)
-	if err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return fmt.Errorf("open current binary: %w", err)
-	}
-	_, copyErr := io.Copy(tmp, in)
-	in.Close()
-	tmp.Close()
-	if copyErr != nil {
-		os.Remove(tmpName)
-		return fmt.Errorf("copy prev: %w", copyErr)
-	}
-	if err := os.Chmod(tmpName, 0o755); err != nil {
-		os.Remove(tmpName)
-		return fmt.Errorf("chmod prev: %w", err)
-	}
-	if err := os.Rename(tmpName, prev); err != nil {
-		os.Remove(tmpName)
-		return fmt.Errorf("install prev: %w", err)
-	}
-	return nil
+	// 复用 replaceBinary(原子 temp+rename+chmod):把 dst 现行二进制写入 `<dst>.prev`。
+	return replaceBinary(dst+".prev", dst)
 }
 
 // ReplaceBinaryWithKeep 换装:先把现行 dst 备份为 `<dst>.prev`,再原子替换为新 src。
