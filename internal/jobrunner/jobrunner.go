@@ -141,14 +141,18 @@ func buildVars(file string) map[string]string {
 	if err != nil {
 		abs = file
 	}
+	// 与 watcher.go 的 buildVars 保持一致:路径类变量转正斜杠(ToSlash)。
+	// 否则 Windows 原生的反斜杠路径(如 D:\Group_Projects\…)填进 cmd 后,
+	// 经 sh -c 执行时反斜杠被 sh 当作转义符吞掉 -> 命令里路径分隔符全丢,
+	// git 等收到 D:Group_Projects… 打不开(`sh` 层 MTC 是 sh -c)。
 	for _, name := range fileVarNames {
 		switch name {
 		case "file_path", "file_remote_path":
-			vars[name] = abs
+			vars[name] = filepath.ToSlash(abs)
 		case "file_name":
 			vars[name] = filepath.Base(abs)
 		case "file_dir":
-			vars[name] = filepath.Dir(abs)
+			vars[name] = filepath.ToSlash(filepath.Dir(abs))
 		}
 	}
 	return vars
