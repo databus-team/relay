@@ -110,7 +110,7 @@ restart_binary() {
   st="${REMOTE_NEW:-${REMOTE_BIN_PATH}.new}"
   dest="${REMOTE_BIN_PATH:-}"
   log "触发 detached 换装 (new=$st -> dest=${dest:-<远端 command -v relay>}, RESTART=1) ..."
-  read -r -d '' RCMD <<EOF
+  read -r -d '' RCMD <<EOF || true
 STG='$st'
 DEST='$dest'
 # detached: 先返回本 exec 响应,3s 后停->换->起
