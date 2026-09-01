@@ -37,8 +37,10 @@ var (
 	// Watch command - continuous monitoring
 	watchCmd = kingpin.Command("watch", "Watch remote directory and execute actions continuously")
 
-	// 位置参数 action:默认前台;run=前台;start/stop/status/restart 为 daemon 控制。
-	watchAction = watchCmd.Arg("action", "run|start|stop|status|restart (default: run)").HintOptions("run", "start", "stop", "status", "restart").String()
+	// 位置参数 action:默认前台;run=前台;start/stop/status/restart/upgrade 为 daemon 控制。
+	watchAction = watchCmd.Arg("action", "run|start|stop|status|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "restart", "upgrade").String()
+	// upgrade 用的新二进制路径(仅 action=upgrade 时使用)。
+	watchUpgradePath = watchCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 
 	// Pull command - download single file (requires filename)
 	pullCmd    = kingpin.Command("pull", "Download single file from remote watch directory")
@@ -118,6 +120,8 @@ func main() {
 			}
 		case "restart":
 			daemonRestart("server")
+		case "upgrade":
+			daemonUpgrade("server", *serverUpgradePath)
 		default:
 			if err := runServer(); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -140,6 +144,8 @@ func main() {
 			}
 		case "restart":
 			daemonRestart("watch")
+		case "upgrade":
+			daemonUpgrade("watch", *watchUpgradePath)
 		default:
 			runWatch()
 		}
@@ -173,7 +179,7 @@ func normalizedAction(a string) string {
 	switch a {
 	case "run", "":
 		return ""
-	case "start", "stop", "status", "restart":
+	case "start", "stop", "status", "restart", "upgrade":
 		return a
 	default:
 		return ""
@@ -221,6 +227,33 @@ func daemonRestart(name string) {
 		return
 	}
 	fmt.Printf("%s restarted (pid %d)\nlog: %s\n", name, pid, logFile)
+}
+
+// daemonUpgrade 按需升级:停 daemon → 原子替换自身二进制 → 用新二进制重启。
+// 这是中转/执行方"self-update + reboot"的入口,仅在被调用时动作(非常驻)。
+func daemonUpgrade(name, newBin string) {
+	if newBin == "" {
+		fmt.Fprintf(os.Stderr, "Error: action 'upgrade' requires a binary path argument\n")
+		return
+	}
+	pidFile, logFile := daemon.PidFile(name), daemon.LogFile(name)
+	_ = daemon.Stop(pidFile) // 若在跑先停(释放占用,尤其 Windows)
+
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: resolve exe: %v\n", err)
+		return
+	}
+	if err := daemon.ReplaceBinary(exe, newBin); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: replace binary: %v\n", err)
+		return
+	}
+	pid, err := daemon.Start([]string{name, "run", "-c", *configPath}, logFile, pidFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: restart %s: %v\n", name, err)
+		return
+	}
+	fmt.Printf("%s upgraded & restarted (pid %d, binary=%s)\nlog: %s\n", name, pid, newBin, logFile)
 }
 
 // daemonStatus 报告 pid 状态与日志路径。
@@ -634,8 +667,8 @@ func runLocalJobsForPush(watchID, absPath string, out func(backend.ExecChunk)) i
 		out(backend.ExecChunk{Stdout: false, Data: "push-job: load config: " + err.Error() + "\n"})
 		return 1
 	}
-	watchCfg, err := cfg.GetWatchByID(watchID)
-	if err != nil {
+	watchCfg := resolvePushWorkspace(cfg, watchID, absPath)
+	if watchCfg == nil {
 		out(backend.ExecChunk{Stdout: false, Data: fmt.Sprintf("push-job: unknown watch %q\n", watchID)})
 		return 1
 	}
@@ -655,6 +688,30 @@ func runLocalJobsForPush(watchID, absPath string, out func(backend.ExecChunk)) i
 		}
 	}
 	return exit
+}
+
+// resolvePushWorkspace 决定 push 落地后该跑哪个 workspace 的 jobs。
+// 单根模型下执行方的 sess.WatchID 是根 watch_id(如 "storage"),并非 workspace id;
+// 故先按 watchID 精确匹配,失败则从落盘路径 absPath 推导:取路径中与某 workspace
+// 的 watch_dir 或 id 相等的段(路径形如 <executor_root>/<workspace>/<file>)。
+func resolvePushWorkspace(cfg *config.Config, watchID, absPath string) *config.WatchConfig {
+	if wc, err := cfg.GetWatchByID(watchID); err == nil {
+		return wc
+	}
+	segs := strings.Split(strings.ReplaceAll(absPath, "\\", "/"), "/")
+	for i := range cfg.Watch {
+		wc := &cfg.Watch[i]
+		// watch_dir 可能是相对子目录(如 "databus_backend")或绝对路径;两者都会以字符串形式出现在 absPath。
+		if wc.WatchDir != "" && strings.Contains(absPath, wc.WatchDir) {
+			return wc
+		}
+		for _, s := range segs {
+			if s == wc.ID {
+				return wc
+			}
+		}
+	}
+	return nil
 }
 
 func runExec() {

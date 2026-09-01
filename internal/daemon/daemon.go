@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -78,6 +79,48 @@ func Start(selfArgs []string, logFile, pidFile string) (int, error) {
 	}
 	return cmd.Process.Pid, nil
 }
+
+// replaceBinary 原子地把 src(新二进制)替换到 dst(通常为 os.Executable() 路径):
+// 先写入 dst 同目录临时文件再 rename,避免写一半被读。
+func replaceBinary(dst, src string) error {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return fmt.Errorf("stat new binary: %w", err)
+	}
+	if srcInfo.IsDir() || srcInfo.Size() == 0 {
+		return fmt.Errorf("new binary is empty or a directory")
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".relay-replace-*")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	in, err := os.Open(src)
+	if err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("open source: %w", err)
+	}
+	_, copyErr := io.Copy(tmp, in)
+	in.Close()
+	tmp.Close()
+	if copyErr != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("copy: %w", copyErr)
+	}
+	if err := os.Chmod(tmpName, 0o755); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("chmod: %w", err)
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("replace: %w", err)
+	}
+	return nil
+}
+
+// ReplaceBinary 把新二进制原子替换到目标路径(通常为 os.Executable())。供 `upgrade` 使用。
+func ReplaceBinary(dst, src string) error { return replaceBinary(dst, src) }
 
 // Stop 读取 pid 文件,若存活则终止并移除 pid 文件;未运行返回错误。
 func Stop(pidFile string) error {
