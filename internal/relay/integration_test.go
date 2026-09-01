@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -405,4 +406,46 @@ func TestIntegration_PathTraversal(t *testing.T) {
 	}
 
 	fmt.Printf("path traversal error (expected): %v\n", err)
+}
+
+// TestIntegration_ReconnectConcurrentWrites 回归:重连不得重复启动 writeLoop。
+// 若重新起一个写 goroutine,两个写 goroutine 会并发写同一 conn 而 panic
+// (gorilla "concurrent write to websocket connection")。断连→重连→并发请求应无 panic。
+func TestIntegration_ReconnectConcurrentWrites(t *testing.T) {
+	watchDir := t.TempDir()
+	ts, wsURL := setupTestServer(t, watchDir)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c, err := client.New(wsURL, "test-token", "test-watch")
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	c.SetReconnectEnabled(true)
+	if err := c.Connect(ctx); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer c.Disconnect()
+
+	// 主动断连 → readLoop 报错 → 触发 reconnectLoop。等它重连成功。
+	c.Disconnect()
+	deadline := time.Now().Add(6 * time.Second)
+	for !c.IsConnected() {
+		if time.Now().After(deadline) {
+			t.Fatal("client did not reconnect in time")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// 重连后并发发起一批请求;若残留了第二个 writeLoop 会立刻 panic。
+	var wg sync.WaitGroup
+	for i := 0; i < 24; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// 多数并发写,让 writeLoop 并发路径被覆盖(-race 下更易暴露)。
+			_ = c.Ping(context.Background())
+		}()
+	}
+	wg.Wait()
 }
