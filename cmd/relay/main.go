@@ -315,6 +315,11 @@ func runWatch() {
 		cancel()
 	}()
 
+	// 本进程是执行方(watch 端):显式置位 executor 角色。
+	// 这样配置里的 executor: true 只在 relay watch 生效;本地 CLI(exec/push/sync)
+	// 即便共用同一份包含 executor 的配置,也不会自注册为执行方、把命令转发回本机。
+	relaybackend.SetExecutorRole(true)
+
 	w, err := watcher.New(cfg, cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create watcher: %v\n", err)

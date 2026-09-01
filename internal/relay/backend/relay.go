@@ -42,7 +42,28 @@ type RelayBackend struct {
 var (
 	pushJobsH  backend.PushJobHandler
 	pushJobsMu sync.RWMutex
+
+	// executorRole 标记本进程是否扮演「执行方」角色。executor 字段只在
+	// relay watch(执行方进程)里生效;本地 CLI(push/exec/transport/sync/ping)
+	// 即便配置写了 executor: true,也不注册为执行方、不处理入站请求,从而
+	// relay exec 仍透明转发到远端 watch,且一份配置可安全地两端共用。
+	executorRole   bool
+	executorRoleMu sync.RWMutex
 )
+
+// SetExecutorRole 由 relay watch(执行方)进程在启动时置位;其余命令不调用。
+func SetExecutorRole(on bool) {
+	executorRoleMu.Lock()
+	defer executorRoleMu.Unlock()
+	executorRole = on
+}
+
+// executorRoleOn 返回本进程是否为执行方角色。
+func executorRoleOn() bool {
+	executorRoleMu.RLock()
+	defer executorRoleMu.RUnlock()
+	return executorRole
+}
 
 type Config struct {
 	URL         string            `mapstructure:"url" yaml:"url"`
@@ -121,7 +142,7 @@ func NewRelayBackend(config map[string]interface{}) (backend.FileTransferBackend
 		eventCh:    make(chan backend.FileInfo, 100),
 	}
 
-	if cfg.Executor {
+	if cfg.Executor && executorRoleOn() {
 		b.enableExecutor()
 	}
 

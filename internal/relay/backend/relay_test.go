@@ -36,6 +36,8 @@ func newTestHub(t *testing.T, watchDir string) (*httptest.Server, string) {
 
 // 端到端:真实执行方(executor)注册到中转,由请求方经中转转发,命令在远端 sh -c 流式执行。
 func TestEndToEnd_ExecStream(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
 	watchDir := t.TempDir()
 	ts, wsURL := newTestHub(t, watchDir)
 	defer ts.Close()
@@ -84,6 +86,8 @@ func TestEndToEnd_ExecStream(t *testing.T) {
 
 // end-to-end: 请求方 PushJob 直达执行方,执行方落盘并跑本地 job,输出流回。
 func TestEndToEnd_PushJob(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
 	watchDir := t.TempDir()
 	execRoot := t.TempDir()
 	ts, wsURL := newTestHub(t, watchDir)
@@ -137,6 +141,8 @@ func TestEndToEnd_PushJob(t *testing.T) {
 
 // 大文件流式直达:请求方 PushJob 分块流式把数 MB 二进制安全落盘到执行方,字节完全一致。
 func TestEndEndPushJobLarge(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
 	watchDir := t.TempDir()
 	execRoot := t.TempDir()
 	ts, wsURL := newTestHub(t, watchDir)
