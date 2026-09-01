@@ -24,6 +24,14 @@ CONFIG="${RELAY_CONFIG:-$HOME/.relay/config.yaml}"
 WATCH="${RELAY_WATCH:-}"
 RESTART="${RESTART:-0}"
 
+# 版本 stamp:与 Makefile 一致,保证产出的远端/中转二进制带同一标识,relay version 才能正确对比。
+GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || true)"
+GIT_VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+STAMP="$(printf '%s%s%s' \
+  "-X github.com/user/relay/internal/version.Version=$GIT_VERSION " \
+  "-X github.com/user/relay/internal/version.Commit=$GIT_COMMIT " \
+  "-X github.com/user/relay/internal/version.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+
 log()  { printf '\033[1;34m[deploy]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[deploy]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[deploy]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -74,7 +82,7 @@ build_binary() {
     windows) target="GOOS=windows GOARCH=amd64" ;;
     linux)   target="GOOS=linux   GOARCH=amd64" ;;
   esac
-  env CGO_ENABLED=0 $target go build -ldflags='-s -w' -o "$REMOTE_BIN" ./cmd/relay
+  env CGO_ENABLED=0 $target go build -ldflags="-s -w $STAMP" -o "$REMOTE_BIN" ./cmd/relay
   [[ -f "$REMOTE_BIN" ]] || die "构建失败: $REMOTE_BIN"
 }
 
@@ -131,7 +139,7 @@ EOF
 # ---- 6) 中转手工清单 ----
 transit() {
   log "构建中转二进制 relay-linux ..."
-  env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags='-s -w' -o relay-linux ./cmd/relay
+  env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w $STAMP" -o relay-linux ./cmd/relay
   cat <<"EOF"
 
 === 中转服务器更新(半自动:经 code-server web 人工) ===
