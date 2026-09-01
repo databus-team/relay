@@ -43,6 +43,9 @@ type Client struct {
 	pushJobHandlerM sync.RWMutex
 	execHandlerM    sync.RWMutex
 
+	configSyncHandler func(*ConfigSyncSession) // 执行方入站 config-sync 处理回调
+	configSyncM       sync.RWMutex
+
 	pushRecvMu sync.RWMutex
 	pushRecv   map[string]*inboundPushReceive // streamID -> 入站流式 push 接收状态
 
@@ -256,6 +259,8 @@ func (c *Client) handleMessage(msg protocol.Message) {
 		c.handleInboundExec(msg)
 	case protocol.MsgPushJob:
 		c.handleInboundPushJob(msg)
+	case protocol.MsgConfigSync:
+		c.handleInboundConfigSync(msg)
 	case protocol.MsgResponse, protocol.MsgError:
 		if msg.RequestID != "" {
 			c.pendingMu.RLock()

@@ -133,6 +133,9 @@ func (c *Client) handleMessage(msg protocol.Message) {
 	case protocol.MsgPushJob:
 		c.handlePushJob(msg)
 
+	case protocol.MsgConfigSync:
+		c.handleConfigSync(msg)
+
 	case protocol.MsgSubscribe:
 		c.handleSubscribe(msg)
 
@@ -215,6 +218,31 @@ func (c *Client) handleExec(msg protocol.Message) {
 	}
 
 	// 记录请求方归属,供执行方回流帧转发回去;原样转发 msg(保留 msg.ID 作关联)
+	c.server.SetReqOwner(msg.ID, c.id)
+	if err := c.server.SendTo(executorID, msg); err != nil {
+		c.server.ClearReqOwner(msg.ID)
+		c.SendError(msg.ID, "executor unavailable: "+err.Error())
+	}
+}
+
+// handleConfigSync 处理 config-sync 请求 —— 纯透明转发给该 watch 的已注册执行方。
+// 与 handleExec 同构(校验 watch → 找执行方 → 记录请求方 → 原样转发)。
+// config 必须只在真执行方上落盘,无执行方时直接 fail-fast,不透传暂存。
+func (c *Client) handleConfigSync(msg protocol.Message) {
+	payload, _ := msg.Payload.(map[string]interface{})
+	watchID := toString(payload["watch_id"])
+
+	if _, ok := c.server.GetWatchDir(watchID); !ok {
+		c.SendError(msg.ID, "unknown watch_id")
+		return
+	}
+
+	executorID, ok := c.server.GetExecutor(watchID)
+	if !ok {
+		c.SendError(msg.ID, "no executor registered for watch '"+watchID+"'")
+		return
+	}
+
 	c.server.SetReqOwner(msg.ID, c.id)
 	if err := c.server.SendTo(executorID, msg); err != nil {
 		c.server.ClearReqOwner(msg.ID)

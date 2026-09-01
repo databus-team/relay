@@ -41,6 +41,7 @@ backend:
     #                                    # 即便同一份配置带 executor: true,本地 exec 仍透明转发到远端执行方,
     #                                    # 不会自注册、不会把命令转发回本机——故可安全地与远端共用一份配置。
     #                                    # executor_dir: /path/to/remote/project   # push 时文件落在执行方的该目录下(可省略,默认进程当前目录)
+    #                                    # config_path: ~/.relay/config.yaml        # relay sync 经 WS 流式把配置落盘到执行方的该文件(可省略,默认即此值)
 
 watch:
   - id: web-app-patches

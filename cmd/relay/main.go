@@ -1193,6 +1193,24 @@ func runSync() {
 		os.Exit(1)
 	}
 
+	// 通道遵循 backend:支持流式的后端(relay)经 WS 直达执行方落盘,不绕中转文件交换。
+	if cs, ok := b.(backend.ConfigSyncCapable); ok {
+		fmt.Printf("Syncing config via %s streaming channel...\n", cfg.Backend.Type)
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		exit, err := cs.ConfigSync(ctx, configData)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Sync failed: %v\n", err)
+			os.Exit(1)
+		}
+		if exit != 0 {
+			fmt.Fprintf(os.Stderr, "Sync failed on executor (exit %d)\n", exit)
+			os.Exit(1)
+		}
+		fmt.Println("Sync successful (config written on executor; restart relay watch to take effect)")
+		return
+	}
+
 	// Build config-sync command
 	cmdFile := exchange.BuildConfigSyncCmd(configData)
 	cmdPath := "cmd-" + cmdFile.ID + ".json"
