@@ -165,7 +165,7 @@ Removes stale `cmd-*.json` and `result-*.json` files from the remote `command_di
 
 ### sync — Config Hot Reload
 
-Push a new config to a running watcher without restarting it.
+Push the unified config to a running remote watcher (executor) without restarting it. Because all three ends share one `config.yaml`, syncing the file brings the executor's backend/watch/jobs up to date; the transit server re-reads the same file on restart.
 
 ```bash
 relay sync -c ~/.relay/config.yaml
@@ -183,41 +183,42 @@ relay sync -c ~/.relay/config.yaml
 
 ### server — Relay Server
 
-Run the relay server that serves file storage and event broadcasting.
+Run the relay server on the transit machine.
 
 ```bash
-# With YAML config file
+# Recommended: the unified config.yaml (three ends share one file)
+relay server -c ~/.relay/config.yaml
+
+# Legacy standalone server file
 relay server --server-config server.yaml
 
 # With CLI flags only
-relay server --addr :8443 --watch web-app:/data/web-app --token secret
+relay server --addr :8080 --watch tcp:/data/web-app --token secret
 
 # CLI flags override config file values
-relay server --server-config server.yaml --addr :9000
+relay server -c config.yaml --addr :9000
 ```
 
-**Server config** (`server.yaml`):
+**One config, three ends.** The unified `config.yaml` carries a `server:` block (addr / watch_root / auth.tokens / tls) plus the `watch` list with per-watch `ttl`. Each end keeps the whole file and reads only its relevant section. Note that the relay server applies config to how it listens/stores — a change there takes effect on **restart**.
 
 ```yaml
-addr: ":8443"
+server:
+  addr: ":8443"
+  watch_root: /data/relay          # watch.watch_dir entries are relative to this
+  auth:
+    tokens: ["${RELAY_TOKEN}"]
+  tls:
+    enabled: false
+    cert_file: ""
+    key_file: ""
 
 watch:
   - id: web-app-patches
-    dir: /data/relay/web-app/patches
-  - id: api-service-patches
-    dir: /data/relay/api-service/patches
-
-auth:
-  tokens:
-    - "${RELAY_TOKEN}"
-
-tls:
-  enabled: false
-  cert_file: ""
-  key_file: ""
+    watch_dir: web-app/patches
+    ttl: 30m
 ```
 
-Environment variables (`$VAR`, `${VAR}`) are expanded in all string values.
+The legacy standalone `server.yaml` (top-level `addr`/`watch`/`auth`/`tls`) is still accepted via `--server-config` for backward compatibility. Environment variables (`$VAR`, `${VAR}`) are expanded in all string values.
 
 ### ws — List Workspaces
 

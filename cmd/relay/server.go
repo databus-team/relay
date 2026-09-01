@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -43,38 +44,134 @@ type serverYAMLConfig struct {
 	} `yaml:"tls"`
 }
 
-func runServer() error {
-	fileCfg := serverYAMLConfig{}
-	if *serverConfigPath != "" {
-		expanded := *serverConfigPath
-		if strings.HasPrefix(expanded, "~") {
-			home, err := os.UserHomeDir()
-			if err == nil {
-				expanded = home + expanded[1:]
+// serverBaseConfig 统一保存映射后的中转基础配置(文件来源),再叠加 CLI overrides。
+type serverBaseConfig struct {
+	addr      string
+	watchDirs []server.WatchDirConfig
+	tokens    []string
+	tls       server.TLSConfig
+}
+
+// hasServerSection 判断文件是否含顶层 `server:` 段(统一 config.yaml)。
+func hasServerSection(data []byte) bool {
+	var probe struct {
+		Server *struct{} `yaml:"server"`
+	}
+	yaml.Unmarshal(data, &probe)
+	return probe.Server != nil
+}
+
+// unifiedServerBase 从统一 config.yaml(含 server 段)构建中转配置。
+// 只有 server 段 + watch 列表有用;其它字段(backend/jobs 等)被忽略。
+func unifiedServerBase(data []byte) (serverBaseConfig, error) {
+	cfg, err := config.LoadFromBytes(data)
+	if err != nil {
+		return serverBaseConfig{}, fmt.Errorf("parse unified config: %w", err)
+	}
+
+	sc := cfg.Server
+	addr := ":8443"
+	if sc != nil && sc.Addr != "" {
+		addr = sc.Addr
+	}
+
+	watchDirs := make([]server.WatchDirConfig, 0, len(cfg.Watch))
+	if sc != nil && sc.WatchRoot != "" {
+		// 单根模式:一个 watch_id 覆盖整个 watch_root,workspace 目录只是到时 root 下相对
+		// 子路径(供客户端路由),不再各自建服务器 watch。
+		id, _ := cfg.Backend.Config["watch_id"].(string)
+		if id == "" && len(cfg.Watch) > 0 {
+			id = cfg.Watch[0].ID
+		}
+		if id == "" {
+			id = "relay"
+		}
+		watchDirs = append(watchDirs, server.WatchDirConfig{ID: id, Dir: sc.WatchRoot})
+	} else {
+		for _, w := range cfg.Watch {
+			dir := w.WatchDir
+			if dir == "" {
+				continue
 			}
+			if sc != nil && sc.WatchRoot != "" && !filepath.IsAbs(dir) {
+				dir = filepath.Join(sc.WatchRoot, dir)
+			}
+			watchDirs = append(watchDirs, server.WatchDirConfig{ID: w.ID, Dir: dir, TTL: w.TTL})
 		}
-		data, err := os.ReadFile(expanded)
-		if err != nil {
-			return fmt.Errorf("read server config: %w", err)
-		}
-		data = []byte(os.ExpandEnv(string(data)))
-		if err := yaml.Unmarshal(data, &fileCfg); err != nil {
-			return fmt.Errorf("parse server config: %w", err)
-		}
+	}
+
+	tokens := []string(nil)
+	tls := server.TLSConfig{}
+	if sc != nil {
+		tokens = sc.Auth.Tokens
+		tls = server.TLSConfig{Enabled: sc.TLS.Enabled, CertFile: sc.TLS.CertFile, KeyFile: sc.TLS.KeyFile}
+	}
+
+	return serverBaseConfig{addr: addr, watchDirs: watchDirs, tokens: tokens, tls: tls}, nil
+}
+
+// legacyServerBase 从旧式 server.yaml(顶层 addr/watch/auth/tls)构建 server 配置。
+func legacyServerBase(data []byte) (serverBaseConfig, error) {
+	var fileCfg serverYAMLConfig
+	if err := yaml.Unmarshal(data, &fileCfg); err != nil {
+		return serverBaseConfig{}, fmt.Errorf("parse server config: %w", err)
 	}
 
 	addr := fileCfg.Addr
-	if *serverAddr != "" {
-		addr = *serverAddr
-	}
 	if addr == "" {
 		addr = ":8443"
 	}
-
-	watchDirs := make([]server.WatchDirConfig, 0)
+	watchDirs := make([]server.WatchDirConfig, 0, len(fileCfg.Watch))
 	for _, w := range fileCfg.Watch {
 		watchDirs = append(watchDirs, server.WatchDirConfig{ID: w.ID, Dir: w.Dir, TTL: w.TTL})
 	}
+	return serverBaseConfig{
+		addr:      addr,
+		watchDirs: watchDirs,
+		tokens:    fileCfg.Auth.Tokens,
+		tls:       server.TLSConfig{Enabled: fileCfg.TLS.Enabled, CertFile: fileCfg.TLS.CertFile, KeyFile: fileCfg.TLS.KeyFile},
+	}, nil
+}
+
+func runServer() error {
+	path := *serverConfigPath
+	if path == "" {
+		// 未指定 --server-config 时,回退到全局 -c/--config 客户端配置文件(统一 config.yaml)。
+		path = *configPath
+	}
+	if path == "" {
+		return fmt.Errorf("no server config: pass --server-config or -c")
+	}
+
+	expanded := path
+	if strings.HasPrefix(expanded, "~") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			expanded = home + expanded[1:]
+		}
+	}
+	data, err := os.ReadFile(expanded)
+	if err != nil {
+		return fmt.Errorf("read server config: %w", err)
+	}
+	data = []byte(os.ExpandEnv(string(data)))
+
+	var base serverBaseConfig
+	if hasServerSection(data) {
+		base, err = unifiedServerBase(data)
+	} else {
+		base, err = legacyServerBase(data)
+	}
+	if err != nil {
+		return err
+	}
+
+	addr := base.addr
+	if *serverAddr != "" {
+		addr = *serverAddr
+	}
+
+	watchDirs := base.watchDirs
 	for _, wd := range *serverWatchDirs {
 		parts := strings.SplitN(wd, ":", 2)
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
@@ -84,14 +181,14 @@ func runServer() error {
 		watchDirs = append(watchDirs, server.WatchDirConfig{ID: parts[0], Dir: config.NormalizeWindowsPath(parts[1])})
 	}
 
-	tokens := fileCfg.Auth.Tokens
+	tokens := base.tokens
 	if len(*serverToken) > 0 {
 		tokens = *serverToken
 	}
 
-	tlsCert := fileCfg.TLS.CertFile
-	tlsKey := fileCfg.TLS.KeyFile
-	tlsEnabled := fileCfg.TLS.Enabled
+	tlsCert := base.tls.CertFile
+	tlsKey := base.tls.KeyFile
+	tlsEnabled := base.tls.Enabled
 	if *serverTLSCert != "" {
 		tlsCert = *serverTLSCert
 		tlsEnabled = true

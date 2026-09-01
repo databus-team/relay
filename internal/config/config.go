@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -16,16 +17,36 @@ type Config struct {
 	Backend  BackendConfig `yaml:"backend"`
 	Auth     *AuthConfig   `yaml:"auth,omitempty"`
 	Watch    []WatchConfig `yaml:"watch"`
+	Server   *ServerConfig `yaml:"server,omitempty"` // 仅 relay server 读取;其它端忽略
 	Interval int           `yaml:"interval_seconds"`
 }
 
+// ServerConfig relay server(中转)段。仅在最终实现 relay server 读取的一份统一 config 里使用。
+type ServerConfig struct {
+	Addr      string          `yaml:"addr"`
+	WatchRoot string          `yaml:"watch_root"` // 中转存储根;各 watch 的 watch_dir 相对它
+	Auth      ServerAuth      `yaml:"auth"`
+	TLS       ServerTLSConfig `yaml:"tls"`
+}
+
+type ServerAuth struct {
+	Tokens []string `yaml:"tokens"`
+}
+
+type ServerTLSConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+}
+
 type WatchConfig struct {
-	ID          string      `yaml:"id"`
-	WatchDir    string      `yaml:"watch_dir"`
-	LocalDir    string      `yaml:"local_dir"`
-	Paths       []string    `yaml:"paths"`
-	Jobs        []JobConfig `yaml:"jobs"`
-	AutoCleanup bool        `yaml:"auto_cleanup"`
+	ID          string        `yaml:"id"`
+	WatchDir    string        `yaml:"watch_dir"`
+	LocalDir    string        `yaml:"local_dir"`
+	Paths       []string      `yaml:"paths"`
+	Jobs        []JobConfig   `yaml:"jobs"`
+	AutoCleanup bool          `yaml:"auto_cleanup"`
+	TTL         time.Duration `yaml:"ttl"` // 仅 server 端使用(中转自动清理)
 }
 
 type BackendConfig struct {

@@ -1,4 +1,9 @@
-# relay server configuration
+# relay server configuration (legacy standalone format)
+#
+# RECOMMENDED: 三端共用一份统一 config.yaml —— 在 config.yaml 里加一个 `server:` 段
+# (addr / watch_root / auth.tokens / tls)并把 watch 目录与 ttl 写进同文件 `watch` 列表,
+# 然后 `relay server -c config.yaml` 启动中转。见 config.example.relay.yaml。
+# 本文件仅用于兼容旧式 server.yaml(顶层 addr/watch/auth/tls)。
 
 # Listen address
 addr: ":8443"
@@ -26,12 +31,12 @@ tls:
   cert_file: ""
   key_file: ""
 
-# Usage:
-#   relay server --config server.yaml
+# Usage (legacy):
+#   relay server --server-config server.yaml
 #
 # CLI flags override config file values:
-#   relay server --config server.yaml --addr :9000 --token secret
+#   relay server --server-config server.yaml --addr :9000 --token secret
 #   relay server --watch myapp:/data/app --token mytoken
 #
 # Environment variables are expanded in all string values:
-#   RELAY_TOKEN=my-secret relay server --config server.yaml
+#   RELAY_TOKEN=my-secret relay server --server-config server.yaml
