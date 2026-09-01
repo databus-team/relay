@@ -273,7 +273,7 @@ backend:
 | `watch_id` | Server-side watch ID to subscribe to |
 | `watch_dir` | Remote directory path (relative to server's watch dir) |
 | `command_dir` | Shared directory for config sync commands |
-| `executor` | `true` 仅当本机是「远端执行方」(relay watch 端)时设置;注册为 `watch_id` 的执行方以接收经中转转发的 `relay exec` / `relay push` |
+| `executor` | 仅在 `relay watch`(执行方进程)生效:注册为 `watch_id` 的执行方以接收经中转转发的 `relay exec` / `relay push`。本地 CLI(exec/push/sync)不读取此字段,故同一份配置可与远端共用 |
 | `executor_dir` | push 时执行方把文件落到该目录(默认进程当前目录),作为远端项目根;`relay exec` 在本地执行(| Exec 时的工作目录用请求的 cwd) |
 
 **Transparent forwarding (transit server only):** The relay server is a pure transparent forwarder — it **never** executes commands itself. When
