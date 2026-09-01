@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -220,15 +221,19 @@ func currentPushJobsHandler() backend.PushJobHandler {
 	return pushJobsH
 }
 
-// handleInboundPushJob 收到转发来的 push-job:把文件写进本地 executor 目录,
-// 再调用已注册的回调在远端跑该工作区的 jobs,并把 job 输出流回请求方。
+// handleInboundPushJob 收到转发来的流式 push-job:把临时落盘内容搬进本地 executor 目录,
+// 再调用已注册的回调在远端跑该工作区的 jobs,并逐一 job 输出回流向请求方。
 func (b *RelayBackend) handleInboundPushJob(sess *client.PushJobSession) {
-	absPath, err := b.writePushedFile(sess.RelPath, sess.Content)
+	src := sess.Temp.Name()
+	absPath, err := b.writePushedFile(sess.RelPath, src)
+	os.Remove(src) // 临时文件已在会话结束前消费完,清理
+
 	if err != nil {
 		_ = sess.Write(false, "push job: write failed: "+err.Error()+"\n")
 		_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: err.Error()})
 		return
 	}
+	sess.AbsPath = absPath
 
 	h := currentPushJobsHandler()
 
@@ -239,12 +244,12 @@ func (b *RelayBackend) handleInboundPushJob(sess *client.PushJobSession) {
 	}
 
 	out := func(ch backend.ExecChunk) { _ = sess.Write(ch.Stdout, ch.Data) }
-	exit := h(sess.WatchID, absPath, out)
+	exit := h(sess.WatchID, sess.AbsPath, out)
 	_ = sess.Done(protocol.ExecResponse{ExitCode: exit})
 }
 
-// writePushedFile 把 push 内容写入执行方根目录下 relPath 的安全路径。
-func (b *RelayBackend) writePushedFile(relPath string, content []byte) (string, error) {
+// writePushedFile 把 push 临时内容(srcPath)拷贝到执行方根目录下 relPath 的安全路径。
+func (b *RelayBackend) writePushedFile(relPath, srcPath string) (string, error) {
 	base := b.execDir
 	if base == "" {
 		base = "."
@@ -260,7 +265,19 @@ func (b *RelayBackend) writePushedFile(relPath string, content []byte) (string, 
 	if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(full, content, 0644); err != nil {
+
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return "", err
+	}
+	defer src.Close()
+
+	dst, err := os.OpenFile(full, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
+		return "", err
+	}
+	defer dst.Close()
+	if _, err := io.Copy(dst, src); err != nil {
 		return "", err
 	}
 	return full, nil

@@ -1,7 +1,9 @@
 package backend
 
 import (
+	"bytes"
 	"context"
+	"math/rand"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -130,6 +132,53 @@ func TestEndToEnd_PushJob(t *testing.T) {
 	}
 	if string(got) != "hello from push\n" {
 		t.Errorf("content: %q", string(got))
+	}
+}
+
+// 大文件流式直达:请求方 PushJob 分块流式把数 MB 二进制安全落盘到执行方,字节完全一致。
+func TestEndEndPushJobLarge(t *testing.T) {
+	watchDir := t.TempDir()
+	execRoot := t.TempDir()
+	ts, wsURL := newTestHub(t, watchDir)
+	defer ts.Close()
+	defer client.CloseAll()
+
+	ctx := context.Background()
+	if _, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-exe", "watch_id": "test", "executor": true, "executor_dir": execRoot,
+	}); err != nil {
+		t.Fatalf("executor backend: %v", err)
+	}
+	reqBackend, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+	pj := reqBackend.(bk.PushJobSender)
+
+	// ~4 MB 不可压缩随机字节,跨越多个 64KB 分块。
+	size := 4 << 20
+	blob := make([]byte, size)
+	rng := rand.New(rand.NewSource(42))
+	rng.Read(blob)
+
+	exit, err := pj.PushJob(ctx, "big.bin", blob, func(bk.ExecChunk) {})
+	if err != nil {
+		t.Fatalf("push job: %v", err)
+	}
+	if exit != 0 {
+		t.Fatalf("exit: %d", exit)
+	}
+	got, err := os.ReadFile(filepath.Join(execRoot, "big.bin"))
+	if err != nil {
+		t.Fatalf("pushed large file not present: %v", err)
+	}
+	if len(got) != len(blob) {
+		t.Fatalf("size mismatch: got %d want %d", len(got), len(blob))
+	}
+	if !bytes.Equal(got, blob) {
+		t.Errorf("large file content mismatch")
 	}
 }
 

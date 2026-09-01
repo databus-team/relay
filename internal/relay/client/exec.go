@@ -2,8 +2,11 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync/atomic"
 
@@ -106,12 +109,17 @@ func (c *Client) Exec(ctx context.Context, cmd string, cwd string, timeout int) 
 	return c.ExecStream(ctx, cmd, cwd, timeout, nil)
 }
 
-// PushJob 将文件内容直达远端执行方,在其项目目录落地并触发 jobs。
-// 返回最终 ExecResponse(含 job 输出与 exit code);无在线执行方时由中转转发段兜底。
+// PushJob 将文件内容以 64KB 分块流式直达远端执行方,在其项目目录落地并触发流式 jobs。
+// 返回最终 ExecResponse(含 job 输出与 exit code);无在线执行方时由中转兜底暂存。
 func (c *Client) PushJob(ctx context.Context, relPath string, content []byte, onChunk func(protocol.ExecChunk)) (*protocol.ExecResponse, error) {
-	reqID := uuid.New().String()
-	ch := make(chan *protocol.Message, 256)
+	if len(content) == 0 {
+		content = []byte{}
+	}
 
+	reqID := uuid.New().String()
+	streamID := uuid.New().String()
+
+	ch := make(chan *protocol.Message, 256)
 	c.execMu.Lock()
 	c.execStreams[reqID] = ch
 	c.execMu.Unlock()
@@ -121,35 +129,92 @@ func (c *Client) PushJob(ctx context.Context, relPath string, content []byte, on
 		c.execMu.Unlock()
 	}()
 
-	msg := &protocol.Message{
+	// sha256 digest 供执行方落盘后校验(与 Pull 的校验思路一致)。
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+	total := int64(len(content))
+
+	header := &protocol.Message{
 		Type: protocol.MsgPushJob,
 		ID:   reqID,
 		Payload: protocol.PushJobRequest{
-			WatchID: c.watchID,
-			RelPath: relPath,
-			Content: content,
+			WatchID:  c.watchID,
+			RelPath:  relPath,
+			Size:     total,
+			Digest:   digest,
+			StreamID: streamID,
 		},
 	}
 
 	select {
-	case c.sendCh <- sendMsg{Message: msg}:
+	case c.sendCh <- sendMsg{Message: header}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+
+	// 分块流式发送内容(压缩二进制帧),复用 Client.Push 的块语义。
+	chunkSize := protocol.DefaultChunkSize
+	var offset int64
+	chunk := 0
+	for offset < total {
+		end := offset + int64(chunkSize)
+		if end > total {
+			end = total
+		}
+		piece := content[offset:end]
+		dataMsg := &protocol.Message{
+			Type:     protocol.MsgStreamData,
+			ID:       uuid.New().String(),
+			StreamID: streamID,
+			Payload: protocol.StreamData{
+				StreamID: streamID,
+				Offset:   offset,
+				Chunk:    chunk,
+			},
+		}
+		select {
+		case c.sendCh <- sendMsg{Message: dataMsg, Raw: protocol.Compress(piece)}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		offset = end
+		chunk++
+	}
+
+	endMsg := &protocol.Message{
+		Type:     protocol.MsgStreamEnd,
+		ID:       uuid.New().String(),
+		StreamID: streamID,
+		Payload: protocol.StreamEnd{
+			StreamID: streamID,
+			OK:       true,
+			Received: total,
+			Digest:   digest,
+		},
+	}
+	select {
+	case c.sendCh <- sendMsg{Message: endMsg}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	// 传输副作用以收尾 MsgResponse 为结算点:执行方跑完 jobs(或中转暂存)后回执。
 	return c.execRoundTrip(ctx, ch, onChunk)
 }
 
 // PushJobSession 是一次入站 push-job(执行方视角)的写回句柄。
+// Temp 是流式内容落地的临时文件;执行方处理(writePushedFile)后把最终路径写回 AbsPath。
 type PushJobSession struct {
 	client    *Client
 	requestID string
 	WatchID   string
 	RelPath   string
-	Content   []byte
+	Temp      *os.File
+	AbsPath   string
 	seq       atomic.Int64
 }
 
-// Write 写一段增量输出(流回请求方)。
+// Write 写回写输出(流回请求方)。
 func (p *PushJobSession) Write(stdout bool, data string) error {
 	chunk := protocol.ExecChunk{Seq: int(p.seq.Add(1)), Stdout: stdout, Data: data}
 	return p.client.sendMessage(&protocol.Message{Type: protocol.MsgExecOutput, RequestID: p.requestID, Payload: chunk})
@@ -167,6 +232,17 @@ func (c *Client) SetPushJobHandler(fn func(*PushJobSession)) {
 	c.execHandlerM.Unlock()
 }
 
+// inboundPushReceive 一次入站流式 push 的接收状态(执行方视角)。
+type inboundPushReceive struct {
+	streamID string
+	stream   *PushJobSession
+	handler  func(*PushJobSession)
+	received int64
+	size     int64
+	digest   string
+}
+
+// handleInboundPushJob 收到流式 push 的元数据头:准备临时接收文件,等待随后的流式内容。
 func (c *Client) handleInboundPushJob(msg protocol.Message) {
 	payload, _ := msg.Payload.(map[string]interface{})
 	data, _ := json.Marshal(payload)
@@ -176,13 +252,119 @@ func (c *Client) handleInboundPushJob(msg protocol.Message) {
 	c.execHandlerM.RLock()
 	h := c.pushJobHandler
 	c.execHandlerM.RUnlock()
-
-	sess := &PushJobSession{client: c, requestID: msg.ID, WatchID: req.WatchID, RelPath: req.RelPath, Content: req.Content}
 	if h == nil {
 		_ = c.sendMessage(&protocol.Message{Type: protocol.MsgError, RequestID: msg.ID, Payload: "push job executor not enabled"})
 		return
 	}
-	go h(sess)
+	if req.StreamID == "" {
+		_ = c.sendMessage(&protocol.Message{Type: protocol.MsgError, RequestID: msg.ID, Payload: "push job: missing stream_id"})
+		return
+	}
+
+	tmp, err := os.CreateTemp("", "relay-pushjob-*")
+	if err != nil {
+		_ = c.sendMessage(&protocol.Message{Type: protocol.MsgError, RequestID: msg.ID, Payload: "push job: create temp: " + err.Error()})
+		return
+	}
+
+	sess := &PushJobSession{client: c, requestID: msg.ID, WatchID: req.WatchID, RelPath: req.RelPath, Temp: tmp}
+	pr := &inboundPushReceive{
+		streamID: req.StreamID,
+		stream:   sess,
+		handler:  h,
+		size:     req.Size,
+		digest:   req.Digest,
+	}
+	c.pushRecvMu.Lock()
+	c.pushRecv[req.StreamID] = pr
+	c.pushRecvMu.Unlock()
+}
+
+// abort 终止一次失败的入站流式 push:清理临时文件、移除接收状态并回执错误。
+func (pr *inboundPushReceive) abort(c *Client, reason string) {
+	if pr.stream != nil && pr.stream.Temp != nil {
+		name := pr.stream.Temp.Name()
+		_ = pr.stream.Temp.Close()
+		os.Remove(name)
+	}
+	c.pushRecvMu.Lock()
+	delete(c.pushRecv, pr.streamID)
+	c.pushRecvMu.Unlock()
+	if pr.stream != nil {
+		_ = c.sendMessage(&protocol.Message{Type: protocol.MsgError, RequestID: pr.stream.requestID, Payload: "push job: " + reason})
+	}
+}
+
+// routeInboundPushStream 请求入站流式 push 的内容帧(命中即消费并返回 true)。
+func (c *Client) routeInboundPushStream(msg *protocol.Message) bool {
+	if msg.StreamID == "" {
+		return false
+	}
+	c.pushRecvMu.RLock()
+	pr := c.pushRecv[msg.StreamID]
+	c.pushRecvMu.RUnlock()
+	if pr == nil {
+		return false
+	}
+	switch msg.Type {
+	case protocol.MsgStreamData:
+		c.handleInboundPushData(pr, msg)
+	case protocol.MsgStreamEnd:
+		c.handleInboundPushEnd(pr, msg)
+	}
+	return true
+}
+
+// handleInboundPushData 追加一段解压后的内容到临时文件,并同时累计摘要。
+func (c *Client) handleInboundPushData(pr *inboundPushReceive, msg *protocol.Message) {
+	payload, _ := msg.Payload.(map[string]interface{})
+	var raw []byte
+	if b, ok := payload["data"].([]byte); ok {
+		raw = b
+	}
+	chunkData, err := protocol.Decompress(raw)
+	if err != nil {
+		pr.abort(c, "decompress: "+err.Error())
+		return
+	}
+	pr.received += int64(len(chunkData))
+	if pr.size > 0 && pr.received > pr.size {
+		pr.abort(c, "received exceeds declared size")
+		return
+	}
+	if _, err := pr.stream.Temp.Write(chunkData); err != nil {
+		pr.abort(c, "write temp: "+err.Error())
+	}
+}
+
+// handleInboundPushEnd 流结束:落盘完成、校验摘要,然后交给 pushJobHandler 在远端跑 jobs。
+func (c *Client) handleInboundPushEnd(pr *inboundPushReceive, msg *protocol.Message) {
+	payload, _ := msg.Payload.(map[string]interface{})
+	data, _ := json.Marshal(payload)
+	var se protocol.StreamEnd
+	json.Unmarshal(data, &se)
+
+	if !se.OK {
+		pr.abort(c, "stream error: "+se.Error)
+		return
+	}
+
+	// 校验接收量/摘要
+	if pr.size != pr.received {
+		pr.abort(c, fmt.Sprintf("size mismatch: declared %d, received %d", pr.size, pr.received))
+		return
+	}
+
+	_ = pr.stream.Temp.Close()
+
+	// 移除接收状态(临时文件由执行方 handler 处理完后清理)。
+	c.pushRecvMu.Lock()
+	delete(c.pushRecv, pr.streamID)
+	c.pushRecvMu.Unlock()
+
+	// 完成写入后交由执行方 handler 处理(把内容落到目录并跑 jobs、回流输出)。
+	handler := pr.handler
+	go handler(pr.stream)
 }
 
 // ExecSession 是一次入站 exec(执行方视角)的写回句柄。

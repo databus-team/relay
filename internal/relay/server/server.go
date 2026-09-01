@@ -35,6 +35,17 @@ type Server struct {
 	// reqOwner 记录被转发的 exec 请求(reqID)归属的请求方客户端,用于把执行方回流帧转回去。
 	reqOwner map[string]string
 	reqMu    sync.RWMutex
+
+	// pushRelay 记录被转发给执行方的流式 push(streamID → 执行方/请求方),用于把内容帧原样透传。
+	pushRelay   map[string]pushRelayInfo
+	pushRelayMu sync.RWMutex
+}
+
+// pushRelayInfo 一次被中转发出的流式 push 的路由信息。
+type pushRelayInfo struct {
+	executorID  string // 接收内容流与执行 jobs 的远端执行方
+	reqID       string // 关联回流的请求 ID(与 reqOwner 一致)
+	requesterID string // 发起 push 的请求方
 }
 
 type Config struct {
@@ -73,6 +84,7 @@ func New(cfg Config) (*Server, error) {
 		subs:      make(map[string]map[string]bool),
 		executors: make(map[string]string),
 		reqOwner:  make(map[string]string),
+		pushRelay: make(map[string]pushRelayInfo),
 	}
 
 	for _, wd := range cfg.WatchDirs {
@@ -354,14 +366,47 @@ func (s *Server) GetReqOwner(reqID string) (string, bool) {
 	return owner, ok
 }
 
-// ClearReqOwner 移除 exec 请求归属记录(收尾后调用)。
+// ClearReqOwner 移除 exec 请求归属(收尾后调用)。
 func (s *Server) ClearReqOwner(reqID string) {
 	s.reqMu.Lock()
 	defer s.reqMu.Unlock()
 	delete(s.reqOwner, reqID)
 }
 
-// cleanupClientState 断连时清理该 client 注册的执行方与待转发请求归属。
+// SetPushRelay 记录一次被转发给执行方的流式 push(streamID → 路由)。
+func (s *Server) SetPushRelay(streamID string, info pushRelayInfo) {
+	s.pushRelayMu.Lock()
+	defer s.pushRelayMu.Unlock()
+	s.pushRelay[streamID] = info
+}
+
+// GetPushRelay 读取流式 push 路由;存在则返回 true。
+func (s *Server) GetPushRelay(streamID string) (pushRelayInfo, bool) {
+	s.pushRelayMu.RLock()
+	defer s.pushRelayMu.RUnlock()
+	info, ok := s.pushRelay[streamID]
+	return info, ok
+}
+
+// DeletePushRelay 移除流式 push 路由(结束时调用)。
+func (s *Server) DeletePushRelay(streamID string) {
+	s.pushRelayMu.Lock()
+	defer s.pushRelayMu.Unlock()
+	delete(s.pushRelay, streamID)
+}
+
+// SendToBinary 向某客户端发送一条 JSON 消息后紧跟一个二进制帧(供流式块透传)。
+func (s *Server) SendToBinary(clientID string, msg protocol.Message, raw []byte) error {
+	s.clientMu.RLock()
+	client, ok := s.clients[clientID]
+	s.clientMu.RUnlock()
+	if !ok {
+		return fmt.Errorf("client not found: %s", clientID)
+	}
+	return client.SendBinary(msg, raw)
+}
+
+// cleanupClientState 断连时清理该 client 注册的执行方、待转发请求归属与流式 push 路由。
 func (s *Server) cleanupClientState(clientID string) {
 	s.executorMu.Lock()
 	for watchID, e := range s.executors {
@@ -378,6 +423,14 @@ func (s *Server) cleanupClientState(clientID string) {
 		}
 	}
 	s.reqMu.Unlock()
+
+	s.pushRelayMu.Lock()
+	for streamID, info := range s.pushRelay {
+		if info.executorID == clientID || info.requesterID == clientID {
+			delete(s.pushRelay, streamID)
+		}
+	}
+	s.pushRelayMu.Unlock()
 }
 
 func (s *Server) BroadcastToSubscribers(event protocol.FileEvent) {

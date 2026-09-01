@@ -2,7 +2,6 @@ package server
 
 import (
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -95,6 +94,11 @@ func (c *Client) writeLoop() {
 func (c *Client) handleMessage(msg protocol.Message) {
 	// 执行方回包(被转发 exec 的输出帧)按 reqOwner 转回请求方
 	if c.maybeRelayExecReply(msg) {
+		return
+	}
+
+	// 被转发给执行方的流式 push 内容帧原样透传,不进入本地流处理。
+	if c.maybeRelayPushStream(&msg) {
 		return
 	}
 
@@ -235,59 +239,101 @@ func (c *Client) handleRegisterExecutor(msg protocol.Message) {
 	c.SendResponse(msg.ID, map[string]interface{}{"ok": true, "watch_id": watchID, "executor": c.id})
 }
 
-// handlePushJob 处理 push-job 请求:有在线执行方则转发由其在远端落地并跑 jobs;
-// 无执行方时回退落地到中转暂存目录(不触发 jobs)。
+// handlePushJob 处理流式 push-job 请求:有在线执行方则把元数据头转发给执行方,
+// 并登记其 streamID 供后续内容帧透传;无执行方时回退为「中根本地暂存流式接收」。
 func (c *Client) handlePushJob(msg protocol.Message) {
 	payload, _ := msg.Payload.(map[string]interface{})
 	watchID := toString(payload["watch_id"])
 	relPath := toString(payload["rel_path"])
+	streamID := toString(payload["stream_id"])
 
 	if _, ok := c.server.GetWatchDir(watchID); !ok {
 		c.SendError(msg.ID, "unknown watch_id")
 		return
 	}
+	if streamID == "" {
+		c.SendError(msg.ID, "push job: missing stream_id")
+		return
+	}
 
 	if executorID, ok := c.server.GetExecutor(watchID); ok {
 		c.server.SetReqOwner(msg.ID, c.id)
+		c.server.SetPushRelay(streamID, pushRelayInfo{executorID: executorID, reqID: msg.ID, requesterID: c.id})
 		if err := c.server.SendTo(executorID, msg); err != nil {
 			c.server.ClearReqOwner(msg.ID)
+			c.server.DeletePushRelay(streamID)
 			c.SendError(msg.ID, "executor unavailable: "+err.Error())
 		}
 		return
 	}
 
-	// 回退:写入中转暂存目录(行为同原有 push),标记为已暂存、未执行 jobs。
+	// 回退:把本流式 push 视为中转自身的接收流,写入暂存目录,收尾时自动回执。
 	dir, _ := c.server.GetWatchDir(watchID)
 	fullPath := safePath(dir, relPath)
 	if fullPath == "" {
 		c.SendError(msg.ID, "path traversal detected")
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
-		c.SendError(msg.ID, "mkdir: "+err.Error())
-		return
+	tmpPath := fullPath + ".tmp-" + streamID
+	reqID := msg.ID
+	c.streamMu.Lock()
+	c.streams[streamID] = &ReceiveStream{
+		streamID: streamID,
+		path:     fullPath,
+		tmpPath:  tmpPath,
+		onDone: func() {
+			// 内容帧收完后回执 prompt + 最终响应,请求方以 exec 语义收尾。
+			_ = c.Send(protocol.Message{
+				Type:      protocol.MsgExecOutput,
+				RequestID: reqID,
+				Payload:   protocol.ExecChunk{Seq: 1, Stdout: true, Data: "[staged to transit; no online executor, jobs not run]\n"},
+			})
+			_ = c.SendResponse(reqID, protocol.ExecResponse{ExitCode: 0})
+		},
 	}
-	if err := os.WriteFile(fullPath, decodePayloadBytes(payload["content"]), 0644); err != nil {
-		c.SendError(msg.ID, err.Error())
-		return
-	}
-	// 提示以实时输出帧发送,客户端/CLI 能立即显示;随后收尾
-	_ = c.Send(protocol.Message{
-		Type:      protocol.MsgExecOutput,
-		RequestID: msg.ID,
-		Payload:   protocol.ExecChunk{Seq: 1, Stdout: true, Data: "[staged to transit; no online executor, jobs not run]\n"},
-	})
-	c.SendResponse(msg.ID, protocol.ExecResponse{ExitCode: 0})
+	c.streamMu.Unlock()
 }
 
-// decodePayloadBytes 解码 JSON []byte(content 为 base64 字符串)。
-func decodePayloadBytes(v interface{}) []byte {
-	if s, ok := v.(string); ok {
-		if b, err := base64.StdEncoding.DecodeString(s); err == nil {
-			return b
-		}
+// maybeRelayPushStream 把被转发给执行方的流式 push 内容帧原样透传(含二进制块),不本地处理。
+func (c *Client) maybeRelayPushStream(msg *protocol.Message) bool {
+	if msg.StreamID == "" {
+		return false
 	}
-	return nil
+	info, ok := c.server.GetPushRelay(msg.StreamID)
+	if !ok {
+		return false
+	}
+
+	switch msg.Type {
+	case protocol.MsgStreamData:
+		var raw []byte
+		var offset, chunk float64
+		if payload, ok := msg.Payload.(map[string]interface{}); ok {
+			if r, ok := payload["data"].([]byte); ok {
+				raw = r
+			}
+			offset = toFloat64(payload["offset"])
+			chunk = toFloat64(payload["chunk"])
+		}
+		// 干净 JSON(不含 data,避免 base64 膨胀)+ 原始压缩二进制帧。
+		clean := protocol.Message{
+			Type:     protocol.MsgStreamData,
+			ID:       uuid.New().String(),
+			StreamID: msg.StreamID,
+			Payload: protocol.StreamData{
+				StreamID: msg.StreamID,
+				Offset:   int64(offset),
+				Chunk:    int(chunk),
+			},
+		}
+		_ = c.server.SendToBinary(info.executorID, clean, raw)
+		return true
+	case protocol.MsgStreamEnd:
+		c.server.DeletePushRelay(msg.StreamID)
+		_ = c.server.SendTo(info.executorID, *msg)
+		return true
+	}
+	return false
 }
 
 // maybeRelayExecReply 处理消息是否是被转发 exec 的执行方回包,则转发回请求方。
@@ -383,7 +429,12 @@ func (c *Client) handleStreamEnd(msg protocol.Message) {
 		return
 	}
 
-	c.Send(protocol.Message{Type: protocol.MsgStreamEnd, StreamID: msg.StreamID, Payload: protocol.StreamEnd{StreamID: msg.StreamID, OK: true, Received: stream.received}})
+	// push-job 回退暂存收尾:落盘后回执 prompt + 最终响应。
+	if stream.onDone != nil {
+		stream.onDone()
+	} else {
+		c.Send(protocol.Message{Type: protocol.MsgStreamEnd, StreamID: msg.StreamID, Payload: protocol.StreamEnd{StreamID: msg.StreamID, OK: true, Received: stream.received}})
+	}
 }
 
 // Send 发送消息
@@ -420,6 +471,8 @@ type ReceiveStream struct {
 	tmpPath  string
 	received int64
 	buf      []byte
+	// onDone 在流完整落盘(rename 成功)后触发;push-job 回退暂存用来自动回执。
+	onDone func()
 }
 
 // handlePull 处理文件下载请求
