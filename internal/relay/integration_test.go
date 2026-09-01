@@ -787,3 +787,52 @@ func TestIntegration_ServerUpgrade_Swap(t *testing.T) {
 		t.Errorf("swap received a binary that differs from the one verified")
 	}
 }
+
+// TestIntegration_ClientUpgradeServer 客户端 UpgradeServer 全链路(上传 → 自检 → ACK)
+// 成功;server 未接线换装 → 仅回 ACK,U4-T1 传输结算点。
+func TestIntegration_ClientUpgradeServer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds real relay binary")
+	}
+	watchDir := t.TempDir()
+	ts, wsURL := setupTestServer(t, watchDir)
+	defer ts.Close()
+
+	bin := filepath.Join(t.TempDir(), "relay-upgrade-test")
+	build := exec.Command("go", "build", "-o", bin, "github.com/user/relay/cmd/relay")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build relay: %v\n%s", err, out)
+	}
+	content, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatalf("read binary: %v", err)
+	}
+
+	ctx := context.Background()
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	if err := c.UpgradeServer(ctx, bin, content); err != nil {
+		t.Fatalf("UpgradeServer: %v", err)
+	}
+}
+
+// TestIntegration_ClientUpgradeServer_NoToken:中转未配置 token → 升级通道默认关闭,
+// UpgradeServer 应返回可读错误(U4-T2/AE3)。
+func TestIntegration_ClientUpgradeServer_NoToken(t *testing.T) {
+	watchDir := t.TempDir()
+	ts, wsURL := setupTestServerAuth(t, watchDir, nil)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	err := c.UpgradeServer(ctx, "unused.bin", []byte{0x00, 0x01})
+	if err == nil {
+		t.Fatal("expected error when transit has no token, got nil")
+	}
+	if !strings.Contains(err.Error(), "disabled") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}

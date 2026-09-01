@@ -99,7 +99,7 @@ exec:
 deploy-remote:
 	./scripts/relay-deploy.sh remote
 
-## deploy-transit: Build linux binary + print manual code-server steps for the transit server
+## deploy-transit: One-click deploy the transit server via controlled self-upgrade
 deploy-transit:
 	./scripts/relay-deploy.sh transit
 
@@ -123,6 +123,6 @@ help:
 	@echo "  make vet            Run go vet"
 	@echo "  make run            Run in daemon mode"
 	@echo "  make deploy-remote    Auto-deliver to remote executor (RESTART=1 to swap+restart)"
-	@echo "  make deploy-transit   Build + print manual transit server steps"
+	@echo "  make deploy-transit   One-click deploy the transit server (controlled self-upgrade)"
 	@echo "  make deploy           Both above"
 	@echo "  make help           Show this help"

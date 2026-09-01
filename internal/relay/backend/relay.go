@@ -302,8 +302,17 @@ func (b *RelayBackend) ConfigSync(ctx context.Context, payload []byte) (int, err
 	return resp.ExitCode, nil
 }
 
-// enableExecutor 让本 backend 在远端 relay watch 上扮演执行方:
-// 注册为 watcherID 的 executor,并处理从中转转发来的 exec/push/config-sync 请求。
+// UpgradeServer 请求方把本地 relay 二进制流式交付给中转发起「服务器自升级」,以中转自检
+// 通过后的成功 ACK 为结算点返回 nil。二进制已由调用方读入 content(binaryPath 仅供报错)。
+func (b *RelayBackend) UpgradeServer(ctx context.Context, binaryPath string, content []byte) error {
+	if err := b.ensureConnected(ctx); err != nil {
+		return err
+	}
+	return b.client.UpgradeServer(ctx, binaryPath, content)
+}
+
+// enableExecutor 让本 backend 在远端 relay watch 上扮演 executor:
+// 注册为 watcherID 的 executor,并执行从中转转发来的 exec/push/config-sync 请求。
 func (b *RelayBackend) enableExecutor() {
 	b.client.SetExecHandler(func(sess *client.ExecSession) { b.handleInboundExec(sess) })
 	b.client.SetPushJobHandler(func(sess *client.PushJobSession) { b.handleInboundPushJob(sess) })
