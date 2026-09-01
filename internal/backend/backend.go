@@ -39,6 +39,34 @@ type EventBackend interface {
 	SubscribeEvents(ctx context.Context) error
 }
 
+// ExecChunk 单条增量执行输出块。
+type ExecChunk struct {
+	Stdout bool // true=stdout,false=stderr
+	Data   string
+}
+
+// ExecStreamBackend 可选接口:backend 支持流式输出远程执行。
+type ExecStreamBackend interface {
+	// ExecStream 流式执行,onChunk 在每次收到增量输出时回调(nil 可忽略);返回 exit code。
+	ExecStream(ctx context.Context, cmd string, cwd string, timeout int, onChunk func(ExecChunk)) (int, error)
+}
+
+// PushJobHandler 执行方在文件落地本地后,为某工作区跑 jobs 的处理器。
+// out 用于把 job 输出回传请求方;返回 0 表示全部成功,非 0 表示有 job 失败。
+type PushJobHandler func(watchID string, absPath string, out func(ExecChunk)) int
+
+// PushJobCapable 可选接口:执行方后端可注册「push 文件落地后本地跑 jobs」的回调。
+// 由远端 relay watch 注入,复用其自身的 watch 配置与 job 执行逻辑。
+type PushJobCapable interface {
+	SetPushJobHandler(h PushJobHandler)
+}
+
+// PushJobSender 可选接口:后端把文件直达远端执行方并触发 jobs(relay backend 实现);
+// 无在线执行方时由中转兜底落地到暂存目录。
+type PushJobSender interface {
+	PushJob(ctx context.Context, relPath string, content []byte, on func(ExecChunk)) (int, error)
+}
+
 type BackendFactory func(config map[string]interface{}) (FileTransferBackend, error)
 
 var backends = make(map[string]BackendFactory)

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/user/relay/internal/relay/client"
+	"github.com/user/relay/internal/relay/protocol"
 	"github.com/user/relay/internal/relay/server"
 )
 
@@ -156,16 +157,38 @@ func TestIntegration_PushPullBinary(t *testing.T) {
 	}
 }
 
+// registerExecutorClient 连接一个充当「执行方」的客户端:为 test-watch 注册 executor,
+// 收到入站 exec 时逐行流式写出两行后收尾。
+func registerExecutorClient(t *testing.T, wsURL string) *client.Client {
+	t.Helper()
+	ctx := context.Background()
+
+	exec := connectTestClient(t, wsURL)
+	exec.SetExecHandler(func(sess *client.ExecSession) {
+		go func() {
+			_ = sess.Write(true, sess.Cmd()+"\n")
+			_ = sess.Write(true, "world\n")
+			_ = sess.Done(protocol.ExecResponse{ExitCode: 0})
+		}()
+	})
+	if err := exec.RegisterExecutor(ctx, "test-watch", "add"); err != nil {
+		t.Fatalf("register executor: %v", err)
+	}
+	return exec
+}
+
 func TestIntegration_Exec(t *testing.T) {
 	watchDir := t.TempDir()
 
 	ts, wsURL := setupTestServer(t, watchDir)
 	defer ts.Close()
 
-	c := connectTestClient(t, wsURL)
-	defer c.Disconnect()
+	exec := registerExecutorClient(t, wsURL)
+	defer exec.Disconnect()
 
 	ctx := context.Background()
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
 
 	resp, err := c.Exec(ctx, "echo hello-relay", "", 10)
 	if err != nil {
@@ -177,6 +200,62 @@ func TestIntegration_Exec(t *testing.T) {
 	}
 	if !strings.Contains(resp.Stdout, "hello-relay") {
 		t.Errorf("stdout: %q", resp.Stdout)
+	}
+}
+
+func TestIntegration_ExecStream(t *testing.T) {
+	watchDir := t.TempDir()
+
+	ts, wsURL := setupTestServer(t, watchDir)
+	defer ts.Close()
+
+	exec := registerExecutorClient(t, wsURL)
+	defer exec.Disconnect()
+
+	ctx := context.Background()
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	type chunk struct {
+		stdout bool
+		data   string
+	}
+	var chunks []chunk
+
+	resp, err := c.ExecStream(ctx, "whatever", "", 10, func(ch protocol.ExecChunk) {
+		chunks = append(chunks, chunk{stdout: ch.Stdout, data: ch.Data})
+	})
+	if err != nil {
+		t.Fatalf("exec stream: %v", err)
+	}
+
+	if resp.ExitCode != 0 {
+		t.Errorf("exit code: %d", resp.ExitCode)
+	}
+	// 流式两行输出都应被逐块收到
+	if len(chunks) != 2 {
+		t.Errorf("expected 2 chunks, got %d: %+v", len(chunks), chunks)
+	}
+	if !strings.Contains(resp.Stdout, "whatever") || !strings.Contains(resp.Stdout, "world") {
+		t.Errorf("stdout: %q", resp.Stdout)
+	}
+}
+
+func TestIntegration_ExecNoExecutor(t *testing.T) {
+	watchDir := t.TempDir()
+
+	ts, wsURL := setupTestServer(t, watchDir)
+	defer ts.Close()
+
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	ctx := context.Background()
+
+	if _, err := c.Exec(ctx, "echo x", "", 10); err == nil {
+		t.Error("expected error when no executor registered, got nil")
+	} else if !strings.Contains(err.Error(), "no executor") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 

@@ -19,11 +19,11 @@ type Client struct {
 	conn      *websocket.Conn
 	connected atomic.Bool
 
-	sendCh      chan sendMsg
-	recvCh      chan *protocol.Message
-	eventCh     chan protocol.FileEvent
-	pending     map[string]chan *protocol.Response
-	pendingMu   sync.RWMutex
+	sendCh    chan sendMsg
+	recvCh    chan *protocol.Message
+	eventCh   chan protocol.FileEvent
+	pending   map[string]chan *protocol.Response
+	pendingMu sync.RWMutex
 
 	closeCh      chan struct{}
 	reconnectCfg ReconnectConfig
@@ -32,6 +32,16 @@ type Client struct {
 	streamMu   sync.RWMutex
 	streams    map[string]*receiveStream
 	streamDone map[string]chan error
+
+	execMu          sync.RWMutex
+	execStreams     map[string]chan *protocol.Message // reqID -> 请求方流式 exec 通道
+	execHandler     func(*ExecSession)                // 执行方入站 exec 处理回调
+	pushJobHandler  func(*PushJobSession)             // 执行方入站 push-job 处理回调
+	pushJobHandlerM sync.RWMutex
+	execHandlerM    sync.RWMutex
+
+	onReconnect   func() // 重连成功后的回调(执行方用于重新注册)
+	onReconnectMu sync.Mutex
 }
 
 func New(url, token, watchID string) (*Client, error) {
@@ -47,6 +57,7 @@ func New(url, token, watchID string) (*Client, error) {
 		reconnectCfg: DefaultReconnectConfig(),
 		streams:      make(map[string]*receiveStream),
 		streamDone:   make(map[string]chan error),
+		execStreams:  make(map[string]chan *protocol.Message),
 	}, nil
 }
 
@@ -164,8 +175,40 @@ func (c *Client) writeLoop() {
 	}
 }
 
+// SetOnReconnect 设置重连成功后的回调(执行方用于向中转重新注册)。
+func (c *Client) SetOnReconnect(fn func()) {
+	c.onReconnectMu.Lock()
+	c.onReconnect = fn
+	c.onReconnectMu.Unlock()
+}
+
+// fireOnReconnect 触发重连回调。由 reconnectLoop 在 re-dial 成功后调用。
+func (c *Client) fireOnReconnect() {
+	c.onReconnectMu.Lock()
+	fn := c.onReconnect
+	c.onReconnectMu.Unlock()
+	if fn != nil {
+		go fn()
+	}
+}
+
+// sendMessage 将一条消息入队（供入站 exec 会话回包使用）。
+func (c *Client) sendMessage(msg *protocol.Message) error {
+	c.sendCh <- sendMsg{Message: msg}
+	return nil
+}
+
 func (c *Client) handleMessage(msg protocol.Message) {
+	// 请求方流式 exec:命中 execStreams 的输出/收尾帧直接投递,不落入 pending
+	if c.routeExecStream(&msg) {
+		return
+	}
+
 	switch msg.Type {
+	case protocol.MsgExec:
+		c.handleInboundExec(msg)
+	case protocol.MsgPushJob:
+		c.handleInboundPushJob(msg)
 	case protocol.MsgResponse, protocol.MsgError:
 		if msg.RequestID != "" {
 			c.pendingMu.RLock()
@@ -302,28 +345,19 @@ func (c *Client) failAllPending(reason string) {
 	}
 }
 
-func (c *Client) Exec(ctx context.Context, cmd string, cwd string, timeout int) (*protocol.ExecResponse, error) {
-	if timeout <= 0 {
-		timeout = 30
-	}
-
-	resp, err := c.Request(ctx, protocol.MsgExec, protocol.ExecRequest{
-		WatchID: c.watchID,
-		Cmd:     cmd,
-		Cwd:     cwd,
-		Timeout: timeout,
+// RegisterExecutor 向服务端注册(或注销,action="remove")本客户端为某 watch 的执行方。
+func (c *Client) RegisterExecutor(ctx context.Context, watchID, action string) error {
+	resp, err := c.Request(ctx, protocol.MsgRegisterExecutor, protocol.RegisterExecutorRequest{
+		WatchID: watchID,
+		Action:  action,
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
-
-	data, _ := json.Marshal(resp.Payload)
-	var execResp protocol.ExecResponse
-	if err := json.Unmarshal(data, &execResp); err != nil {
-		return nil, fmt.Errorf("parse exec response: %w", err)
+	if !resp.OK {
+		return fmt.Errorf("register executor failed: %s", resp.Error)
 	}
-
-	return &execResp, nil
+	return nil
 }
 
 func (c *Client) Subscribe(ctx context.Context, watchID string) error {
@@ -411,17 +445,23 @@ func toClientMsg(msg protocol.Message) Message {
 }
 
 func toString(v interface{}) string {
-	if s, ok := v.(string); ok { return s }
+	if s, ok := v.(string); ok {
+		return s
+	}
 	return ""
 }
 func toBool(v interface{}) bool {
-	if b, ok := v.(bool); ok { return b }
+	if b, ok := v.(bool); ok {
+		return b
+	}
 	return false
 }
 func toInt64(v interface{}) int64 {
 	switch val := v.(type) {
-	case float64: return int64(val)
-	case int64: return val
+	case float64:
+		return int64(val)
+	case int64:
+		return val
 	}
 	return 0
 }

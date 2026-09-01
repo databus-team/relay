@@ -4,33 +4,36 @@ package protocol
 type MessageType string
 
 const (
-	MsgConnect     MessageType = "connect"
-	MsgConnectAck  MessageType = "connect_ack"
-	MsgPing        MessageType = "ping"
-	MsgPong        MessageType = "pong"
-	MsgFileEvent   MessageType = "file_event"
-	MsgEventAck    MessageType = "event_ack"
-	MsgPush        MessageType = "push"
-	MsgPull        MessageType = "pull"
-	MsgList        MessageType = "list"
-	MsgExec        MessageType = "exec"
-	MsgDelete      MessageType = "delete"
-	MsgSubscribe   MessageType = "subscribe"
-	MsgResponse    MessageType = "response"
-	MsgStreamStart MessageType = "stream_start"
-	MsgStreamData  MessageType = "stream_data"
-	MsgStreamEnd   MessageType = "stream_end"
-	MsgError       MessageType = "error"
-	MsgSubscribed  MessageType = "subscribed"
+	MsgConnect          MessageType = "connect"
+	MsgConnectAck       MessageType = "connect_ack"
+	MsgPing             MessageType = "ping"
+	MsgPong             MessageType = "pong"
+	MsgFileEvent        MessageType = "file_event"
+	MsgEventAck         MessageType = "event_ack"
+	MsgPush             MessageType = "push"
+	MsgPull             MessageType = "pull"
+	MsgList             MessageType = "list"
+	MsgExec             MessageType = "exec"
+	MsgDelete           MessageType = "delete"
+	MsgSubscribe        MessageType = "subscribe"
+	MsgResponse         MessageType = "response"
+	MsgStreamStart      MessageType = "stream_start"
+	MsgStreamData       MessageType = "stream_data"
+	MsgStreamEnd        MessageType = "stream_end"
+	MsgError            MessageType = "error"
+	MsgSubscribed       MessageType = "subscribed"
+	MsgExecOutput       MessageType = "exec_output"
+	MsgRegisterExecutor MessageType = "register_executor"
+	MsgPushJob          MessageType = "push_job"
 )
 
 // Message 是所有消息的通用包装
 type Message struct {
-	Type       MessageType `json:"type"`
-	ID         string      `json:"id"`
-	RequestID  string      `json:"request_id,omitempty"`
-	Payload    interface{} `json:"payload,omitempty"`
-	StreamID   string      `json:"stream_id,omitempty"`
+	Type      MessageType `json:"type"`
+	ID        string      `json:"id"`
+	RequestID string      `json:"request_id,omitempty"`
+	Payload   interface{} `json:"payload,omitempty"`
+	StreamID  string      `json:"stream_id,omitempty"`
 }
 
 // ConnectRequest 客户端连接请求
@@ -109,6 +112,28 @@ type ExecResponse struct {
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
 	Duration int64  `json:"duration_ms"`
+}
+
+// ExecChunk 单条增量执行输出帧。由执行方发送,RequestID 关联到原始 exec 请求。
+type ExecChunk struct {
+	Seq    int    `json:"seq"`
+	Stdout bool   `json:"stdout"` // true=stdout, false=stderr
+	Data   string `json:"data"`
+}
+
+// RegisterExecutorRequest 向中转注册/注销某 watch 的 executor(远端执行方)。
+type RegisterExecutorRequest struct {
+	WatchID string `json:"watch_id"`
+	Action  string `json:"action"` // "add" / "remove"
+}
+
+// PushJobRequest push 一个文件直达远端执行方并在其本地跑 jobs。
+// Content 为 base64 内联文本,避免再引入双向字节流转发。
+type PushJobRequest struct {
+	WatchID string `json:"watch_id"`
+	RelPath string `json:"rel_path"` // 相对执行方项目根的路径
+	Mode    uint32 `json:"mode"`
+	Content []byte `json:"content"`
 }
 
 // PushRequest 上传文件请求
