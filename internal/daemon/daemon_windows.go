@@ -25,7 +25,9 @@ func detach(c *exec.Cmd) {
 
 // alive 用 tasklist 判断进程是否存活(windows 的 Signal(0) 不受支持)。
 func alive(pid int) bool {
-	out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/FO", "CSV", "/NH").Output()
+	cmd := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/FO", "CSV", "/NH")
+	detach(cmd) // 后台 daemon 下调用时压掉控制台窗口闪烁
+	out, err := cmd.Output()
 	if err != nil {
 		return false
 	}
@@ -35,5 +37,7 @@ func alive(pid int) bool {
 
 // kill 用 taskkill 强杀。
 func kill(pid int) {
-	_ = exec.Command("taskkill", "/PID", strconv.Itoa(pid), "/F").Run()
+	cmd := exec.Command("taskkill", "/PID", strconv.Itoa(pid), "/F")
+	detach(cmd) // 同上,避免无控制台上下文弹窗
+	_ = cmd.Run()
 }

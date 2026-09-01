@@ -125,6 +125,7 @@ func (b *LocalBackend) Exec(ctx context.Context, cmd string, cwd string, timeout
 	if cwd != "" {
 		execCmd.Dir = cwd
 	}
+	HideConsoleWindow(execCmd)
 	output, err := execCmd.CombinedOutput()
 	if err != nil {
 		// If context deadline exceeded, return a clear error
