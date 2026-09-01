@@ -6,7 +6,6 @@ package jobrunner
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -77,15 +76,8 @@ func runOne(ctx context.Context, watchCfg *config.WatchConfig, job *config.JobCo
 		}
 		return done(res, nil)
 
-	case "file_delete":
-		if file == "" && usesFileVars(job.Path) {
-			return done(Result{}, fmt.Errorf("job %q deletes a file; provide a file argument", job.ID))
-		}
-		path := watcher.SubstituteVariables(job.Path, vars)
-		if err := os.Remove(path); err != nil {
-			return done(Result{}, fmt.Errorf("file_delete job %q failed: %w", job.ID, err))
-		}
-		return done(Result{}, nil)
+	// 删除类工作不再有专有 job 类型:统一用 exec 执行删除命令(如 `rm -f {file_path}`),
+	// 幂等且任一路径 fetch/push 语义一致。未知类型一律报错。
 
 	default:
 		return done(Result{}, fmt.Errorf("unknown job type: %q", job.Type))

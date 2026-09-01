@@ -66,11 +66,9 @@ type AuthConfig struct {
 
 type JobConfig struct {
 	ID       string `yaml:"id"`
-	Type     string `yaml:"type"`             // exec, file_delete
-	Target   string `yaml:"target,omitempty"` // file_delete only: remote (default) | local
+	Type     string `yaml:"type"` // 仅 exec;删除统一用 exec(如 `rm -f {file_path}`)
 	Cmd      string `yaml:"cmd,omitempty"`
 	Cwd      string `yaml:"cwd,omitempty"`
-	Path     string `yaml:"path,omitempty"`
 	If       string `yaml:"if,omitempty"`
 	KeepFile bool   `yaml:"keep_file"`
 	Timeout  int    `yaml:"timeout,omitempty"` // seconds, optional per-job timeout

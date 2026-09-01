@@ -149,57 +149,16 @@ func TestBuildVariablesNoLocal(t *testing.T) {
 	}
 }
 
-func TestExecuteJobsLocalDelete(t *testing.T) {
-	tmp := t.TempDir()
-	localPath := filepath.Join(tmp, "foo.test")
-	if err := os.WriteFile(localPath, []byte("hi"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
+func TestExecuteJobsRejectsRemovedFileDelete(t *testing.T) {
+	// file_delete 专有类型已移除:任何本本中出现都应作为未知类型报错(删除用 exec)。
 	w := &Watcher{jobResults: make(map[string]bool)}
-	b := &stubBackend{}
 	jobs := []config.JobConfig{
-		{ID: "rm", Type: "file_delete", Target: "local", Path: "{file_path}"},
+		{ID: "rm", Type: "file_delete", Cmd: "rm -f {file_path}"},
 	}
-
-	// target=local must remove the locally-synced copy and NOT call the backend.
-	if err := w.executeJobs(context.Background(), jobs, "/remote/x/foo.test", localPath, "foo.test", tmp, b); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(localPath); !os.IsNotExist(err) {
-		t.Error("local file should have been removed by target=local file_delete")
-	}
-	if len(b.deleted) != 0 {
-		t.Errorf("backend.Delete should not be called for target=local, got %v", b.deleted)
-	}
-}
-
-func TestExecuteJobsLocalDeleteMissingIsNoop(t *testing.T) {
-	// Deleting an already-absent local file must not error the job chain.
-	w := &Watcher{jobResults: make(map[string]bool)}
-	b := &stubBackend{}
-	jobs := []config.JobConfig{
-		{ID: "rm", Type: "file_delete", Target: "local", Path: "{file_path}"},
-	}
-	missing := filepath.Join(t.TempDir(), "never-wrote.test")
-	if err := w.executeJobs(context.Background(), jobs, "/remote/x.test", missing, "x.test", "", b); err != nil {
-		t.Fatalf("deleting a missing local file should be a no-op, got: %v", err)
-	}
-}
-
-func TestExecuteJobsRemoteDeleteDefault(t *testing.T) {
-	// Default target (unset) deletes the remote file via the backend.
-	w := &Watcher{jobResults: make(map[string]bool)}
-	b := &stubBackend{}
-	jobs := []config.JobConfig{
-		{ID: "rm", Type: "file_delete", Path: "{file_remote_path}"},
-	}
-	const remote = "/remote/watched/foo.test"
-	if err := w.executeJobs(context.Background(), jobs, remote, "", "foo.test", "", b); err != nil {
-		t.Fatal(err)
-	}
-	if len(b.deleted) != 1 || b.deleted[0] != remote {
-		t.Errorf("deleted = %v, want [%s]", b.deleted, remote)
+	if err := w.executeJobs(context.Background(), jobs, "/remote/x.test", "x.test", "x.test", "", &stubBackend{}); err == nil {
+		t.Fatal("expected unknown-job-type error for the removed file_delete type")
+	} else if !strings.Contains(err.Error(), "unknown job type") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
