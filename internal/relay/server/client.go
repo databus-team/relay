@@ -310,7 +310,14 @@ func (c *Client) finishServerUpgrade(reqID, tmpBin, expectedDigest string) {
 	}
 	// 3) 自检通过 → 先回执成功 ACK(AE4):请求方以这里为成功结算点,随后才换装。
 	_ = c.SendResponse(reqID, map[string]interface{}{"ok": true, "verified": true})
-	// U3 在此接入换装(停旧 → .prev 备份 → 替换 → 重启)。
+
+	// 4) 换装:ACK 已在先,随后执行停旧 → .prev 备份 → 替换 → 重启(R6)。换装由接线
+	//    方(SetUpgradeSwap)注入;未接线(如测试)则仅清理暂存、不真实换装。
+	if swap := c.server.upgradeSwap; swap != nil {
+		swap(tmpBin)
+	} else {
+		os.Remove(tmpBin)
+	}
 }
 
 // verifyFileDigest 计算文件 sha256 并与期望值比对;期望为空视为缺失摘要而拒绝。
