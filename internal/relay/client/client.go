@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sync"
 	"sync/atomic"
 
@@ -16,6 +17,7 @@ type Client struct {
 	url       string
 	token     string
 	watchID   string
+	headers   http.Header // WebSocket 握手携带的自定义头(中转前置鉴权)
 	conn      *websocket.Conn
 	connected atomic.Bool
 
@@ -47,8 +49,16 @@ type Client struct {
 	onReconnectMu sync.Mutex
 }
 
-func New(url, token, watchID string) (*Client, error) {
-	return &Client{
+// Option 配置新建 Client 的行为(如 WebSocket 握手自定义头)。
+type Option func(*Client)
+
+// WithHeaders 设置 WebSocket 握手携带的 HTTP 头(应对中转前置的 headers 鉴权)。
+func WithHeaders(h http.Header) Option {
+	return func(c *Client) { c.headers = h }
+}
+
+func New(url, token, watchID string, opts ...Option) (*Client, error) {
+	c := &Client{
 		url:          url,
 		token:        token,
 		watchID:      watchID,
@@ -62,7 +72,11 @@ func New(url, token, watchID string) (*Client, error) {
 		streamDone:   make(map[string]chan error),
 		execStreams:  make(map[string]chan *protocol.Message),
 		pushRecv:     make(map[string]*inboundPushReceive),
-	}, nil
+	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c, nil
 }
 
 func (c *Client) Connect(ctx context.Context) error {
@@ -78,8 +92,11 @@ func (c *Client) Connect(ctx context.Context) error {
 
 func (c *Client) dial(ctx context.Context) error {
 	dialer := websocket.Dialer{}
-	conn, _, err := dialer.DialContext(ctx, c.url, nil)
+	conn, httpResp, err := dialer.DialContext(ctx, c.url, c.headers)
 	if err != nil {
+		if httpResp != nil {
+			return fmt.Errorf("dial: %w (upstream HTTP %s)", err, httpResp.Status)
+		}
 		return fmt.Errorf("dial: %w", err)
 	}
 	c.conn = conn
