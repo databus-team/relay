@@ -651,20 +651,26 @@ func runPush() {
 		return
 	}
 
-	content, rerr := os.ReadFile(src)
-	if rerr != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read source: %v\n", rerr)
-		os.Exit(1)
+	dest := watchDir + "/" + filename
+	if *pushNoJobs && *pushDest != "" {
+		dest = *pushDest
+	}
+
+	// content 仅在需要它的后端分支内读取;普通后端走 pushFile 自行读,
+	// 避免为不消费内容的路径重复整文件读。
+	readContent := func() []byte {
+		content, rerr := os.ReadFile(src)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "Failed to read source: %v\n", rerr)
+			os.Exit(1)
+		}
+		return content
 	}
 
 	// 纯下发(不跑 workspace job): 走 Jobs=false 通道,落到 dest(绝对)或 watch_dir 目录。
 	if *pushNoJobs {
 		if tn, ok := b.(backend.PushNoJobsSender); ok {
-			dest := *pushDest
-			if dest == "" {
-				dest = watchDir + "/" + filename
-			}
-			exit, perr := tn.PushNoJobs(ctx, dest, content)
+			exit, perr := tn.PushNoJobs(ctx, dest, readContent())
 			if perr != nil {
 				fmt.Fprintf(os.Stderr, "Push error: %v\n", perr)
 				os.Exit(1)
@@ -681,8 +687,7 @@ func runPush() {
 
 	// 直达后端(relay):把文件直达远端执行方并触发其本地 jobs;输出流式显示。
 	if pj, ok := b.(backend.PushJobSender); ok {
-		dest := watchDir + "/" + filename
-		exit, perr := pj.PushJob(ctx, dest, content, func(c backend.ExecChunk) {
+		exit, perr := pj.PushJob(ctx, dest, readContent(), func(c backend.ExecChunk) {
 			if c.Stdout {
 				os.Stdout.WriteString(c.Data)
 			} else {
@@ -700,7 +705,7 @@ func runPush() {
 		return
 	}
 
-	pushFile(ctx, b, src, watchDir+"/"+filename)
+	pushFile(ctx, b, src, dest)
 	fmt.Println("Push completed successfully")
 }
 
@@ -735,17 +740,16 @@ func runLocalJobsForPush(watchID, absPath string, out func(backend.ExecChunk)) i
 		out(backend.ExecChunk{Stdout: r.Err == nil, Data: fmt.Sprintf("[jobs %d/%d] %s %s %s (exit=%d, %s)\n", step, st.Total, mark, r.JobID, okc, r.ExitCode, dur)})
 		// 失败时把该 job 捕获到的输出(stdout/stderr)一并回显,缓冲即为此用,便于定位根因
 		if r.Err != nil {
-			for _, b := range []struct {
-				stdout bool
-				s      string
-			}{{true, r.Stdout}, {false, r.Stderr}} {
-				for _, line := range strings.Split(b.s, "\n") {
+			echo := func(stdout bool, text string) {
+				for _, line := range strings.Split(text, "\n") {
 					if strings.TrimSpace(line) == "" {
 						continue
 					}
-					out(backend.ExecChunk{Stdout: b.stdout, Data: "      │ " + line + "\n"})
+					out(backend.ExecChunk{Stdout: stdout, Data: "      │ " + line + "\n"})
 				}
 			}
+			echo(true, r.Stdout)
+			echo(false, r.Stderr)
 		}
 	})
 	return exit

@@ -98,13 +98,14 @@ type Step struct {
 // Returns the overall exit code: 0 if all steps succeeded, else the first
 // failing job's exit code (or 1 when it carried none).
 func RunJobs(ctx context.Context, watchCfg *config.WatchConfig, file string, report func(Step)) int {
+	total := len(watchCfg.Jobs)
 	for i := range watchCfg.Jobs {
 		job := &watchCfg.Jobs[i]
-		report(Step{Total: len(watchCfg.Jobs), Running: true, Result: Result{JobID: job.ID, Type: job.Type}})
+		report(Step{Total: total, Running: true, Result: Result{JobID: job.ID, Type: job.Type}})
 		res, err := runOne(ctx, watchCfg, job, file)
 		res.JobID = job.ID
 		res.Type = job.Type
-		report(Step{Total: len(watchCfg.Jobs), Result: res})
+		report(Step{Total: total, Result: res})
 		if err != nil {
 			if res.ExitCode == 0 {
 				res.ExitCode = 1

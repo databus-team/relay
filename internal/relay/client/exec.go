@@ -15,6 +15,24 @@ import (
 	"github.com/user/relay/internal/relay/protocol"
 )
 
+// registerInStream 注册一条在途响应流(请求方视角):分配 reqID、建收包通道并登记到
+// execStreams。调用方应在返回前 defer unregisterInStream(reqID) 清理,避免字典泄漏。
+func (c *Client) registerInStream() (reqID string, ch chan *protocol.Message) {
+	reqID = uuid.New().String()
+	ch = make(chan *protocol.Message, 256)
+	c.execMu.Lock()
+	c.execStreams[reqID] = ch
+	c.execMu.Unlock()
+	return reqID, ch
+}
+
+// unregisterInStream 移除 reqID 对应的在途响应流(请求方视角)。
+func (c *Client) unregisterInStream(reqID string) {
+	c.execMu.Lock()
+	delete(c.execStreams, reqID)
+	c.execMu.Unlock()
+}
+
 // ExecRequest 是一次远程执行请求(请求方发出或被执行方收到)。
 type ExecRequest struct {
 	WatchID string
@@ -30,17 +48,8 @@ func (c *Client) ExecStream(ctx context.Context, cmd, cwd string, timeout int, o
 		timeout = 30
 	}
 
-	reqID := uuid.New().String()
-	ch := make(chan *protocol.Message, 256)
-
-	c.execMu.Lock()
-	c.execStreams[reqID] = ch
-	c.execMu.Unlock()
-	defer func() {
-		c.execMu.Lock()
-		delete(c.execStreams, reqID)
-		c.execMu.Unlock()
-	}()
+	reqID, ch := c.registerInStream()
+	defer c.unregisterInStream(reqID)
 
 	msg := &protocol.Message{
 		Type: protocol.MsgExec,
@@ -113,17 +122,8 @@ func (c *Client) Exec(ctx context.Context, cmd string, cwd string, timeout int) 
 // ConfigSync 把一份新配置(latest 端经 ExpandEnv 后)经中转直达执行方落盘(单次应答,
 // 与 ExecStream 复用同一 execStreams/execRoundTrip 回包管道)。返回执行方 exit code。
 func (c *Client) ConfigSync(ctx context.Context, payload []byte) (*protocol.ExecResponse, error) {
-	reqID := uuid.New().String()
-	ch := make(chan *protocol.Message, 256)
-
-	c.execMu.Lock()
-	c.execStreams[reqID] = ch
-	c.execMu.Unlock()
-	defer func() {
-		c.execMu.Lock()
-		delete(c.execStreams, reqID)
-		c.execMu.Unlock()
-	}()
+	reqID, ch := c.registerInStream()
+	defer c.unregisterInStream(reqID)
 
 	msg := &protocol.Message{
 		Type: protocol.MsgConfigSync,
@@ -149,18 +149,9 @@ func (c *Client) PushJob(ctx context.Context, relPath string, content []byte, on
 		content = []byte{}
 	}
 
-	reqID := uuid.New().String()
+	reqID, ch := c.registerInStream()
+	defer c.unregisterInStream(reqID)
 	streamID := uuid.New().String()
-
-	ch := make(chan *protocol.Message, 256)
-	c.execMu.Lock()
-	c.execStreams[reqID] = ch
-	c.execMu.Unlock()
-	defer func() {
-		c.execMu.Lock()
-		delete(c.execStreams, reqID)
-		c.execMu.Unlock()
-	}()
 
 	// sha256 digest 供执行方落盘后校验(与 Pull 的校验思路一致)。
 	sum := sha256.Sum256(content)
@@ -242,18 +233,9 @@ func (c *Client) Transport(ctx context.Context, targetWatch, dest string, conten
 		content = []byte{}
 	}
 
-	reqID := uuid.New().String()
+	reqID, ch := c.registerInStream()
+	defer c.unregisterInStream(reqID)
 	streamID := uuid.New().String()
-
-	ch := make(chan *protocol.Message, 256)
-	c.execMu.Lock()
-	c.execStreams[reqID] = ch
-	c.execMu.Unlock()
-	defer func() {
-		c.execMu.Lock()
-		delete(c.execStreams, reqID)
-		c.execMu.Unlock()
-	}()
 
 	sum := sha256.Sum256(content)
 	digest := hex.EncodeToString(sum[:])
