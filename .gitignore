@@ -1,5 +1,6 @@
 # Binaries
 /relay
+/relay-linux
 *.exe
 *.dll
 *.so
