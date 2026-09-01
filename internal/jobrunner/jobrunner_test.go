@@ -129,3 +129,50 @@ func TestRun_UnknownJobID(t *testing.T) {
 		t.Fatal("expected error for unknown job id")
 	}
 }
+
+func TestRunJobs_EmitsStepProgressAndExitCode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.patch")
+	if err := os.WriteFile(path, []byte("patch"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	watch := baseWatch()
+	// apply(exec) -> clean(file_delete) -> then a failing exec step.
+	watch.Jobs = []config.JobConfig{
+		{ID: "apply", Type: "exec", Cmd: "echo {file_path}"},
+		{ID: "clean", Type: "file_delete", Path: "{file_path}"},
+		{ID: "boom", Type: "exec", Cmd: "exit 3"},
+	}
+
+	var steps []Step
+	exit := RunJobs(context.Background(), watch, path, func(s Step) {
+		s.Result.Stdout = "" // 只关心标记/状态,不比较输出
+		steps = append(steps, s)
+	})
+	if exit != 3 {
+		t.Errorf("exit = %d, want 3", exit)
+	}
+
+	// 事件序列:每步一个 Running + 一个 finished(含最终失败步)。
+	if len(steps) != 6 {
+		t.Fatalf("got %d step events, want 6 (3 jobs x start/finish)", len(steps))
+	}
+	for idx, s := range steps {
+		wantRunning := idx%2 == 0
+		if s.Running != wantRunning {
+			t.Errorf("event %d Running = %v, want %v", idx, s.Running, wantRunning)
+		}
+		if s.Total != 3 {
+			t.Errorf("event %d Total = %d, want 3", idx, s.Total)
+		}
+	}
+	// index5 = 第 3 步(boom)的 finished,应携带错误与 JobID。
+	finish := steps[5]
+	if finish.Result.Err == nil {
+		t.Error("expected boom step to carry an error")
+	}
+	if finish.Result.JobID != "boom" {
+		t.Errorf("failing step JobID = %q, want boom", finish.Result.JobID)
+	}
+}
