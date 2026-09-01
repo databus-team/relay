@@ -63,15 +63,16 @@ remote_cmd() { relay exec -c "$CONFIG" "$1" 2>&1 | sed -E 's/^Checking remote wa
 # ---- 1) 探测远端 OS/arch ----
 detect_remote() {
   log "探测远端系统 ..."
-  local name arch
-  name=$(remote_cmd "uname -s"  | tail -1 | tr -d '\r')
-  arch=$(remote_cmd "uname -m"  | tail -1 | tr -d '\r' || true)
+  local name; name=$(remote_cmd "uname -s"  | tail -1 | tr -d '\r')
+  local arch; arch=$(remote_cmd "uname -m"  | tail -1 | tr -d '\r' || true)
   case "$name" in
     *MINGW*|*MSYS*|*CYGWIN*) REMOTE_OS=windows; REMOTE_BIN=relay.exe ;;
     Linux)                   REMOTE_OS=linux;   REMOTE_BIN=relay ;;
     *) warn "未识别系统(uname='$name'),默认 linux/amd64"; REMOTE_OS=linux; REMOTE_BIN=relay; arch=amd64 ;;
   esac
-  log "远端: $REMOTE_OS ($arch) -> 目标二进制 $REMOTE_BIN"
+  # 自动探测远端正在运行的 relay 二进制路径(换装目标),不猜安装目录。
+  REMOTE_BIN_PATH="$(remote_cmd "command -v relay" | tail -1 | tr -d '\r')"
+  log "远端: $REMOTE_OS ($arch) -> 目标二进制 $REMOTE_BIN (running at: ${REMOTE_BIN_PATH:-未知})"
 }
 
 # ---- 2) 本地交叉编译 ----
@@ -84,13 +85,16 @@ build_binary() {
   esac
   env CGO_ENABLED=0 $target go build -ldflags="-s -w $STAMP" -o "$REMOTE_BIN" ./cmd/relay
   [[ -f "$REMOTE_BIN" ]] || die "构建失败: $REMOTE_BIN"
+  # 用独立文件名下发,避免覆盖远端正在运行的同名可执行文件(Windows 上运行中文件会被占用)。
+  REMOTE_STAGED="$REMOTE_BIN.staged"
+  cp -f "$REMOTE_BIN" "$REMOTE_STAGED"
 }
 
-# ---- 3) 经中转 push 下发 ----
+# ---- 3) 经中转 push 下发(以独立文件 *staged 落盘) ----
 push_binary() {
   local w="$1"
-  log "经中转 push $REMOTE_BIN -> workspace[$w] ..."
-  relay push -c "$CONFIG" -w "$w" "$REMOTE_BIN"
+  log "经中转 push $REMOTE_STAGED -> workspace[$w] ..."
+  relay push -c "$CONFIG" -w "$w" "$REMOTE_STAGED"
 }
 
 # ---- 4) 远端 staged 路径(由共享 config 精确推导) ----
@@ -100,35 +104,38 @@ staged_path() {
   watch_dir="$(awk -v id="$w" '
     $0 ~ "^[[:space:]]*- id: *"id"$" {idc=1; next}
     idc && /^[[:space:]]*watch_dir:/ {sub(/^[[:space:]]*watch_dir:[[:space:]]*/,""); gsub(/"/,""); v=$0; exit} \
-    END{print v? v : "."}' "$CONFIG")"
+    END{print v? v: "."}' "$CONFIG")"
   # watch_dir 若是 "." 则直接落 executor 根
   if [[ "$watch_dir" == "." || -z "$watch_dir" ]]; then
-    echo "$exe/$REMOTE_BIN"
+    echo "$exe/$REMOTE_STAGED"
   else
-    echo "$exe/$watch_dir/$REMOTE_BIN"
+    echo "$exe/$watch_dir/$REMOTE_STAGED"
   fi
 }
 
-# ---- 5) detached 换装重启(missing RESTART=1 时跳过) ----
+# ---- 5) detached 换装重启(RESTART=1;目标是自动探测的 REMOTE_BIN_PATH) ----
 restart_binary() {
   [[ "$RESTART" == "1" ]] || {
-    warn "RESTART 未开:已下发本地 $REMOTE_BIN,未重启远端。需要自动替换+重启: make deploy-remote RESTART=1"
+    warn "RESTART 未开:已下发本地 $REMOTE_STAGED,未换远端。需要自动替换+重启: make deploy-remote RESTART=1"
     return 0
   }
-  local w="$1" st
+  local w="$1" st dest
   st="$(staged_path "$w")"
-  log "触发 detached 换装 (staged=$st, RESTART=1) ..."
+  dest="${REMOTE_BIN_PATH:-}"
+  log "触发 detached 换装 (staged=$st -> dest=${dest:-<远端 command -v relay>}, RESTART=1) ..."
+  # 已探测到 dest 就直接用,否则远端回退 command -v relay。多级引号用 \$-escape:远端展开 $$。
   read -r -d '' RCMD <<EOF || true
 STG='$st'
-# detached:先返回本 exec 响应,3s 后停->换->起
+DEST='$dest'
+# detached: 先返回本 exec 响应,3s 后停->换->起
 ( sleep 3
-  BIN="\$(command -v relay)"; [ -n "\$BIN" ] || BIN="\$HOME/.local/bin/relay"
+  [ -z "\$DEST" ] && DEST="\$(command -v relay)"; [ -n "\$DEST" ] || DEST="\$HOME/.local/bin/relay"
   for p in \$(ps -eo pid=,args= 2>/dev/null | grep '[r]elay watch' | awk '{print \$1}'); do
     kill -9 "\$p" 2>/dev/null || true
   done
-  cp -f "\$STG" "\$BIN" && chmod +x "\$BIN"
-  nohup "\$BIN" watch -c "\$HOME/.relay/config.yaml" >>"\$HOME/.relay/relay.log" 2>&1 &
-  echo "restarted \$BIN"
+  mv -f "\$STG" "\$DEST" && chmod +x "\$DEST"
+  nohup "\$DEST" watch -c "\$HOME/.relay/config.yaml" >>"\$HOME/.relay/relay.log" 2>&1 &
+  echo "restarted \$DEST"
 ) &
 echo "swap scheduled; new staged at \$STG"
 EOF
@@ -137,27 +144,37 @@ EOF
 }
 
 # ---- 6) 中转手工清单 ----
+# 中转的 relay 安装路径无法经 relay 探测(中转非 executor、relay 只做文件交换),
+# 由 TRANSIT_BIN 指定(默认 ~/.local/bin/relay);部署后可用 relay version -r 核验。
 transit() {
   log "构建中转二进制 relay-linux ..."
   env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w $STAMP" -o relay-linux ./cmd/relay
-  cat <<"EOF"
+  TRANSIT_BIN="${TRANSIT_BIN:-$HOME/.local/bin/relay}"
+  cat <<EOF
 
 === 中转服务器更新(半自动:经 code-server web 人工) ===
 中转无程序化通道,需手工:
   1. 已生成 relay-linux,经 code-server web 上传到中转可达目录(e.g. $HOME/relay/)
-  2. 替换二进制并重启(可用新 daemon 形式):
-       cp -f relay-linux ~/.local/bin/relay && chmod +x ~/.local/bin/relay
-       relay server restart -c ~/.relay/config.yaml   # daemon 重启(旧进程被 SIGTERM)
-       # 或前台: relay server -c ~/.relay/config.yaml
-  状态查看: relay server status -c ~/.relay/config.yaml
+  2. 用 self-update + reboot 一键替换重启(新二进制已带 relay server upgrade):
+       cp -f relay-linux $TRANSIT_BIN && chmod +x $TRANSIT_BIN
+       relay server upgrade $TRANSIT_BIN -c $HOME/.relay/config.yaml
+     # 或仅重启不换版本: relay server restart -c $HOME/.relay/config.yaml
+  状态: relay server status -c $HOME/.relay/config.yaml
+  说明: 中转路径无法经 relay 自动探测(无命令通道),如需换目录请 export TRANSIT_BIN=<path> 重跑。
 EOF
+}
+
+# ---- 7) 部署后核验:三端版本台账 ----
+verify() {
+  log "核验版本台账 (relay version -r) ..."
+  relay version -r -c "$CONFIG"
 }
 
 cmd="${1:-all}"
 case "$cmd" in
-  remote) W="$(pick_watch)"; detect_remote; build_binary; push_binary "$W"; restart_binary "$W" ;;
+  remote) W="$(pick_watch)"; detect_remote; build_binary; push_binary "$W"; restart_binary "$W"; verify ;;
   transit) transit ;;
-  all) W="$(pick_watch)"; detect_remote; build_binary; push_binary "$W"; restart_binary "$W"; warn "=== 中转段 ==="; transit ;;
+  all) W="$(pick_watch)"; detect_remote; build_binary; push_binary "$W"; restart_binary "$W"; warn "=== 中转段 ==="; transit; verify ;;
   *) die "用法: $0 {remote|transit|all}" ;;
 esac
 log "完成。"
