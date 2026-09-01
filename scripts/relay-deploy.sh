@@ -90,41 +90,27 @@ build_binary() {
   cp -f "$REMOTE_BIN" "$REMOTE_STAGED"
 }
 
-# ---- 3) 经中转 push 下发(以独立文件 *staged 落盘) ----
+# ---- 3) 经中转 relay transport 纯下发到执行端二进制旁(绝对路径,不跑 workspace job) ----
 push_binary() {
-  local w="$1"
-  log "经中转 push $REMOTE_STAGED -> workspace[$w] ..."
-  relay push -c "$CONFIG" -w "$w" "$REMOTE_STAGED"
+  # 目标:自动探测到的运行二进制旁的新文件(独立名,避免覆盖运行中的同名 exe)
+  local dest="${REMOTE_BIN_PATH}.new"
+  log "经中转 transport 下发 $REMOTE_STAGED -> 执行端 $dest ..."
+  # transport 不传 -w(自动从版本台账挑执行方 watch);不触发 workspace job。
+  relay transport -c "$CONFIG" "$REMOTE_STAGED" "$dest"
+  REMOTE_NEW="$dest"
 }
 
-# ---- 4) 远端 staged 路径(由共享 config 精确推导) ----
-staged_path() {
-  local w="$1" exe watch_dir
-  exe="$(cfg_bc executor_dir)"; exe="${exe:-$HOME}"
-  watch_dir="$(awk -v id="$w" '
-    $0 ~ "^[[:space:]]*- id: *"id"$" {idc=1; next}
-    idc && /^[[:space:]]*watch_dir:/ {sub(/^[[:space:]]*watch_dir:[[:space:]]*/,""); gsub(/"/,""); v=$0; exit} \
-    END{print v? v: "."}' "$CONFIG")"
-  # watch_dir 若是 "." 则直接落 executor 根
-  if [[ "$watch_dir" == "." || -z "$watch_dir" ]]; then
-    echo "$exe/$REMOTE_STAGED"
-  else
-    echo "$exe/$watch_dir/$REMOTE_STAGED"
-  fi
-}
-
-# ---- 5) detached 换装重启(RESTART=1;目标是自动探测的 REMOTE_BIN_PATH) ----
+# ---- 4) detached 换装重启(RESTART=1;替换自动探测到的 REMOTE_BIN_PATH) ----
 restart_binary() {
   [[ "$RESTART" == "1" ]] || {
-    warn "RESTART 未开:已下发本地 $REMOTE_STAGED,未换远端。需要自动替换+重启: make deploy-remote RESTART=1"
+    warn "RESTART 未开:已下发 $REMOTE_NEW,未换远端。需要自动替换+重启: make deploy-remote RESTART=1"
     return 0
   }
   local w="$1" st dest
-  st="$(staged_path "$w")"
+  st="${REMOTE_NEW:-${REMOTE_BIN_PATH}.new}"
   dest="${REMOTE_BIN_PATH:-}"
-  log "触发 detached 换装 (staged=$st -> dest=${dest:-<远端 command -v relay>}, RESTART=1) ..."
-  # 已探测到 dest 就直接用,否则远端回退 command -v relay。多级引号用 \$-escape:远端展开 $$。
-  read -r -d '' RCMD <<EOF || true
+  log "触发 detached 换装 (new=$st -> dest=${dest:-<远端 command -v relay>}, RESTART=1) ..."
+  read -r -d '' RCMD <<EOF
 STG='$st'
 DEST='$dest'
 # detached: 先返回本 exec 响应,3s 后停->换->起
@@ -140,7 +126,7 @@ DEST='$dest'
 echo "swap scheduled; new staged at \$STG"
 EOF
   relay exec -c "$CONFIG" -w "$w" "$RCMD"
-  log "换装已调度(约3s后自动替换+重启)日志: ~/.relay/relay.log"
+  log "换装已调度(约 3s 后自动替换+重启)日志: ~/.relay/relay.log"
 }
 
 # ---- 6) 中转手工清单 ----

@@ -91,10 +91,16 @@ var (
 	wsVerbose = wsCmd.Flag("verbose", "Show detailed table output").Short('v').Bool()
 
 	// Version command - 版本查看与跨机对比入口
-	versionCmd     = kingpin.Command("version", "Print relay build information; with -r, compare against transit + executors")
+	versionCmd     = kingpin.Command("version", "查看/对比版本信息(本地 + -r 远端台账)")
 	versionRemote  = versionCmd.Flag("remote", "Also query the transit server (+ executors) and report version match/mismatch vs local").Short('r').Bool()
 	versionWatch   = versionCmd.Flag("watch", "Limit remote comparison to a specific watch ID").Short('w').String()
 	versionJSONOut = versionCmd.Flag("json", "Output as JSON").Bool()
+
+	// Transport command - 纯下发(不触发 workspace job),用于部署二进制等
+	transportCmd   = kingpin.Command("transport", "Pure file transfer to the remote executor at an absolute path (no workspace jobs)")
+	transportWatch = transportCmd.Flag("watch", "Executor watch id (the root watch the executor registered)").Short('w').String()
+	transportSrc   = transportCmd.Arg("src", "Local source file").Required().String()
+	transportDest  = transportCmd.Arg("dest", "Absolute destination path on the executor").Required().String()
 )
 
 func main() {
@@ -176,6 +182,8 @@ func main() {
 		runWorkspaces()
 	case versionCmd.FullCommand():
 		runVersion()
+	case transportCmd.FullCommand():
+		runTransport()
 	case jobRun.FullCommand():
 		runJobRun()
 	default:
@@ -952,6 +960,60 @@ func queryRemoteVersions() (protocol.VersionResponse, error) {
 		return vr, err
 	}
 	return vr, nil
+}
+
+// runTransport 纯下发:把本地文件流式写到执行端的绝对路径 dest(不触发 workspace job)。
+// 目标 -w 应为执行方注册的 watch(通常是根 watch,如 "storage");省略时自动从版本台账找一个执行方。
+func runTransport() {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
+		os.Exit(1)
+	}
+	rb, ok := b.(*relaybackend.RelayBackend)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Error: backend %q has no transport (relay backend only)\n", cfg.Backend.Type)
+		os.Exit(1)
+	}
+
+	content, err := os.ReadFile(*transportSrc)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read source %q: %v\n", *transportSrc, err)
+		os.Exit(1)
+	}
+
+	// 未指定 -w 时,自动从版本台账里挑一个执行方 watch。
+	watch := *transportWatch
+	if watch == "" {
+		wr, verr := queryRemoteVersions()
+		if verr != nil {
+			fmt.Fprintf(os.Stderr, "Error: resolve executor watch: %v (pass -w <executor watch>)\n", verr)
+			os.Exit(1)
+		}
+		for _, n := range wr.Nodes {
+			if n.Role == "executor" {
+				watch = n.WatchID
+				break
+			}
+		}
+		if watch == "" {
+			fmt.Fprintf(os.Stderr, "Error: no online executor to transport to; pass -w <executor watch>\n")
+			os.Exit(1)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := rb.Transport(ctx, watch, *transportDest, content); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Transferred %s -> %s (executor watch %s)\n", *transportSrc, *transportDest, watch)
 }
 
 // orDash 空串显示为 "-"。

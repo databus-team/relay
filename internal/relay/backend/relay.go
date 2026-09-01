@@ -210,6 +210,22 @@ func (b *RelayBackend) ExecStream(ctx context.Context, cmd string, cwd string, t
 	return resp.ExitCode, nil
 }
 
+// Transport 将文件内容纯下发写到达远端执行方的目标路径(Jobs=false,不触发 workspace job)。
+// 用于部署二进制等场景;targetWatch 指向执行方注册的 watch(通常是根 watch)。
+func (b *RelayBackend) Transport(ctx context.Context, targetWatch, dest string, content []byte) error {
+	if err := b.ensureConnected(ctx); err != nil {
+		return err
+	}
+	resp, err := b.client.Transport(ctx, targetWatch, dest, content)
+	if err != nil {
+		return err
+	}
+	if resp.ExitCode != 0 {
+		return fmt.Errorf("transport to %s failed (exit=%d): %s", dest, resp.ExitCode, resp.Stderr)
+	}
+	return nil
+}
+
 // PushJob 将文件直达远端执行方并触发其本地 jobs;输出流式回调。无在线执行方时由中转兜底落地。
 func (b *RelayBackend) PushJob(ctx context.Context, relPath string, content []byte, on func(backend.ExecChunk)) (int, error) {
 	if err := b.ensureConnected(ctx); err != nil {
@@ -251,8 +267,24 @@ func currentPushJobsHandler() backend.PushJobHandler {
 // handleInboundPushJob 收到转发来的流式 push-job:把临时落盘内容搬进本地 executor 目录,
 // 再调用已注册的回调在远端跑该工作区的 jobs,并逐一 job 输出回流向请求方。
 func (b *RelayBackend) handleInboundPushJob(sess *client.PushJobSession) {
-	log.Printf("[push] receiving %s (watch=%s)", sess.RelPath, sess.WatchID)
+	log.Printf("[push] receiving %s (watch=%s, jobs=%v)", sess.RelPath, sess.WatchID, sess.Jobs)
 	src := sess.Temp.Name()
+
+	// Jobs=false:纯传输下发,内容写到目标路径(可为绝对路径)即完成,不跑 workspace job。
+	if !sess.Jobs {
+		dest, err := b.writeTransportFile(sess.RelPath, src)
+		os.Remove(src)
+		if err != nil {
+			_ = sess.Write(false, "transport: write failed: "+err.Error()+"\n")
+			_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: err.Error()})
+			return
+		}
+		sess.AbsPath = dest
+		log.Printf("[transport] delivered -> %s", dest)
+		_ = sess.Done(protocol.ExecResponse{ExitCode: 0})
+		return
+	}
+
 	absPath, err := b.writePushedFile(sess.RelPath, src)
 	os.Remove(src) // 临时文件已在会话结束前消费完,清理
 
@@ -275,6 +307,45 @@ func (b *RelayBackend) handleInboundPushJob(sess *client.PushJobSession) {
 	exit := h(sess.WatchID, sess.AbsPath, out)
 	log.Printf("[push] done %s -> %s (exit=%d)", sess.RelPath, absPath, exit)
 	_ = sess.Done(protocol.ExecResponse{ExitCode: exit})
+}
+
+// writeTransportFile 把临时内容搬到目标路径 dest。dest 为绝对路径时直接写;
+// 相对路径则以执行方 execDir 为根。用于纯传输下发(部署二进制等),不触发 jobs。
+func (b *RelayBackend) writeTransportFile(dest, srcPath string) (string, error) {
+	// Windows 上把 MSYS 绝对路径("/d/foo")转成原生盘符路径,再判绝对。
+	if runtime.GOOS == "windows" {
+		if w := msysToWindowsPath(dest); w != dest {
+			dest = w
+		}
+	}
+	if !filepath.IsAbs(dest) {
+		base := b.execDir
+		if base == "" {
+			base = "."
+		}
+		dest = filepath.Join(base, dest)
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return "", err
+	}
+	s, err := os.Open(srcPath)
+	if err != nil {
+		return "", err
+	}
+	defer s.Close()
+	d, err := os.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return "", err
+	}
+	_, cerr := io.Copy(d, s)
+	if cerr != nil {
+		d.Close()
+		return "", cerr
+	}
+	if cerr := d.Close(); cerr != nil {
+		return "", cerr
+	}
+	return dest, nil
 }
 
 // writePushedFile 把 push 临时内容(srcPath)拷贝到执行方根目录下 relPath 的安全路径。
