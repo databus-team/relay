@@ -56,6 +56,7 @@ func (c *Client) reconnectLoop(ctx context.Context) {
 		go c.readLoop()
 		go c.writeLoop()
 		go c.startHeartbeat(ctx)
+		c.fireOnReconnect()
 		return
 	}
 

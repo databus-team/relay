@@ -1,18 +1,15 @@
 package server
 
 import (
-	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -59,23 +56,23 @@ func (c *Client) Run() {
 func (c *Client) readLoop() {
 	defer close(c.closeCh)
 	defer c.conn.Close()
-	
+
 	for {
 		msgType, data, err := c.conn.ReadMessage()
 		if err != nil {
 			return
 		}
-		
+
 		if msgType == websocket.BinaryMessage {
 			continue
 		}
-		
+
 		var msg protocol.Message
 		if err := json.Unmarshal(data, &msg); err != nil {
 			c.SendError("", "invalid message")
 			continue
 		}
-		
+
 		if msg.Type == protocol.MsgStreamData {
 			binType, binData, err := c.conn.ReadMessage()
 			if err == nil && binType == websocket.BinaryMessage {
@@ -84,7 +81,7 @@ func (c *Client) readLoop() {
 				}
 			}
 		}
-		
+
 		c.handleMessage(msg)
 	}
 }
@@ -96,31 +93,42 @@ func (c *Client) writeLoop() {
 
 // handleMessage 处理消息
 func (c *Client) handleMessage(msg protocol.Message) {
+	// 执行方回包(被转发 exec 的输出帧)按 reqOwner 转回请求方
+	if c.maybeRelayExecReply(msg) {
+		return
+	}
+
 	switch msg.Type {
 	case protocol.MsgPing:
 		c.Send(protocol.Message{Type: protocol.MsgPong, ID: uuid.New().String(), RequestID: msg.ID})
-		
+
 	case protocol.MsgList:
 		c.handleList(msg)
-		
+
 	case protocol.MsgPull:
 		c.handlePull(msg)
-		
+
 	case protocol.MsgPush:
 		c.handlePush(msg)
-		
+
 	case protocol.MsgDelete:
 		c.handleDelete(msg)
-		
+
 	case protocol.MsgExec:
 		c.handleExec(msg)
-		
+
+	case protocol.MsgRegisterExecutor:
+		c.handleRegisterExecutor(msg)
+
+	case protocol.MsgPushJob:
+		c.handlePushJob(msg)
+
 	case protocol.MsgSubscribe:
 		c.handleSubscribe(msg)
-		
+
 	case protocol.MsgStreamData:
 		c.handleStreamData(msg)
-		
+
 	case protocol.MsgStreamEnd:
 		c.handleStreamEnd(msg)
 	}
@@ -131,25 +139,25 @@ func (c *Client) handleList(msg protocol.Message) {
 	payload, _ := msg.Payload.(map[string]interface{})
 	watchID := toString(payload["watch_id"])
 	path := toString(payload["path"])
-	
+
 	dir, ok := c.server.GetWatchDir(watchID)
 	if !ok {
 		c.SendError(msg.ID, "unknown watch_id")
 		return
 	}
-	
+
 	fullPath := safePath(dir, path)
 	if fullPath == "" {
 		c.SendError(msg.ID, "path traversal detected")
 		return
 	}
-	
+
 	entries, err := readDir(fullPath)
 	if err != nil {
 		c.SendError(msg.ID, err.Error())
 		return
 	}
-	
+
 	c.SendResponse(msg.ID, protocol.ListResponse{Entries: entries})
 }
 
@@ -158,83 +166,153 @@ func (c *Client) handleDelete(msg protocol.Message) {
 	payload, _ := msg.Payload.(map[string]interface{})
 	watchID := toString(payload["watch_id"])
 	path := toString(payload["path"])
-	
+
 	dir, ok := c.server.GetWatchDir(watchID)
 	if !ok {
 		c.SendError(msg.ID, "unknown watch_id")
 		return
 	}
-	
+
 	fullPath := safePath(dir, path)
 	if fullPath == "" {
 		c.SendError(msg.ID, "path traversal detected")
 		return
 	}
-	
+
 	if err := os.RemoveAll(fullPath); err != nil {
 		c.SendError(msg.ID, err.Error())
 		return
 	}
-	
+
 	c.SendResponse(msg.ID, nil)
 }
 
-// handleExec 处理执行请求
+// handleExec 处理执行请求 —— 纯透明转发给该 watch 的已注册执行方。
+// 中转不本地执行;无执行方时直接报错。
 func (c *Client) handleExec(msg protocol.Message) {
 	payload, _ := msg.Payload.(map[string]interface{})
 	watchID := toString(payload["watch_id"])
-	cmdStr := toString(payload["cmd"])
-	timeout := int(toFloat64(payload["timeout"]))
-	
-	if timeout <= 0 { timeout = 30 }
-	
-	dir, ok := c.server.GetWatchDir(watchID)
-	if !ok {
+
+	if _, ok := c.server.GetWatchDir(watchID); !ok {
 		c.SendError(msg.ID, "unknown watch_id")
 		return
 	}
-	
-	if strings.TrimSpace(cmdStr) == "" {
-		c.SendError(msg.ID, "empty command")
+
+	executorID, ok := c.server.GetExecutor(watchID)
+	if !ok {
+		c.SendError(msg.ID, "no executor registered for watch '"+watchID+"'")
 		return
 	}
-	
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
-	defer cancel()
-	
-	start := time.Now()
-	cmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
-	cmd.Dir = dir
-	cmd.Stdin = nil
-	
-	stdout, _ := cmd.StdoutPipe()
-	stderr, _ := cmd.StderrPipe()
-	if err := cmd.Start(); err != nil {
-		c.SendResponse(msg.ID, protocol.ExecResponse{
-			ExitCode: 1,
-			Stderr:   err.Error(),
-			Duration: time.Since(start).Milliseconds(),
-		})
+
+	// 记录请求方归属,供执行方回流帧转发回去;原样转发 msg(保留 msg.ID 作关联)
+	c.server.SetReqOwner(msg.ID, c.id)
+	if err := c.server.SendTo(executorID, msg); err != nil {
+		c.server.ClearReqOwner(msg.ID)
+		c.SendError(msg.ID, "executor unavailable: "+err.Error())
+	}
+}
+
+// handleRegisterExecutor 处理执行方注册/注销。
+func (c *Client) handleRegisterExecutor(msg protocol.Message) {
+	payload, _ := msg.Payload.(map[string]interface{})
+	watchID := toString(payload["watch_id"])
+	action := toString(payload["action"])
+
+	if _, ok := c.server.GetWatchDir(watchID); !ok {
+		c.SendError(msg.ID, "unknown watch_id")
 		return
 	}
-	
-	stdoutBytes, _ := io.ReadAll(stdout)
-	stderrBytes, _ := io.ReadAll(stderr)
-	cmd.Wait()
-	
-	exitCode := 0
-	if ctx.Err() != nil {
-		exitCode = -1
-	} else {
-		exitCode = cmd.ProcessState.ExitCode()
+
+	switch action {
+	case "add", "":
+		c.server.RegisterExecutor(watchID, c.id)
+	case "remove":
+		c.server.UnregisterExecutor(watchID, c.id)
+	default:
+		c.SendError(msg.ID, "invalid action")
+		return
 	}
-	
-	c.SendResponse(msg.ID, protocol.ExecResponse{
-		ExitCode: exitCode,
-		Stdout:   string(stdoutBytes),
-		Stderr:   string(stderrBytes),
-		Duration: time.Since(start).Milliseconds(),
+	c.SendResponse(msg.ID, map[string]interface{}{"ok": true, "watch_id": watchID, "executor": c.id})
+}
+
+// handlePushJob 处理 push-job 请求:有在线执行方则转发由其在远端落地并跑 jobs;
+// 无执行方时回退落地到中转暂存目录(不触发 jobs)。
+func (c *Client) handlePushJob(msg protocol.Message) {
+	payload, _ := msg.Payload.(map[string]interface{})
+	watchID := toString(payload["watch_id"])
+	relPath := toString(payload["rel_path"])
+
+	if _, ok := c.server.GetWatchDir(watchID); !ok {
+		c.SendError(msg.ID, "unknown watch_id")
+		return
+	}
+
+	if executorID, ok := c.server.GetExecutor(watchID); ok {
+		c.server.SetReqOwner(msg.ID, c.id)
+		if err := c.server.SendTo(executorID, msg); err != nil {
+			c.server.ClearReqOwner(msg.ID)
+			c.SendError(msg.ID, "executor unavailable: "+err.Error())
+		}
+		return
+	}
+
+	// 回退:写入中转暂存目录(行为同原有 push),标记为已暂存、未执行 jobs。
+	dir, _ := c.server.GetWatchDir(watchID)
+	fullPath := safePath(dir, relPath)
+	if fullPath == "" {
+		c.SendError(msg.ID, "path traversal detected")
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+		c.SendError(msg.ID, "mkdir: "+err.Error())
+		return
+	}
+	if err := os.WriteFile(fullPath, decodePayloadBytes(payload["content"]), 0644); err != nil {
+		c.SendError(msg.ID, err.Error())
+		return
+	}
+	// 提示以实时输出帧发送,客户端/CLI 能立即显示;随后收尾
+	_ = c.Send(protocol.Message{
+		Type:      protocol.MsgExecOutput,
+		RequestID: msg.ID,
+		Payload:   protocol.ExecChunk{Seq: 1, Stdout: true, Data: "[staged to transit; no online executor, jobs not run]\n"},
 	})
+	c.SendResponse(msg.ID, protocol.ExecResponse{ExitCode: 0})
+}
+
+// decodePayloadBytes 解码 JSON []byte(content 为 base64 字符串)。
+func decodePayloadBytes(v interface{}) []byte {
+	if s, ok := v.(string); ok {
+		if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+			return b
+		}
+	}
+	return nil
+}
+
+// maybeRelayExecReply 处理消息是否是被转发 exec 的执行方回包,则转发回请求方。
+// 判定依据:消息携带 reqOwner 中存在的 RequestID。返回 true 表示已拦截处理。
+func (c *Client) maybeRelayExecReply(msg protocol.Message) bool {
+	if msg.RequestID == "" {
+		return false
+	}
+
+	owner, ok := c.server.GetReqOwner(msg.RequestID)
+	if !ok {
+		return false
+	}
+
+	switch msg.Type {
+	case protocol.MsgExecOutput:
+		_ = c.server.SendTo(owner, msg)
+		return true
+	case protocol.MsgResponse, protocol.MsgError:
+		c.server.ClearReqOwner(msg.RequestID)
+		_ = c.server.SendTo(owner, msg)
+		return true
+	default:
+		return false
+	}
 }
 
 // handleStreamData 处理流数据
@@ -242,14 +320,18 @@ func (c *Client) handleStreamData(msg protocol.Message) {
 	c.streamMu.RLock()
 	stream, ok := c.streams[msg.StreamID]
 	c.streamMu.RUnlock()
-	
-	if !ok || stream == nil { return }
-	
+
+	if !ok || stream == nil {
+		return
+	}
+
 	payload, _ := msg.Payload.(map[string]interface{})
 	offset := toFloat64(payload["offset"])
-	
-	if int64(offset) != stream.received { return }
-	
+
+	if int64(offset) != stream.received {
+		return
+	}
+
 	var chunkData []byte
 	if raw, ok := payload["data"].([]byte); ok {
 		decompressed, err := protocol.Decompress(raw)
@@ -259,10 +341,10 @@ func (c *Client) handleStreamData(msg protocol.Message) {
 			chunkData = raw
 		}
 	}
-	
+
 	stream.buf = append(stream.buf, chunkData...)
 	stream.received += int64(len(chunkData))
-	
+
 	if len(stream.buf) > 64*1024 {
 		os.MkdirAll(filepath.Dir(stream.tmpPath), 0755)
 		f, err := os.OpenFile(stream.tmpPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -280,9 +362,11 @@ func (c *Client) handleStreamEnd(msg protocol.Message) {
 	stream, ok := c.streams[msg.StreamID]
 	delete(c.streams, msg.StreamID)
 	c.streamMu.Unlock()
-	
-	if !ok || stream == nil { return }
-	
+
+	if !ok || stream == nil {
+		return
+	}
+
 	if len(stream.buf) > 0 {
 		os.MkdirAll(filepath.Dir(stream.tmpPath), 0755)
 		f, err := os.OpenFile(stream.tmpPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -293,12 +377,12 @@ func (c *Client) handleStreamEnd(msg protocol.Message) {
 		f.Write(stream.buf)
 		f.Close()
 	}
-	
+
 	if err := os.Rename(stream.tmpPath, stream.path); err != nil {
 		c.Send(protocol.Message{Type: protocol.MsgStreamEnd, StreamID: msg.StreamID, Payload: protocol.StreamEnd{StreamID: msg.StreamID, OK: false, Error: err.Error()}})
 		return
 	}
-	
+
 	c.Send(protocol.Message{Type: protocol.MsgStreamEnd, StreamID: msg.StreamID, Payload: protocol.StreamEnd{StreamID: msg.StreamID, OK: true, Received: stream.received}})
 }
 
@@ -343,42 +427,42 @@ func (c *Client) handlePull(msg protocol.Message) {
 	payload, _ := msg.Payload.(map[string]interface{})
 	watchID := toString(payload["watch_id"])
 	path := toString(payload["path"])
-	
+
 	dir, ok := c.server.GetWatchDir(watchID)
 	if !ok {
 		c.SendError(msg.ID, "unknown watch_id")
 		return
 	}
-	
+
 	fullPath := safePath(dir, path)
 	if fullPath == "" {
 		c.SendError(msg.ID, "path traversal detected")
 		return
 	}
-	
+
 	info, err := os.Stat(fullPath)
 	if err != nil {
 		c.SendError(msg.ID, err.Error())
 		return
 	}
-	
+
 	streamID := msg.StreamID
 	if streamID == "" {
 		streamID = uuid.New().String()
 	}
-	
+
 	c.Send(protocol.Message{
 		Type: protocol.MsgStreamStart, ID: uuid.New().String(), RequestID: msg.ID, StreamID: streamID,
 		Payload: protocol.StreamStart{StreamID: streamID, Total: info.Size(), Offset: 0, Remaining: info.Size(), Compressed: true},
 	})
-	
+
 	f, err := os.Open(fullPath)
 	if err != nil {
 		c.Send(protocol.Message{Type: protocol.MsgStreamEnd, ID: uuid.New().String(), StreamID: streamID, Payload: protocol.StreamEnd{StreamID: streamID, OK: false, Error: err.Error()}})
 		return
 	}
 	defer f.Close()
-	
+
 	hasher := sha256.New()
 	buf := make([]byte, protocol.DefaultChunkSize)
 	var offset int64
@@ -399,7 +483,7 @@ func (c *Client) handlePull(msg protocol.Message) {
 			break
 		}
 	}
-	
+
 	digest := hex.EncodeToString(hasher.Sum(nil))
 	c.Send(protocol.Message{
 		Type: protocol.MsgStreamEnd, ID: uuid.New().String(), StreamID: streamID,
@@ -412,29 +496,29 @@ func (c *Client) handlePush(msg protocol.Message) {
 	payload, _ := msg.Payload.(map[string]interface{})
 	watchID := toString(payload["watch_id"])
 	path := toString(payload["path"])
-	
+
 	dir, ok := c.server.GetWatchDir(watchID)
 	if !ok {
 		c.SendError(msg.ID, "unknown watch_id")
 		return
 	}
-	
+
 	fullPath := safePath(dir, path)
 	if fullPath == "" {
 		c.SendError(msg.ID, "path traversal detected")
 		return
 	}
-	
+
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 		c.SendError(msg.ID, fmt.Sprintf("mkdir: %v", err))
 		return
 	}
-	
+
 	streamID := msg.StreamID
 	if streamID == "" {
 		streamID = toString(payload["stream_id"])
 	}
-	
+
 	tmpPath := fullPath + ".tmp-" + streamID
 	c.streamMu.Lock()
 	c.streams[streamID] = &ReceiveStream{
@@ -443,7 +527,7 @@ func (c *Client) handlePush(msg protocol.Message) {
 		tmpPath:  tmpPath,
 	}
 	c.streamMu.Unlock()
-	
+
 	c.SendResponse(msg.ID, map[string]interface{}{"ok": true, "stream_id": streamID})
 }
 
@@ -452,13 +536,13 @@ func (c *Client) handleSubscribe(msg protocol.Message) {
 	payload, _ := msg.Payload.(map[string]interface{})
 	watchID := toString(payload["watch_id"])
 	action := toString(payload["action"])
-	
+
 	_, ok := c.server.GetWatchDir(watchID)
 	if !ok {
 		c.SendResponse(msg.ID, protocol.SubscribedResponse{WatchID: watchID, OK: false, Error: "unknown watch_id"})
 		return
 	}
-	
+
 	switch action {
 	case "add", "":
 		c.server.Subscribe(c.id, watchID)
@@ -468,7 +552,7 @@ func (c *Client) handleSubscribe(msg protocol.Message) {
 		c.SendResponse(msg.ID, protocol.SubscribedResponse{WatchID: watchID, OK: false, Error: "invalid action"})
 		return
 	}
-	
+
 	c.SendResponse(msg.ID, protocol.SubscribedResponse{WatchID: watchID, OK: true})
 }
 
@@ -485,32 +569,39 @@ func safePath(baseDir, relPath string) string {
 
 func readDir(path string) ([]protocol.FileEntry, error) {
 	entries, err := os.ReadDir(path)
-	if err != nil { return nil, err }
-	
+	if err != nil {
+		return nil, err
+	}
+
 	result := make([]protocol.FileEntry, 0, len(entries))
 	for _, e := range entries {
 		info, _ := e.Info()
-		if info == nil { continue }
+		if info == nil {
+			continue
+		}
 		result = append(result, protocol.FileEntry{
 			Name: e.Name(), Path: filepath.Join(path, e.Name()),
 			IsDir: e.IsDir(), Size: info.Size(),
 			ModTime: info.ModTime().UnixMilli(),
-			Mode: uint32(info.Mode()),
+			Mode:    uint32(info.Mode()),
 		})
 	}
 	return result, nil
 }
 
-
 func toFloat64(v interface{}) float64 {
-	if f, ok := v.(float64); ok { return f }
+	if f, ok := v.(float64); ok {
+		return f
+	}
 	return 0
 }
 
 func toBytes(v interface{}) []byte {
 	if b, ok := v.([]interface{}); ok {
 		result := make([]byte, len(b))
-		for i, e := range b { result[i] = byte(toFloat64(e)) }
+		for i, e := range b {
+			result[i] = byte(toFloat64(e))
+		}
 		return result
 	}
 	return nil

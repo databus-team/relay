@@ -146,6 +146,9 @@ func runWatch() {
 		os.Exit(1)
 	}
 
+	// 执行方(relay executor)要把「push 落地后本地跑 jobs」接到自身的 watch 配置与 job 执行逻辑。
+	w.SetPushJobHandler(runLocalJobsForPush)
+
 	if err := w.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 		os.Exit(1)
@@ -465,11 +468,68 @@ func runPush() {
 
 	if info.IsDir() {
 		pushDir(ctx, b, src, watchDir)
-	} else {
-		pushFile(ctx, b, src, dest)
+		fmt.Println("Push completed successfully")
+		return
 	}
 
+	// 直达后端(relay):把文件直达远端执行方并触发其本地 jobs;输出流式显示。
+	if pj, ok := b.(backend.PushJobSender); ok {
+		content, rerr := os.ReadFile(src)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "Failed to read source: %v\n", rerr)
+			os.Exit(1)
+		}
+		exit, perr := pj.PushJob(ctx, dest, content, func(c backend.ExecChunk) {
+			if c.Stdout {
+				os.Stdout.WriteString(c.Data)
+			} else {
+				os.Stderr.WriteString(c.Data)
+			}
+		})
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "Push error: %v\n", perr)
+			os.Exit(1)
+		}
+		if exit != 0 {
+			os.Exit(exit)
+		}
+		fmt.Println("Push completed successfully")
+		return
+	}
+
+	pushFile(ctx, b, src, dest)
 	fmt.Println("Push completed successfully")
+}
+
+// runLocalJobsForPush 执行方收到直达 push 落地文件后,在本地按工作区跑 jobs,
+// 断言 job 输出流回请求方,返回 0 全成功、非 0 有失败。
+func runLocalJobsForPush(watchID, absPath string, out func(backend.ExecChunk)) int {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		out(backend.ExecChunk{Stdout: false, Data: "push-job: load config: " + err.Error() + "\n"})
+		return 1
+	}
+	watchCfg, err := cfg.GetWatchByID(watchID)
+	if err != nil {
+		out(backend.ExecChunk{Stdout: false, Data: fmt.Sprintf("push-job: unknown watch %q\n", watchID)})
+		return 1
+	}
+
+	ctx := context.Background()
+	exit := 0
+	for _, job := range watchCfg.Jobs {
+		res, rerr := jobrunner.Run(ctx, watchCfg, job.ID, absPath)
+		if res.Stdout != "" {
+			out(backend.ExecChunk{Stdout: true, Data: res.Stdout})
+		}
+		if res.Stderr != "" {
+			out(backend.ExecChunk{Stdout: false, Data: res.Stderr})
+		}
+		if rerr != nil {
+			exit = 1
+		}
+	}
+	return exit
 }
 
 func runExec() {
@@ -534,6 +594,25 @@ func runExec() {
 		fmt.Println("OK")
 	} else {
 		fmt.Println("Note: Specify -w to check remote watcher before exec")
+	}
+
+	// 支持流式的后端(relay)逐帧实时转发输出,并以 exit code 收尾
+	if eb, ok := b.(backend.ExecStreamBackend); ok {
+		exit, err := eb.ExecStream(ctx, *execCmdStr, execCwd, 0, func(chunk backend.ExecChunk) {
+			if chunk.Stdout {
+				os.Stdout.WriteString(chunk.Data)
+			} else {
+				os.Stderr.WriteString(chunk.Data)
+			}
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Exec error: %v\n", err)
+			os.Exit(1)
+		}
+		if exit != 0 {
+			os.Exit(exit)
+		}
+		return
 	}
 
 	result, err := b.Exec(ctx, *execCmdStr, execCwd, 0)

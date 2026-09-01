@@ -29,7 +29,12 @@ type Watcher struct {
 	// pendingConfig holds staged config for next cycle apply
 	pendingConfig   []byte
 	pendingConfigMu sync.Mutex
+	// pushJobHandler 由 cmd/relay 注入:执行方处理直达 push 落地后本地跑 jobs。
+	pushJobHandler backend.PushJobHandler
 }
+
+// SetPushJobHandler 注入 push 落地后的本地 jobs 执行回调(cmd/relay 在创建 watcher 后设置)。
+func (w *Watcher) SetPushJobHandler(h backend.PushJobHandler) { w.pushJobHandler = h }
 
 func New(cfg *config.Config, configPath string) (*Watcher, error) {
 	return &Watcher{
@@ -41,12 +46,25 @@ func New(cfg *config.Config, configPath string) (*Watcher, error) {
 }
 
 func (w *Watcher) createBackend(watchCfg config.WatchConfig) (backend.FileTransferBackend, error) {
-	return backend.NewBackend(w.cfg.Backend.Type, w.cfg.Backend.Config)
+	b, err := backend.NewBackend(w.cfg.Backend.Type, w.cfg.Backend.Config)
+	if err == nil && w.pushJobHandler != nil {
+		// 每个新建 backend 可能的同名 executor 会覆盖入站 handler,故每次都要补注入 jobs 回调
+		if pc, ok := b.(backend.PushJobCapable); ok {
+			pc.SetPushJobHandler(w.pushJobHandler)
+		}
+	}
+	return b, err
 }
 
 func (w *Watcher) Run(ctx context.Context) error {
 	probeBackend, err := backend.NewBackend(w.cfg.Backend.Type, w.cfg.Backend.Config)
 	if err == nil {
+		// 执行方(relay executor)需要注入 push 落地后的本地 jobs 处理器
+		if w.pushJobHandler != nil {
+			if pc, ok := probeBackend.(backend.PushJobCapable); ok {
+				pc.SetPushJobHandler(w.pushJobHandler)
+			}
+		}
 		if eb, ok := probeBackend.(backend.EventBackend); ok {
 			log.Println("Starting watcher in event-driven mode")
 			return w.runEventDriven(ctx, eb)

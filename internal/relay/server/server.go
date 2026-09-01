@@ -26,8 +26,15 @@ type Server struct {
 	auth      AuthConfig
 	tls       TLSConfig
 
-	subs   map[string]map[string]bool
-	subMu  sync.RWMutex
+	subs  map[string]map[string]bool
+	subMu sync.RWMutex
+
+	// executors 记录每个 watch 上注册的执行方客户端(远端 watcher)。
+	executors  map[string]string
+	executorMu sync.RWMutex
+	// reqOwner 记录被转发的 exec 请求(reqID)归属的请求方客户端,用于把执行方回流帧转回去。
+	reqOwner map[string]string
+	reqMu    sync.RWMutex
 }
 
 type Config struct {
@@ -64,6 +71,8 @@ func New(cfg Config) (*Server, error) {
 		auth:      cfg.Auth,
 		tls:       cfg.TLS,
 		subs:      make(map[string]map[string]bool),
+		executors: make(map[string]string),
+		reqOwner:  make(map[string]string),
 	}
 
 	for _, wd := range cfg.WatchDirs {
@@ -239,6 +248,7 @@ func (s *Server) handleConnection(conn *websocket.Conn) {
 	<-client.CloseCh()
 
 	s.UnsubscribeAll(clientID)
+	s.cleanupClientState(clientID)
 
 	s.clientMu.Lock()
 	delete(s.clients, clientID)
@@ -305,6 +315,71 @@ func (s *Server) UnsubscribeAll(clientID string) {
 	}
 }
 
+// RegisterExecutor 将 clientID 注册为 watchID 的执行方。
+func (s *Server) RegisterExecutor(watchID, clientID string) {
+	s.executorMu.Lock()
+	defer s.executorMu.Unlock()
+	s.executors[watchID] = clientID
+}
+
+// UnregisterExecutor 若 clientID 是 watchID 的执行方则移除。
+func (s *Server) UnregisterExecutor(watchID, clientID string) {
+	s.executorMu.Lock()
+	defer s.executorMu.Unlock()
+	if s.executors[watchID] == clientID {
+		delete(s.executors, watchID)
+	}
+}
+
+// GetExecutor 返回 watchID 对应执行方客户端 ID。
+func (s *Server) GetExecutor(watchID string) (string, bool) {
+	s.executorMu.RLock()
+	defer s.executorMu.RUnlock()
+	e, ok := s.executors[watchID]
+	return e, ok
+}
+
+// SetReqOwner 记录被转发 exec 请求的归属请求方。
+func (s *Server) SetReqOwner(reqID, clientID string) {
+	s.reqMu.Lock()
+	defer s.reqMu.Unlock()
+	s.reqOwner[reqID] = clientID
+}
+
+// GetReqOwner 读取 exec 请求的归属请求方;存在则返回 true。
+func (s *Server) GetReqOwner(reqID string) (string, bool) {
+	s.reqMu.RLock()
+	defer s.reqMu.RUnlock()
+	owner, ok := s.reqOwner[reqID]
+	return owner, ok
+}
+
+// ClearReqOwner 移除 exec 请求归属记录(收尾后调用)。
+func (s *Server) ClearReqOwner(reqID string) {
+	s.reqMu.Lock()
+	defer s.reqMu.Unlock()
+	delete(s.reqOwner, reqID)
+}
+
+// cleanupClientState 断连时清理该 client 注册的执行方与待转发请求归属。
+func (s *Server) cleanupClientState(clientID string) {
+	s.executorMu.Lock()
+	for watchID, e := range s.executors {
+		if e == clientID {
+			delete(s.executors, watchID)
+		}
+	}
+	s.executorMu.Unlock()
+
+	s.reqMu.Lock()
+	for reqID, owner := range s.reqOwner {
+		if owner == clientID {
+			delete(s.reqOwner, reqID)
+		}
+	}
+	s.reqMu.Unlock()
+}
+
 func (s *Server) BroadcastToSubscribers(event protocol.FileEvent) {
 	s.subMu.RLock()
 	clients := make([]string, 0)
@@ -331,6 +406,8 @@ func (s *Server) BroadcastFileEvent(event protocol.FileEvent) {
 }
 
 func toString(v interface{}) string {
-	if s, ok := v.(string); ok { return s }
+	if s, ok := v.(string); ok {
+		return s
+	}
 	return ""
 }

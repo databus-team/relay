@@ -11,6 +11,10 @@ backend:
     watch_id: web-app-patches          # subscribe to this watch on server
     watch_dir: .                       # remote watch directory (relative to server's watch dir)
     command_dir: /tmp/relay-commands   # shared command directory for hot-reload
+    # executor: true                    # 仅当本机是「远端执行方」(relay watch 端)时启用:
+    #                                    # 注册为 watch_id 的执行方,接收经中转转发的 relay exec / relay push 并本地执行
+    #                                    # executor_dir: /path/to/remote/project   # push 时文件落在执行方的该目录下(可省略,默认进程当前目录)
+    #                                    # 本地 CLI (relay exec / relay push) 无需该项;exec 无执行方时报错,push 会回退中转暂存
 
 watch:
   - id: web-app-patches

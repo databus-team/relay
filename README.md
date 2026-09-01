@@ -111,6 +111,11 @@ relay push -w web-app-patches ./my.patch
 
 Pushes file or directory to the watch's `watch_dir` on the remote backend.
 
+With the **relay** backend, a single-file push is **transparent**: the file is delivered directly to the online remote executor's project
+directory (`executor_dir`), and the remote runs that workspace's **jobs automatically**, streaming job output back to the local command.
+If no executor is online, `push` falls back to staging the file on the transit server's `watch_dir` (the classic watch-and-pull flow) and
+prints a `[staged to transit; no online executor, jobs not run]` notice. Directories still use the plain staging path.
+
 ### pull — Download File
 
 ```bash
@@ -136,7 +141,9 @@ Lists files in the watch's remote `watch_dir` with size and modification time.
 relay exec -w web-app-patches "npm run build"
 ```
 
-Forwards a command to the remote backend for execution. Requires a backend that supports `Exec` (local, fs_mcp). The `-w` flag sets the working directory to the watch's `local_dir`. When omitted, `-w` is inferred from the cwd when it can be; otherwise `exec` falls back to its no-workspace behavior.
+Forwards a command to the remote side for execution. Requires a backend that supports `Exec` (local, fs_mcp, relay). The `-w` flag sets the working directory to the watch's `local_dir`. When omitted, `-w` is inferred from the cwd when it can be; otherwise `exec` falls back to its no-workspace behavior.
+
+With the **relay** backend, output is **streamed back in real time** (stdout/stderr appear as the remote command runs, e.g. build logs and `tail -f`), and the local exit code mirrors the remote command's exit code. The relay server only forwards the request to the remote executor — if none is registered for the watch, `exec` errors. See [Transparent forwarding](#relay-backend-configuration).
 
 ### job run — Run a Config Job Locally
 
@@ -242,6 +249,13 @@ backend:
 | `watch_id` | Server-side watch ID to subscribe to |
 | `watch_dir` | Remote directory path (relative to server's watch dir) |
 | `command_dir` | Shared directory for config sync commands |
+| `executor` | `true` 仅当本机是「远端执行方」(relay watch 端)时设置;注册为 `watch_id` 的执行方以接收经中转转发的 `relay exec` / `relay push` |
+| `executor_dir` | push 时执行方把文件落到该目录(默认进程当前目录),作为远端项目根;`relay exec` 在本地执行(| Exec 时的工作目录用请求的 cwd) |
+
+**Transparent forwarding (transit server only):** The relay server is a pure transparent forwarder — it **never** executes commands itself. When
+`relay exec` is issued locally, the server forwards it over the existing WebSocket connection to the registered executor (the remote
+`relay watch` with `executor: true`), and relays the command's stdout/stderr back **incrementally** in real time. If no executor is
+registered for the watch, `relay exec` fails with `no executor registered for watch '<id>'`.
 
 **Transfer features** (automatic, no config needed):
 - 64KB chunked streaming for large files
