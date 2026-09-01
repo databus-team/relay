@@ -109,29 +109,16 @@ restart_binary() {
   local w="$1" st dest
   st="${REMOTE_NEW:-${REMOTE_BIN_PATH}.new}"
   dest="${REMOTE_BIN_PATH:-}"
-  log "触发 detached 换装 (new=$st -> dest=${dest:-<远端 command -v relay>}, RESTART=1) ..."
-  read -r -d '' RCMD <<EOF || true
-STG='$st'
-DEST='$dest'
-# detached: 先返回本 exec 响应,3s 后停旧->换->起
-( sleep 3
-  [ -z "\$DEST" ] && DEST="\$(command -v relay)"; [ -n "\$DEST" ] || DEST="\$HOME/.local/bin/relay"
-  # 平台相关的可靠终止:Windows 用 taskkill 按镜像名清掉所有 relay(msys kill 常失效);
-  # POSIX 用 pkill。确保不留堆叠的旧 daemon / 控制台窗口。
-  # 注意:MSYS_NO_PATHCONV=1 下必须用单斜杠 /F,双斜杠 //F 会给 system32 的 taskkill(解析不了)。
-  case "\$(uname -s 2>/dev/null)" in
-    *MINGW*|*MSYS*|*CYGWIN*) MSYS_NO_PATHCONV=1 taskkill /F /IM relay.exe >/dev/null 2>&1 || true ;;
-    *) pkill -9 -f 'relay watch' 2>/dev/null || true ;;
-  esac
-  sleep 1
-  mv -f "\$STG" "\$DEST" && chmod +x "\$DEST"
-  nohup "\$DEST" watch -c "\$HOME/.relay/config.yaml" >>"\$HOME/.relay/relay.log" 2>&1 &
-  echo "restarted \$DEST"
-) >/dev/null 2>&1 </dev/null &
-echo "swap scheduled; new staged at \$STG"
-EOF
-  relay exec -c "$CONFIG" -w "$w" "$RCMD"
-  log "换装已调度(约 3s 后自动替换+重启)日志: ~/.relay/relay.log"
+  log "触发 daemon 自升级换装 (st=$st -> dest=${dest:-<远端 command -v relay>}, RESTART=1) ..."
+  # 复用 relay 自身的 `watch upgrade`:停 daemon -> 原子替换二进制 -> 以守护进程重启。
+  # 相比手写 taskkill + nohup 拉起:upgrade 走 daemonStart(detach + HideWindow,无黑窗),
+  # 并写 ~/.relay/watch.pid,`relay watch status` 才能正确显示运行态。
+  # 注意:upgrade 会先停掉正在服务本 exec 的 daemon,本命令的回包可能被切断;
+  # 但停->换->起在远端执行,由后续 verify()(relay version -r)兜底核对。
+  relay exec -c "$CONFIG" -w "$w" "\"$dest\" watch upgrade \"$st\" -c \"\$HOME/.relay/config.yaml\"" \
+    && log "daemon 自升级完成" \
+    || warn "exec 回包断开是预期(服务 daemon 被替换);结果以 verify 为准"
+  log "daemon 自升级已触发;日志: ~/.relay/watch.log"
 }
 
 # ---- 6) 中转手工清单 ----
