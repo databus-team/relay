@@ -15,6 +15,7 @@ import (
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/config"
+	"github.com/user/relay/internal/daemon"
 	"github.com/user/relay/internal/exchange"
 	"github.com/user/relay/internal/jobrunner"
 	"github.com/user/relay/internal/logx"
@@ -35,6 +36,9 @@ var (
 
 	// Watch command - continuous monitoring
 	watchCmd = kingpin.Command("watch", "Watch remote directory and execute actions continuously")
+
+	// 位置参数 action:默认前台;run=前台;start/stop/status/restart 为 daemon 控制。
+	watchAction = watchCmd.Arg("action", "run|start|stop|status|restart (default: run)").HintOptions("run", "start", "stop", "status", "restart").String()
 
 	// Pull command - download single file (requires filename)
 	pullCmd    = kingpin.Command("pull", "Download single file from remote watch directory")
@@ -94,8 +98,49 @@ func main() {
 	}
 
 	switch kingpin.Parse() {
+	case serverCmd.FullCommand():
+		// action 位置参数:默认/run=前台;start/stop/status/restart=daemon。裸 `relay server`
+		// (无 action)即为前台,保留原有用法。
+		switch normalizedAction(*serverAction) {
+		case "start":
+			if err := daemonStart("server"); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		case "stop":
+			daemonStop("server")
+		case "status":
+			if err := daemonStatus("server"); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		case "restart":
+			daemonRestart("server")
+		default:
+			if err := runServer(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		}
 	case watchCmd.FullCommand():
-		runWatch()
+		switch normalizedAction(*watchAction) {
+		case "start":
+			if err := daemonStart("watch"); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		case "stop":
+			daemonStop("watch")
+		case "status":
+			if err := daemonStatus("watch"); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		case "restart":
+			daemonRestart("watch")
+		default:
+			runWatch()
+		}
 	case pullCmd.FullCommand():
 		runPull()
 	case pushCmd.FullCommand():
@@ -112,9 +157,6 @@ func main() {
 		app.Usage(os.Args)
 	case syncCmd.FullCommand():
 		runSync()
-
-	case serverCmd.FullCommand():
-		runServer()
 	case wsCmd.FullCommand():
 		runWorkspaces()
 	case jobRun.FullCommand():
@@ -124,6 +166,75 @@ func main() {
 	}
 }
 
+// normalizedAction 把 action 位置参数归一:run 或空视为前台(返回 ""),其余 daemon 动作原样返回。
+func normalizedAction(a string) string {
+	switch a {
+	case "run", "":
+		return ""
+	case "start", "stop", "status", "restart":
+		return a
+	default:
+		return ""
+	}
+}
+
+// daemonStart 已运行则提示,否则 detached 拉起 `relay <name> run -c <config>` 并记录 pid。
+func daemonStart(name string) error {
+	pidFile, logFile := daemon.PidFile(name), daemon.LogFile(name)
+	st := daemon.Get(pidFile)
+	if st.Err != nil {
+		return st.Err
+	}
+	if st.Running {
+		fmt.Printf("%s already running (pid %d)\n", name, st.Pid)
+		return nil
+	}
+	pid, err := daemon.Start([]string{name, "run", "-c", *configPath}, logFile, pidFile)
+	if err != nil {
+		return fmt.Errorf("daemon start %s: %w", name, err)
+	}
+	fmt.Printf("%s started (pid %d)\nlog: %s\n", name, pid, logFile)
+	return nil
+}
+
+// daemonStop 停止;未运行视为幂等成功。
+func daemonStop(name string) {
+	if err := daemon.Stop(daemon.PidFile(name)); err != nil {
+		fmt.Printf("%s is not running\n", name)
+		return
+	}
+	fmt.Printf("%s stopped\n", name)
+}
+
+// daemonRestart 先停再启。
+func daemonRestart(name string) {
+	pidFile, logFile := daemon.PidFile(name), daemon.LogFile(name)
+	st := daemon.Get(pidFile)
+	if st.Err == nil && st.Running {
+		_ = daemon.Stop(pidFile)
+	}
+	pid, err := daemon.Start([]string{name, "run", "-c", *configPath}, logFile, pidFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	fmt.Printf("%s restarted (pid %d)\nlog: %s\n", name, pid, logFile)
+}
+
+// daemonStatus 报告 pid 状态与日志路径。
+func daemonStatus(name string) error {
+	pidFile, logFile := daemon.PidFile(name), daemon.LogFile(name)
+	st := daemon.Get(pidFile)
+	if st.Err != nil {
+		return st.Err
+	}
+	if st.Running {
+		fmt.Printf("%s: running (pid %d)\nlog: %s\n", name, st.Pid, logFile)
+	} else {
+		fmt.Printf("%s: stopped\nlog: %s\n", name, logFile)
+	}
+	return nil
+}
 func runWatch() {
 	// Resolve a leading ~ so the path stored on the watcher (used later for
 	// config backup during sync) is an absolute filesystem path, not a literal
