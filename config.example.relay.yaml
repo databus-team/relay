@@ -55,15 +55,11 @@ watch:
       - id: apply
         type: exec
         cmd: git am --3way {file_path}
-      - id: cleanup_remote
-        type: file_delete
-        target: remote          # default; deletes {file_remote_path} on the backend's watch_dir
-        path: "{file_remote_path}"
-        if: jobs.apply.success
+      # 删除类工作统一用 exec:应用成功后移除执行方本地的 .patch。
+      # 中转 watch_dir 的源文件则由 auto_cleanup: true 在 jobs 全部成功后自动删除。
       - id: cleanup_local
-        type: file_delete
-        target: local           # deletes the local copy with os.Remove on this machine
-        path: "{file_path}"
+        type: exec
+        cmd: rm -f {file_path}           # rm -f 幂等,即使已存在也不会假失败
         if: jobs.apply.success
 
   - id: web-app-deploy
