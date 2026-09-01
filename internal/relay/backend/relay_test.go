@@ -84,7 +84,66 @@ func TestEndToEnd_ExecStream(t *testing.T) {
 	}
 }
 
-// end-to-end: 请求方 PushJob 直达执行方,执行方落盘并跑本地 job,输出流回。
+// 端到端:请求方经中转把新配置直达执行方,执行方校验+原子落盘到 config_path,回执成功。
+func TestEndToEnd_ConfigSync(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
+
+	watchDir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("name: old\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ts, wsURL := newTestHub(t, watchDir)
+	defer ts.Close()
+	defer client.CloseAll()
+
+	ctx := context.Background()
+
+	// 执行方:注册为 executor,config_path 指向要落盘的文件
+	if _, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-exe", "watch_id": "test", "executor": true,
+		"config_path": configPath,
+	}); err != nil {
+		t.Fatalf("executor backend: %v", err)
+	}
+
+	// 请求方:走 config-sync 流程
+	reqBackend, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+	cs, ok := reqBackend.(bk.ConfigSyncCapable)
+	if !ok {
+		t.Fatalf("requester backend does not implement ConfigSyncCapable")
+	}
+
+	payload := []byte("name: relay\nversion: 2\nbackend:\n  type: relay\n")
+	exit, err := cs.ConfigSync(ctx, payload)
+	if err != nil {
+		t.Fatalf("config sync: %v", err)
+	}
+	if exit != 0 {
+		t.Fatalf("config sync exit: %d", exit)
+	}
+
+	// 执行方应已原子落盘新配置
+	got, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read synced config: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Errorf("config content:\n got=%q\nwant=%q", got, payload)
+	}
+	// 旧文件应已备份
+	if _, err := os.Stat(configPath + ".bak"); err != nil {
+		t.Errorf("backup file not created: %v", err)
+	}
+}
+
+// end-to-end: 请求方 PushJob 直达执行方,执行方落盘并跑本地 job,推送流回。
 func TestEndToEnd_PushJob(t *testing.T) {
 	SetExecutorRole(true)
 	defer SetExecutorRole(false)

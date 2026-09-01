@@ -3,6 +3,7 @@ package backend
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/user/relay/internal/backend"
+	"github.com/user/relay/internal/config"
 	"github.com/user/relay/internal/logx"
 	"github.com/user/relay/internal/relay/client"
 	"github.com/user/relay/internal/relay/protocol"
@@ -28,6 +30,7 @@ type RelayBackend struct {
 	watchID    string
 	commandDir string
 	execDir    string // push 落地根目录(执行方);空则用进程当前目录
+	configPath string // config-sync 落盘目标(执行方)
 	eventCh    chan backend.FileInfo
 	mu         sync.RWMutex
 
@@ -73,7 +76,8 @@ type Config struct {
 	CommandDir  string            `mapstructure:"command_dir" yaml:"command_dir"`
 	ExecutorDir string            `mapstructure:"executor_dir" yaml:"executor_dir"`
 	Executor    bool              `mapstructure:"executor" yaml:"executor"`
-	Headers     map[string]string `mapstructure:"headers" yaml:"headers"` // WS 握手自定义头(中转前置鉴权)
+	ConfigPath  string            `mapstructure:"config_path" yaml:"config_path"` // 执行方 config-sync 落盘目标(缺省 ~/.relay/config.yaml)
+	Headers     map[string]string `mapstructure:"headers" yaml:"headers"`         // WS 握手自定义头(中转前置鉴权)
 }
 
 func NewRelayBackend(config map[string]interface{}) (backend.FileTransferBackend, error) {
@@ -100,6 +104,9 @@ func NewRelayBackend(config map[string]interface{}) (backend.FileTransferBackend
 	if dir, ok := config["executor_dir"].(string); ok {
 		cfg.ExecutorDir = dir
 	}
+	if cp, ok := config["config_path"].(string); ok {
+		cfg.ConfigPath = cp
+	}
 	if raw, ok := config["headers"].(map[string]interface{}); ok {
 		cfg.Headers = make(map[string]string, len(raw))
 		for k, v := range raw {
@@ -117,6 +124,12 @@ func NewRelayBackend(config map[string]interface{}) (backend.FileTransferBackend
 	}
 	if cfg.WatchID == "" {
 		cfg.WatchID = "default"
+	}
+	if cfg.ConfigPath == "" {
+		// 执行方 config-sync 的默认落盘目标(与 relay watch 的 ~/.relay/config.yaml 一致)。
+		if home, err := os.UserHomeDir(); err == nil {
+			cfg.ConfigPath = filepath.Join(home, ".relay", "config.yaml")
+		}
 	}
 
 	var opts []client.Option
@@ -139,6 +152,7 @@ func NewRelayBackend(config map[string]interface{}) (backend.FileTransferBackend
 		watchID:    cfg.WatchID,
 		commandDir: cfg.CommandDir,
 		execDir:    cfg.ExecutorDir,
+		configPath: cfg.ConfigPath,
 		eventCh:    make(chan backend.FileInfo, 100),
 	}
 
@@ -263,13 +277,47 @@ func (b *RelayBackend) PushJob(ctx context.Context, relPath string, content []by
 	return resp.ExitCode, nil
 }
 
-// enableExecutor 让本 backend(通常在远端 relay watch 上)扮演执行方:
-// 注册为 watcherID 的 executor,并处理从中转转发来的 exec 请求。
+// ConfigSync 请求方把新配置经中转直达执行方落盘(WS 流式通道,不写 command 文件)。
+func (b *RelayBackend) ConfigSync(ctx context.Context, payload []byte) (int, error) {
+	if err := b.ensureConnected(ctx); err != nil {
+		return 1, err
+	}
+	resp, err := b.client.ConfigSync(ctx, payload)
+	if err != nil {
+		return 1, err
+	}
+	return resp.ExitCode, nil
+}
+
+// enableExecutor 让本 backend 在远端 relay watch 上扮演执行方:
+// 注册为 watcherID 的 executor,并处理从中转转发来的 exec/push/config-sync 请求。
 func (b *RelayBackend) enableExecutor() {
 	b.client.SetExecHandler(func(sess *client.ExecSession) { b.handleInboundExec(sess) })
 	b.client.SetPushJobHandler(func(sess *client.PushJobSession) { b.handleInboundPushJob(sess) })
+	b.client.SetConfigSyncHandler(func(sess *client.ConfigSyncSession) { b.handleInboundConfigSync(sess) })
 	b.client.SetOnReconnect(b.registerExecutor)
 	b.registerExecutor()
+}
+
+// ConfigSyncPath 回读执行方配置落盘目标(供部署/运维排查 r 用)。
+func (b *RelayBackend) ConfigSyncPath() string { return b.configPath }
+
+// handleInboundConfigSync 执行方收到流式 config-sync:解码、校验、原子落盘到自身
+// config_path,随后回执给请求方。复用 config.ApplyConfigFile 与文件命令交换同一份逻辑。
+func (b *RelayBackend) handleInboundConfigSync(sess *client.ConfigSyncSession) {
+	log.Printf("[config-sync] received config for watch %s", sess.WatchID())
+	payload, err := base64.StdEncoding.DecodeString(sess.Payload())
+	if err != nil {
+		_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: "config-sync: bad base64: " + err.Error()})
+		return
+	}
+	if err := config.ApplyConfigFile(payload, b.configPath); err != nil {
+		log.Printf("[config-sync] apply failed: %v", err)
+		_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: err.Error()})
+		return
+	}
+	log.Printf("[config-sync] applied %d bytes -> %s (restart relay watch to take effect)", len(payload), b.configPath)
+	_ = sess.Done(protocol.ExecResponse{ExitCode: 0, Stdout: fmt.Sprintf("config applied to %s; restart relay watch to take effect", b.configPath)})
 }
 
 // SetPushJobHandler 注册「push 文件落地后本地跑 jobs」的回调(由远端 relay watch 注入)。

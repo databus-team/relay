@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -135,6 +136,32 @@ func loadFromBytes(data []byte) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// ApplyConfigFile 校验并原子写回一份新配置到 configPath,覆盖前先备份旧文件到
+// configPath+".bak"。由文件命令交换(watcher)与 relay WS 流式 config-sync 两条 sync
+// 通道共用,避免复制"校验+备份+tmp/rename 原子写"逻辑。configPath 为空时拒绝。
+func ApplyConfigFile(payload []byte, configPath string) error {
+	if configPath == "" {
+		return errors.New("config path not set")
+	}
+	if _, err := LoadFromBytes(payload); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	if cur, err := os.ReadFile(configPath); err == nil {
+		if err := os.WriteFile(configPath+".bak", cur, 0644); err != nil {
+			return fmt.Errorf("backup config: %w", err)
+		}
+	}
+	tmpPath := configPath + ".tmp"
+	if err := os.WriteFile(tmpPath, payload, 0644); err != nil {
+		return fmt.Errorf("write temp config: %w", err)
+	}
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("atomic replace config: %w", err)
+	}
+	return nil
 }
 
 func (c *Config) GetBackendType() string {

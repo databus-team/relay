@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -107,6 +108,38 @@ func (c *Client) execRoundTrip(ctx context.Context, ch chan *protocol.Message, o
 // Exec 缓冲式执行(流式结果聚合后一次性返回),保持向后兼容。
 func (c *Client) Exec(ctx context.Context, cmd string, cwd string, timeout int) (*protocol.ExecResponse, error) {
 	return c.ExecStream(ctx, cmd, cwd, timeout, nil)
+}
+
+// ConfigSync 把一份新配置(latest 端经 ExpandEnv 后)经中转直达执行方落盘(单次应答,
+// 与 ExecStream 复用同一 execStreams/execRoundTrip 回包管道)。返回执行方 exit code。
+func (c *Client) ConfigSync(ctx context.Context, payload []byte) (*protocol.ExecResponse, error) {
+	reqID := uuid.New().String()
+	ch := make(chan *protocol.Message, 256)
+
+	c.execMu.Lock()
+	c.execStreams[reqID] = ch
+	c.execMu.Unlock()
+	defer func() {
+		c.execMu.Lock()
+		delete(c.execStreams, reqID)
+		c.execMu.Unlock()
+	}()
+
+	msg := &protocol.Message{
+		Type: protocol.MsgConfigSync,
+		ID:   reqID,
+		Payload: protocol.ConfigSyncRequest{
+			WatchID: c.watchID,
+			Payload: base64.StdEncoding.EncodeToString(payload),
+		},
+	}
+
+	select {
+	case c.sendCh <- sendMsg{Message: msg}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return c.execRoundTrip(ctx, ch, nil)
 }
 
 // PushJob 将文件内容以 64KB 分块流式直达远端执行方,在其项目目录落地并触发流式 jobs。
@@ -506,6 +539,48 @@ func (c *Client) handleInboundExec(msg protocol.Message) {
 		return
 	}
 	go h(sess)
+}
+
+// ConfigSyncSession 是一次入站 config-sync(执行方视角)的写回句柄。
+type ConfigSyncSession struct {
+	client    *Client
+	requestID string
+	req       protocol.ConfigSyncRequest
+}
+
+func (s *ConfigSyncSession) WatchID() string { return s.req.WatchID }
+func (s *ConfigSyncSession) Payload() string { return s.req.Payload }
+
+// SetConfigSyncHandler 设置入站 config-sync 处理回调。与 SetExecHandler/SetPushJobHandler 同构。
+func (c *Client) SetConfigSyncHandler(fn func(*ConfigSyncSession)) {
+	c.configSyncM.Lock()
+	c.configSyncHandler = fn
+	c.configSyncM.Unlock()
+}
+
+// handleInboundConfigSync 处理从中转转发来的 config-sync 请求(执行方视角)。
+func (c *Client) handleInboundConfigSync(msg protocol.Message) {
+	payload, _ := msg.Payload.(map[string]interface{})
+	req := protocol.ConfigSyncRequest{
+		WatchID: toString(payload["watch_id"]),
+		Payload: toString(payload["payload"]),
+	}
+
+	c.configSyncM.RLock()
+	h := c.configSyncHandler
+	c.configSyncM.RUnlock()
+
+	sess := &ConfigSyncSession{client: c, requestID: msg.ID, req: req}
+	if h == nil {
+		_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: "config-sync executor not enabled"})
+		return
+	}
+	go h(sess)
+}
+
+// Done 收尾,返回最终 exit code 与结果。
+func (s *ConfigSyncSession) Done(resp protocol.ExecResponse) error {
+	return s.client.sendMessage(&protocol.Message{Type: protocol.MsgResponse, RequestID: s.requestID, ID: uuid.New().String(), Payload: resp})
 }
 
 // Write 写一行/一段增量输出。

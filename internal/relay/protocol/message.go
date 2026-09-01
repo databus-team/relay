@@ -25,6 +25,7 @@ const (
 	MsgExecOutput       MessageType = "exec_output"
 	MsgRegisterExecutor MessageType = "register_executor"
 	MsgPushJob          MessageType = "push_job"
+	MsgConfigSync       MessageType = "config_sync"
 	MsgVersion          MessageType = "version"
 )
 
@@ -160,6 +161,13 @@ type PushJobRequest struct {
 	Digest   string `json:"digest"` // sha256 十六进制,落盘后校验
 	StreamID string `json:"stream_id"`
 	Jobs     *bool  `json:"jobs,omitempty"` // nil/true=跑 jobs(默认);false=纯传输
+}
+
+// ConfigSyncRequest 流式 config-sync 载荷:把一份新配置(local 端 ExpandEnv 后、
+// base64 编码)发到远端执行方,由其校验+原子落盘到自身 config_path。单次应答。
+type ConfigSyncRequest struct {
+	WatchID string `json:"watch_id"`
+	Payload string `json:"payload"` // base64 编码的整份配置内容
 }
 
 // PushRequest 上传文件请求

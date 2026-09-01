@@ -62,10 +62,16 @@ type PushJobCapable interface {
 	SetPushJobHandler(h PushJobHandler)
 }
 
-// PushJobSender 可选接口:后端把文件直达远端执行方并触发 jobs(relay backend 实现);
+// PushJobSender 可选接口：后端把文件直达远端执行方并触发 jobs(relay backend 实现);
 // 无在线执行方时由中转兜底落地到暂存目录。
 type PushJobSender interface {
 	PushJob(ctx context.Context, relPath string, content []byte, on func(ExecChunk)) (int, error)
+}
+
+// ConfigSyncCapable 可选接口：后端支持经其原生通道(relay 为 WS 流式)把配置直接同步
+// 到执行方落盘。runSync 据此决定走流式还是退回通用文件命令交换。
+type ConfigSyncCapable interface {
+	ConfigSync(ctx context.Context, payload []byte) (int, error) // 返回执行方 apply 的 exit code
 }
 
 type BackendFactory func(config map[string]interface{}) (FileTransferBackend, error)
