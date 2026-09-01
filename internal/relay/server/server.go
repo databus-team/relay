@@ -41,6 +41,11 @@ type Server struct {
 	// pushRelay 记录被转发给执行方的流式 push(streamID → 执行方/请求方),用于把内容帧原样透传。
 	pushRelay   map[string]pushRelayInfo
 	pushRelayMu sync.RWMutex
+
+	// upgradeSwap 由接线方(如 cmd/relay)注入的「自升级换装」闭包:入参为已通过 sha256
+	// 校验与自检、落盘好的新二进制路径;闭包内做停旧/.prev 备份/替换/重启。仅为 nil 时
+	// (如测试)升级通道只回执 ACK 并清理暂存,不真实换装。
+	upgradeSwap func(newBin string)
 }
 
 // pushRelayInfo 一次被中转发出的流式 push 的路由信息。
@@ -160,6 +165,11 @@ func (s *Server) cleanupExpiredFiles() {
 			}
 		}
 	}
+}
+
+// SetUpgradeSwap 注入换装闭包(自检通过后执行停旧/.prev/换装/重启)。可为 nil。
+func (s *Server) SetUpgradeSwap(fn func(newBin string)) {
+	s.upgradeSwap = fn
 }
 
 func (s *Server) Serve(ctx context.Context) error {

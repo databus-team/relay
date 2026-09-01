@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/user/relay/internal/config"
+	"github.com/user/relay/internal/daemon"
 	"github.com/user/relay/internal/relay/server"
 	"gopkg.in/yaml.v3"
 )
@@ -217,6 +219,9 @@ func runServer() error {
 	if err != nil {
 		return fmt.Errorf("create server: %w", err)
 	}
+	// 接线「受控自升级」换装:自检/ACK 在 server 内完成,换装由这里注入(停旧 → .prev →
+	// 替换 → 原地重启)。未接线时升级通道只回执 ACK。
+	srv.SetUpgradeSwap(transitSelfUpgrade)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -238,4 +243,23 @@ func runServer() error {
 	}
 
 	return srv.Serve(ctx)
+}
+
+// transitSelfUpgrade 中转「受控自升级」换装闭包:入参为已通过 sha256 校验与自检、落盘好的
+// 新二进制路径。步骤:备份现行二进制为 `.prev` → 原子替换 → 用新二进制原地重启
+// (syscall.Exec 复用当前 argv,driver 替换进程镜像)。任一步失败保留 `.prev` 且不破坏运行中
+// 实例;不做自动回滚(左移人工兜底)。
+func transitSelfUpgrade(newBin string) {
+	exe, err := os.Executable()
+	if err != nil {
+		log.Printf("[upgrade] resolve own executable: %v", err)
+		return
+	}
+	if err := daemon.ReplaceBinaryWithKeep(exe, newBin); err != nil {
+		log.Printf("[upgrade] swap failed, .prev retained: %v", err)
+		return
+	}
+	if err := syscall.Exec(exe, os.Args, os.Environ()); err != nil {
+		log.Printf("[upgrade] in-place restart failed: %v", err)
+	}
 }

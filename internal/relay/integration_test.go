@@ -718,3 +718,72 @@ func TestIntegration_ServerUpgrade_ACK(t *testing.T) {
 		t.Fatalf("expected self-check pass + ACK, got error: %s", errMsg)
 	}
 }
+
+// TestIntegration_ServerUpgrade_Swap:自检通过并回执 ACK 后,换装闭包被以已校验二进制调用
+// (U3 换装链路:ACK 先行,随后换装收到同一二进制)。
+func TestIntegration_ServerUpgrade_Swap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds real relay binary")
+	}
+	watchDir := t.TempDir()
+
+	cfg := server.Config{
+		Addr: ":0",
+		WatchDirs: []server.WatchDirConfig{
+			{ID: "test-watch", Dir: watchDir},
+		},
+		Auth: server.AuthConfig{Type: "token", Tokens: []string{"test-token"}},
+	}
+	srv, err := server.New(cfg)
+	if err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+
+	var swapped []byte
+	var swapMu sync.Mutex
+	var swapCalled = make(chan struct{}, 1)
+	srv.SetUpgradeSwap(func(tmpBin string) {
+		b, _ := os.ReadFile(tmpBin)
+		swapMu.Lock()
+		swapped = b
+		swapMu.Unlock()
+		select {
+		case swapCalled <- struct{}{}:
+		default:
+		}
+	})
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/relay"
+
+	// 构建一份真实 relay 二进制作为「可启动」负载。
+	bin := filepath.Join(t.TempDir(), "relay-upgrade-test")
+	build := exec.Command("go", "build", "-o", bin, "github.com/user/relay/cmd/relay")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build relay for upgrade test: %v\n%s", err, out)
+	}
+	content, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatalf("read built binary: %v", err)
+	}
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+
+	ok, errMsg := upgradeOverWS(t, wsURL, "test-token", content, digest)
+	if !ok {
+		t.Fatalf("expected ACK, got error: %s", errMsg)
+	}
+
+	// 换装闭包应已以相同二进制被调用。
+	select {
+	case <-swapCalled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("swap hook was not invoked after successful ACK")
+	}
+	swapMu.Lock()
+	defer swapMu.Unlock()
+	if len(swapped) != len(content) || string(swapped) != string(content) {
+		t.Errorf("swap received a binary that differs from the one verified")
+	}
+}

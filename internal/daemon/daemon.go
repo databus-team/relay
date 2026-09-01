@@ -122,6 +122,56 @@ func replaceBinary(dst, src string) error {
 // ReplaceBinary 把新二进制原子替换到目标路径(通常为 os.Executable())。供 `upgrade` 使用。
 func ReplaceBinary(dst, src string) error { return replaceBinary(dst, src) }
 
+// BackupBinary 把 dst 现行二进制原子复制为 `<dst>.prev`,作为换装前的人工回退备件。
+// 现有 replaceBinary 只做 temp+rename、不产生旧文件备份,故 `.prev` 由本函数显式产生。
+func BackupBinary(dst string) error {
+	info, err := os.Stat(dst)
+	if err != nil {
+		return fmt.Errorf("stat current binary: %w", err)
+	}
+	if info.IsDir() || info.Size() == 0 {
+		return fmt.Errorf("current binary is empty or a directory")
+	}
+
+	prev := dst + ".prev"
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".relay-prev-*")
+	if err != nil {
+		return fmt.Errorf("create prev temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	in, err := os.Open(dst)
+	if err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("open current binary: %w", err)
+	}
+	_, copyErr := io.Copy(tmp, in)
+	in.Close()
+	tmp.Close()
+	if copyErr != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("copy prev: %w", copyErr)
+	}
+	if err := os.Chmod(tmpName, 0o755); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("chmod prev: %w", err)
+	}
+	if err := os.Rename(tmpName, prev); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("install prev: %w", err)
+	}
+	return nil
+}
+
+// ReplaceBinaryWithKeep 换装:先把现行 dst 备份为 `<dst>.prev`,再原子替换为新 src。
+// 备份在前:即使后续替换失败,`.prev` 也已保留,供人工回退(无自动回滚)。供中转/uLeU3 换装使用。
+func ReplaceBinaryWithKeep(dst, src string) error {
+	if err := BackupBinary(dst); err != nil {
+		return err
+	}
+	return replaceBinary(dst, src)
+}
+
 // Stop 读取 pid 文件,若存活则终止并移除 pid 文件;未运行返回错误。
 func Stop(pidFile string) error {
 	st := Get(pidFile)

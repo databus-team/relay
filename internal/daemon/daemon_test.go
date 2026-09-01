@@ -71,3 +71,56 @@ func TestReplaceBinaryRejectsDir(t *testing.T) {
 		t.Fatalf("expected dir-rejection error, got %v", err)
 	}
 }
+
+// U3-T1: 替换前已生成 `<exe>.prev`(含旧版本构建)。
+func TestReplaceBinaryWithKeep_CreatesPrev(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "relay")
+	os.WriteFile(dst, []byte("old-binary-v1"), 0o755)
+	src := filepath.Join(dir, "new")
+	os.WriteFile(src, []byte("new-binary-v2"), 0o644)
+
+	if err := ReplaceBinaryWithKeep(dst, src); err != nil {
+		t.Fatalf("ReplaceBinaryWithKeep: %v", err)
+	}
+
+	// 目标已更新。
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new-binary-v2" {
+		t.Fatalf("dst = %q, want new-binary-v2", got)
+	}
+
+	// `.prev` 保留旧版构建。
+	prev, err := os.ReadFile(dst + ".prev")
+	if err != nil {
+		t.Fatalf("read prev: %v", err)
+	}
+	if string(prev) != "old-binary-v1" {
+		t.Fatalf("prev = %q, want old-binary-v1", prev)
+	}
+}
+
+// U3-T2: 换装失败(替换源缺失)→ 不自动回滚,`.prev` 仍已保留。
+func TestReplaceBinaryWithKeep_Failed_KeepsPrev(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "relay")
+	os.WriteFile(dst, []byte("old-binary-v1"), 0o755)
+	missing := filepath.Join(dir, "does-not-exist")
+
+	// 备份应已发生(即使后面替换失败)。判断:替换失败返回错误,且 `.prev` 已落位。
+	if err := ReplaceBinaryWithKeep(dst, missing); err == nil {
+		t.Fatal("expected error replacing from missing source")
+	}
+
+	if _, err := os.Stat(dst + ".prev"); err != nil {
+		t.Fatalf("expected .prev backup to be created even on failed swap: %v", err)
+	}
+	// 现行二进制不受影响。
+	got, _ := os.ReadFile(dst)
+	if string(got) != "old-binary-v1" {
+		t.Fatalf("dst corrupted after failed swap: %q", got)
+	}
+}
