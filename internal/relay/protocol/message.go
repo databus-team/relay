@@ -27,6 +27,7 @@ const (
 	MsgPushJob          MessageType = "push_job"
 	MsgConfigSync       MessageType = "config_sync"
 	MsgVersion          MessageType = "version"
+	MsgServerUpgrade    MessageType = "server_upgrade"
 )
 
 // Message 是所有消息的通用包装
@@ -168,6 +169,17 @@ type PushJobRequest struct {
 type ConfigSyncRequest struct {
 	WatchID string `json:"watch_id"`
 	Payload string `json:"payload"` // base64 编码的整份配置内容
+}
+
+// ServerUpgradeRequest 服务器自升级请求:客户端把本地构建的新 relay 二进制经流式
+// 分块 + sha256 摘要交付给中转,由中转本地自检后可原子换装重启。仅由中转本地处理,
+// 绝不转发执行方。二进制内容不放入请求头,经 MsgStreamStart/MsgStreamData/MsgStreamEnd
+// 流式帧承载。
+type ServerUpgradeRequest struct {
+	WatchID  string `json:"watch_id"`
+	Size     int64  `json:"size"`
+	Digest   string `json:"digest"` // sha256 十六进制,落盘后校验
+	StreamID string `json:"stream_id"`
 }
 
 // PushRequest 上传文件请求
