@@ -25,6 +25,7 @@ const (
 	MsgExecOutput       MessageType = "exec_output"
 	MsgRegisterExecutor MessageType = "register_executor"
 	MsgPushJob          MessageType = "push_job"
+	MsgVersion          MessageType = "version"
 )
 
 // Message 是所有消息的通用包装
@@ -124,7 +125,27 @@ type ExecChunk struct {
 // RegisterExecutorRequest 向中转注册/注销某 watch 的 executor(远端执行方)。
 type RegisterExecutorRequest struct {
 	WatchID string `json:"watch_id"`
-	Action  string `json:"action"` // "add" / "remove"
+	Action  string `json:"action"`            // "add" / "remove"
+	Version string `json:"version,omitempty"` // 执行方 relay 构建版本(用于 relay version 对比)
+}
+
+// VersionInfo 描述部署中一个 relay 节点的构建信息,用于 `relay version` 跨机对比。
+type VersionInfo struct {
+	Role      string `json:"role"`               // "local"|"transit"|"executor"
+	WatchID   string `json:"watch_id,omitempty"` // executor 归属的 watch;其余角色为空
+	Version   string `json:"version"`
+	Commit    string `json:"commit,omitempty"`
+	BuildTime string `json:"build_time,omitempty"`
+	GOOS      string `json:"goos"`
+	GOARCH    string `json:"goarch"`
+	Go        string `json:"go"`
+}
+
+// VersionResponse 中转对 MsgVersion 的应答:本机(transit)构建信息 + 各在线执行方构建信息。
+type VersionResponse struct {
+	OK    bool          `json:"ok"`
+	Error string        `json:"error,omitempty"`
+	Nodes []VersionInfo `json:"nodes"`
 }
 
 // PushJobRequest push 一个文件直达远端执行方并在其本地跑 jobs。

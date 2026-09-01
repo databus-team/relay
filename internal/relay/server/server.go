@@ -30,8 +30,10 @@ type Server struct {
 	subMu sync.RWMutex
 
 	// executors 记录每个 watch 上注册的执行方客户端(远端 watcher)。
-	executors  map[string]string
-	executorMu sync.RWMutex
+	executors map[string]string
+	// executorVers 记录每个 watch 执行方的 relay 构建版本,供 relay version 对比。
+	executorVers map[string]string
+	executorMu   sync.RWMutex
 	// reqOwner 记录被转发的 exec 请求(reqID)归属的请求方客户端,用于把执行方回流帧转回去。
 	reqOwner map[string]string
 	reqMu    sync.RWMutex
@@ -74,17 +76,18 @@ type WatchDirConfig struct {
 
 func New(cfg Config) (*Server, error) {
 	s := &Server{
-		addr:      cfg.Addr,
-		watchDirs: make(map[string]string),
-		watchCfgs: cfg.WatchDirs,
-		clients:   make(map[string]*Client),
-		serverID:  "relay-" + uuid.New().String()[:8],
-		auth:      cfg.Auth,
-		tls:       cfg.TLS,
-		subs:      make(map[string]map[string]bool),
-		executors: make(map[string]string),
-		reqOwner:  make(map[string]string),
-		pushRelay: make(map[string]pushRelayInfo),
+		addr:         cfg.Addr,
+		watchDirs:    make(map[string]string),
+		watchCfgs:    cfg.WatchDirs,
+		clients:      make(map[string]*Client),
+		serverID:     "relay-" + uuid.New().String()[:8],
+		auth:         cfg.Auth,
+		tls:          cfg.TLS,
+		subs:         make(map[string]map[string]bool),
+		executors:    make(map[string]string),
+		executorVers: make(map[string]string),
+		reqOwner:     make(map[string]string),
+		pushRelay:    make(map[string]pushRelayInfo),
 	}
 
 	for _, wd := range cfg.WatchDirs {
@@ -327,11 +330,17 @@ func (s *Server) UnsubscribeAll(clientID string) {
 	}
 }
 
-// RegisterExecutor 将 clientID 注册为 watchID 的执行方。
-func (s *Server) RegisterExecutor(watchID, clientID string) {
+// RegisterExecutor 将 clientID 注册为 watchID 的执行方,并记录其 relay 构建版本。
+func (s *Server) RegisterExecutor(watchID, clientID, version string) {
 	s.executorMu.Lock()
 	defer s.executorMu.Unlock()
 	s.executors[watchID] = clientID
+	if version != "" {
+		s.executorVers[watchID] = version
+	} else {
+		// 旧版执行方不携带 version,清空以表示未知,避免与真实值混淆。
+		delete(s.executorVers, watchID)
+	}
 }
 
 // UnregisterExecutor 若 clientID 是 watchID 的执行方则移除。
@@ -340,7 +349,19 @@ func (s *Server) UnregisterExecutor(watchID, clientID string) {
 	defer s.executorMu.Unlock()
 	if s.executors[watchID] == clientID {
 		delete(s.executors, watchID)
+		delete(s.executorVers, watchID)
 	}
+}
+
+// ExecutorVersions 返回各 watch 在线执行方的构建版本(watchID → version)。
+func (s *Server) ExecutorVersions() map[string]string {
+	s.executorMu.RLock()
+	defer s.executorMu.RUnlock()
+	out := make(map[string]string, len(s.executorVers))
+	for k, v := range s.executorVers {
+		out[k] = v
+	}
+	return out
 }
 
 // GetExecutor 返回 watchID 对应执行方客户端 ID。
@@ -412,6 +433,7 @@ func (s *Server) cleanupClientState(clientID string) {
 	for watchID, e := range s.executors {
 		if e == clientID {
 			delete(s.executors, watchID)
+			delete(s.executorVers, watchID)
 		}
 	}
 	s.executorMu.Unlock()

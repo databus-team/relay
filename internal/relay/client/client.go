@@ -393,10 +393,11 @@ func (c *Client) failAllPending(reason string) {
 }
 
 // RegisterExecutor 向服务端注册(或注销,action="remove")本客户端为某 watch 的执行方。
-func (c *Client) RegisterExecutor(ctx context.Context, watchID, action string) error {
+func (c *Client) RegisterExecutor(ctx context.Context, watchID, action, buildVersion string) error {
 	resp, err := c.Request(ctx, protocol.MsgRegisterExecutor, protocol.RegisterExecutorRequest{
 		WatchID: watchID,
 		Action:  action,
+		Version: buildVersion,
 	})
 	if err != nil {
 		return err
@@ -405,6 +406,23 @@ func (c *Client) RegisterExecutor(ctx context.Context, watchID, action string) e
 		return fmt.Errorf("register executor failed: %s", resp.Error)
 	}
 	return nil
+}
+
+// Version 向中转查询版本台账:中转自身构建信息 + 各 watch 在线执行方版本,用于跨机对比。
+func (c *Client) Version(ctx context.Context) (protocol.VersionResponse, error) {
+	var vr protocol.VersionResponse
+	resp, err := c.Request(ctx, protocol.MsgVersion, nil)
+	if err != nil {
+		return vr, err
+	}
+	if !resp.OK {
+		return vr, fmt.Errorf("version query failed: %s", resp.Error)
+	}
+	data, _ := json.Marshal(resp.Payload)
+	if err := json.Unmarshal(data, &vr); err != nil {
+		return vr, fmt.Errorf("decode version response: %w", err)
+	}
+	return vr, nil
 }
 
 func (c *Client) Subscribe(ctx context.Context, watchID string) error {

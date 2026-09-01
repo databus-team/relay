@@ -7,12 +7,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/user/relay/internal/relay/protocol"
+	"github.com/user/relay/internal/version"
 )
 
 // Client 服务端客户端连接
@@ -124,6 +127,9 @@ func (c *Client) handleMessage(msg protocol.Message) {
 	case protocol.MsgRegisterExecutor:
 		c.handleRegisterExecutor(msg)
 
+	case protocol.MsgVersion:
+		c.handleVersion(msg)
+
 	case protocol.MsgPushJob:
 		c.handlePushJob(msg)
 
@@ -221,6 +227,7 @@ func (c *Client) handleRegisterExecutor(msg protocol.Message) {
 	payload, _ := msg.Payload.(map[string]interface{})
 	watchID := toString(payload["watch_id"])
 	action := toString(payload["action"])
+	version := toString(payload["version"])
 
 	if _, ok := c.server.GetWatchDir(watchID); !ok {
 		c.SendError(msg.ID, "unknown watch_id")
@@ -229,7 +236,7 @@ func (c *Client) handleRegisterExecutor(msg protocol.Message) {
 
 	switch action {
 	case "add", "":
-		c.server.RegisterExecutor(watchID, c.id)
+		c.server.RegisterExecutor(watchID, c.id, version)
 	case "remove":
 		c.server.UnregisterExecutor(watchID, c.id)
 	default:
@@ -237,6 +244,31 @@ func (c *Client) handleRegisterExecutor(msg protocol.Message) {
 		return
 	}
 	c.SendResponse(msg.ID, map[string]interface{}{"ok": true, "watch_id": watchID, "executor": c.id})
+}
+
+// handleVersion 回答版本查询:返回中转自身的构建信息 + 各 watch 在线执行方的构建版本。
+func (c *Client) handleVersion(msg protocol.Message) {
+	nodes := []protocol.VersionInfo{{
+		Role:      "transit",
+		Version:   version.Version,
+		Commit:    version.Commit,
+		BuildTime: version.Date,
+		GOOS:      runtime.GOOS,
+		GOARCH:    runtime.GOARCH,
+		Go:        runtime.Version(),
+	}}
+
+	for watchID, ver := range c.server.ExecutorVersions() {
+		nodes = append(nodes, protocol.VersionInfo{
+			Role:    "executor",
+			WatchID: watchID,
+			Version: ver,
+		})
+	}
+	// executor 按 watch 排序,便于对比。
+	sort.SliceStable(nodes[1:], func(i, j int) bool { return nodes[i+1].WatchID < nodes[j+1].WatchID })
+
+	c.SendResponse(msg.ID, protocol.VersionResponse{OK: true, Nodes: nodes})
 }
 
 // handlePushJob 处理流式 push-job 请求:有在线执行方则把元数据头转发给执行方,

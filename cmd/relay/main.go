@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -19,14 +20,14 @@ import (
 	"github.com/user/relay/internal/exchange"
 	"github.com/user/relay/internal/jobrunner"
 	"github.com/user/relay/internal/logx"
-	_ "github.com/user/relay/internal/relay/backend"
+	relaybackend "github.com/user/relay/internal/relay/backend"
+	"github.com/user/relay/internal/relay/protocol"
 	_ "github.com/user/relay/internal/relay/server"
+	"github.com/user/relay/internal/version"
 	"github.com/user/relay/internal/watcher"
 )
 
 var (
-	version = "1.0.0"
-
 	app = kingpin.New("relay", "Generic File Exchange Command Execution System")
 
 	_ = kingpin.CommandLine
@@ -88,6 +89,12 @@ var (
 	wsName    = wsCmd.Flag("name", "Show details for a specific workspace ID").String()
 	wsJSON    = wsCmd.Flag("json", "Output as JSON").Bool()
 	wsVerbose = wsCmd.Flag("verbose", "Show detailed table output").Short('v').Bool()
+
+	// Version command - 版本查看与跨机对比入口
+	versionCmd     = kingpin.Command("version", "Print relay build information; with -r, compare against transit + executors")
+	versionRemote  = versionCmd.Flag("remote", "Also query the transit server (+ executors) and report version match/mismatch vs local").Short('r').Bool()
+	versionWatch   = versionCmd.Flag("watch", "Limit remote comparison to a specific watch ID").Short('w').String()
+	versionJSONOut = versionCmd.Flag("json", "Output as JSON").Bool()
 )
 
 func main() {
@@ -167,6 +174,8 @@ func main() {
 		runSync()
 	case wsCmd.FullCommand():
 		runWorkspaces()
+	case versionCmd.FullCommand():
+		runVersion()
 	case jobRun.FullCommand():
 		runJobRun()
 	default:
@@ -846,6 +855,111 @@ func runPing() {
 	}
 	// 探活成功。relay 后端 Ping 忽略 watchID,输出上仍标注目标 workspace 便于区分。
 	fmt.Printf("OK — remote watcher %q reachable via %s (%s)\n", watchCfg.ID, cfg.Backend.Type, time.Since(start).Round(time.Millisecond))
+}
+
+// runVersion 打印本机构建信息;--remote 时向中转查询远程台账(中转 + 各执行方)并对比版本。
+func runVersion() {
+	local := version.String()
+
+	if *versionJSONOut {
+		rep := map[string]interface{}{
+			"local": map[string]interface{}{
+				"version": version.Version,
+				"commit":  version.Commit,
+				"build":   version.Date,
+				"goos":    runtime.GOOS,
+				"goarch":  runtime.GOARCH,
+				"go":      runtime.Version(),
+			},
+		}
+		if *versionRemote {
+			if vr, err := queryRemoteVersions(); err == nil {
+				rep["remote"] = vr.Nodes
+			}
+		}
+		enc, _ := json.MarshalIndent(rep, "", "  ")
+		fmt.Println(string(enc))
+		return
+	}
+
+	fmt.Printf("relay %s\n", version.Full())
+	fmt.Printf("  local  %s/%s  commit=%s  built=%s  go=%s\n",
+		runtime.GOOS, runtime.GOARCH, orDash(version.Commit), orDash(version.Date), runtime.Version())
+
+	if !*versionRemote {
+		fmt.Println("  (add -r to query the transit server and executors for comparison)")
+		return
+	}
+
+	vr, err := queryRemoteVersions()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: query remote versions: %v\n", err)
+		os.Exit(1)
+	}
+	if !vr.OK {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", vr.Error)
+		os.Exit(1)
+	}
+
+	fmt.Println("  remote:")
+
+	found := false
+	for _, n := range vr.Nodes {
+		if *versionWatch != "" && n.Role == "executor" && n.WatchID != *versionWatch {
+			continue
+		}
+		found = true
+		ident := n.Version
+		if n.Commit != "" {
+			ident = n.Version + "+" + n.Commit
+		}
+		status := "== local ok"
+		if ident != local {
+			status = "!! MISMATCH"
+		}
+		who := n.Role
+		detail := ""
+		if n.Role == "executor" {
+			detail = "watch=" + n.WatchID
+		} else {
+			detail = n.GOOS + "/" + n.GOARCH
+		}
+		fmt.Printf("    %-8s %-24s %-24s %s\n", who, detail, ident, status)
+	}
+	if !found {
+		fmt.Println("    (no nodes reported; is the transit server reachable?)")
+	}
+}
+
+// queryRemoteVersions 建立 relay 后端连接,向中转查询版本台账(中转 + 各执行方)。
+func queryRemoteVersions() (protocol.VersionResponse, error) {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return protocol.VersionResponse{}, fmt.Errorf("load config: %w", err)
+	}
+	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	if err != nil {
+		return protocol.VersionResponse{}, fmt.Errorf("create backend: %w", err)
+	}
+	rb, ok := b.(*relaybackend.RelayBackend)
+	if !ok {
+		return protocol.VersionResponse{}, fmt.Errorf("backend %q has no version query (relay backend only)", cfg.Backend.Type)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	vr, err := rb.Version(ctx)
+	if err != nil {
+		return vr, err
+	}
+	return vr, nil
+}
+
+// orDash 空串显示为 "-"。
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func runJobRun() {

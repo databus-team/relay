@@ -172,7 +172,7 @@ func registerExecutorClient(t *testing.T, wsURL string) *client.Client {
 			_ = sess.Done(protocol.ExecResponse{ExitCode: 0})
 		}()
 	})
-	if err := exec.RegisterExecutor(ctx, "test-watch", "add"); err != nil {
+	if err := exec.RegisterExecutor(ctx, "test-watch", "add", "test-build-1"); err != nil {
 		t.Fatalf("register executor: %v", err)
 	}
 	return exec
@@ -298,6 +298,50 @@ func TestIntegration_Ping(t *testing.T) {
 
 	if err := c.Ping(ctx); err != nil {
 		t.Fatalf("ping: %v", err)
+	}
+}
+
+// TestIntegration_Version:中转版本台账应含 transit 自身 + 已注册执行方。
+func TestIntegration_Version(t *testing.T) {
+	watchDir := t.TempDir()
+
+	ts, wsURL := setupTestServer(t, watchDir)
+	defer ts.Close()
+
+	exec := registerExecutorClient(t, wsURL)
+	defer exec.Disconnect()
+
+	ctx := context.Background()
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	vr, err := c.Version(ctx)
+	if err != nil {
+		t.Fatalf("version query: %v", err)
+	}
+	if !vr.OK {
+		t.Fatalf("version not OK: %s", vr.Error)
+	}
+
+	var hasTransit, hasExecutor bool
+	for _, n := range vr.Nodes {
+		switch n.Role {
+		case "transit":
+			hasTransit = true
+			if n.Version == "" || n.GOOS == "" {
+				t.Errorf("transit node missing version/goos: %+v", n)
+			}
+		case "executor":
+			if n.WatchID == "test-watch" && n.Version == "test-build-1" {
+				hasExecutor = true
+			}
+		}
+	}
+	if !hasTransit {
+		t.Error("version台账 should include a transit node")
+	}
+	if !hasExecutor {
+		t.Error("version台账 should include the registered executor for test-watch")
 	}
 }
 
