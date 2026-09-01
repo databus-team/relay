@@ -220,6 +220,39 @@ watch:
 
 The legacy standalone `server.yaml` (top-level `addr`/`watch`/`auth`/`tls`) is still accepted via `--server-config` for backward compatibility. Environment variables (`$VAR`, `${VAR}`) are expanded in all string values.
 
+### server-remote — One-Click Transit Upgrade
+
+Deploy a freshly built relay binary to the transit server over a **controlled self-upgrade**
+channel (no SSH, no manual code-server upload). The client streams the binary to the transit,
+which verifies the sha256 digest, self-checks that the binary can start, sends a success ACK,
+backups the running binary to `.prev`, atomically swaps, and restarts — then the client
+reconnects and polls `relay version -r` to confirm the transit now runs the new build.
+
+```bash
+# One-click: build a linux relay and deploy it to the transit server
+make deploy-transit
+
+# Or invoke the channel directly against a local binary
+relay server-remote --binary relay-linux -c ~/.relay/config.yaml
+```
+
+**Trust & availability:**
+
+- **Auth is a hard gate.** The channel is only available on an already-authenticated
+  (handshake-token) session, AND the server must explicitly configure an `auth.tokens`.
+  When no token is configured, the upgrade channel is **closed by default** — distinct from
+  the "no token ⇒ allow all" posture of the file channel. Token holders can swap+restart the
+  transit binary; this is a known, reviewed trust extension.
+- **Self-check before swap.** Digest mismatch or a binary that cannot start (`version`
+  subcommand fails) aborts without touching the running instance.
+- **No auto-rollback.** The pre-swap binary is kept as `<binary>.prev` for manual recovery.
+
+**Manual fallback (first-seed / SSH-unreachable):** to receive this message the transit must
+already run a build that recognizes it, so the very first transit seed is manual — upload the
+new `relay-linux` via code-server and run `relay server upgrade <path> -c $HOME/.relay/config.yaml`
+(or `relay server restart` to just reboot). On a failed upgrade, restore via `.prev` through the
+same manual path.
+
 ### ws — List Workspaces
 
 ```bash

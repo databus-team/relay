@@ -93,7 +93,30 @@ make test           # go test -v -race ./...
 make fmt            # go fmt ./...
 make vet            # go vet ./...
 make build-release  # Stripped, CGO_ENABLED=0
+make deploy-remote  # Auto-deliver new binary to remote executor (RESTART=1 to swap+restart)
+make deploy-transit # One-click transit server upgrade via controlled self-upgrade
 ```
+
+### Server self-upgrade protocol (`MsgServerUpgrade`)
+
+The transit box gets a **controlled self-upgrade** channel (`relay server-remote` /
+`make deploy-transit`) instead of assuming SSH/executor reachability. The client streams a
+locally-built relay binary; the transit (a) verifies the sha256 digest, (b) self-checks the
+binary with its `version` subcommand, (c) sends a success ACK *first*, then (d) swaps.
+Key invariants:
+
+| Concern | Rule |
+|---|---|
+| Auth | Only on token-authenticated sessions; server must set `auth.tokens` or the channel is **closed by default** |
+| Integrity | sha256 digest only — proves arrival == declared, not source authenticity |
+| Bootability | `version` subprocess self-check is a damage/not-startable guard, not authenticity |
+| Write surface | Lands only in a server-generated temp file (`/tmp/relay-upgrade-*`); never client-chosen paths |
+| Rollback | Pre-swap binary kept as `<binary>.prev`; **no auto-rollback** |
+
+Wiring: server exposes `SetUpgradeSwap(fn)`; `cmd/relay/server.go` injects
+`transitSelfUpgrade` (backup `.prev` → `daemon.ReplaceBinaryWithKeep` → re-exec). Client side:
+`Client.UpgradeServer` (exec.go) → `RelayBackend.UpgradeServer` → CLI `server-remote`.
+Deletion/digest-mismatch/self-check-fail paths abort before touching the running instance.
 
 ## internal/watcher/
 
