@@ -33,6 +33,47 @@ func (c *Client) unregisterInStream(reqID string) {
 	c.execMu.Unlock()
 }
 
+// streamChunkedContent 将 content 以 64KB 分块 + 压缩发帧给远端(与 PushJob/Transport/UpgradeServer
+// 共用同一块语义、同一摘要),并以 MsgStreamEnd 收尾。返回 nil 表示已完整调度发送。
+func (c *Client) streamChunkedContent(ctx context.Context, streamID string, total int64, digest string, content []byte) error {
+	chunkSize := protocol.DefaultChunkSize
+	var offset int64
+	chunk := 0
+	for offset < total {
+		end := offset + int64(chunkSize)
+		if end > total {
+			end = total
+		}
+		piece := content[offset:end]
+		dataMsg := &protocol.Message{
+			Type:     protocol.MsgStreamData,
+			ID:       uuid.New().String(),
+			StreamID: streamID,
+			Payload:  protocol.StreamData{StreamID: streamID, Offset: offset, Chunk: chunk},
+		}
+		select {
+		case c.sendCh <- sendMsg{Message: dataMsg, Raw: protocol.Compress(piece)}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		offset = end
+		chunk++
+	}
+
+	endMsg := &protocol.Message{
+		Type:     protocol.MsgStreamEnd,
+		ID:       uuid.New().String(),
+		StreamID: streamID,
+		Payload:  protocol.StreamEnd{StreamID: streamID, OK: true, Received: total, Digest: digest},
+	}
+	select {
+	case c.sendCh <- sendMsg{Message: endMsg}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return nil
+}
+
 // ExecRequest 是一次远程执行请求(请求方发出或被执行方收到)。
 type ExecRequest struct {
 	WatchID string
@@ -151,41 +192,9 @@ func (c *Client) UpgradeServer(ctx context.Context, content []byte) error {
 		return ctx.Err()
 	}
 
-	// 分块流式发送内容(压缩二进制帧),与 PushJob/Transport 块语义一致。
-	chunkSize := protocol.DefaultChunkSize
-	var offset int64
-	chunk := 0
-	for offset < total {
-		end := offset + int64(chunkSize)
-		if end > total {
-			end = total
-		}
-		piece := content[offset:end]
-		dataMsg := &protocol.Message{
-			Type:     protocol.MsgStreamData,
-			ID:       uuid.New().String(),
-			StreamID: streamID,
-			Payload:  protocol.StreamData{StreamID: streamID, Offset: offset, Chunk: chunk},
-		}
-		select {
-		case c.sendCh <- sendMsg{Message: dataMsg, Raw: protocol.Compress(piece)}:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-		offset = end
-		chunk++
-	}
-
-	endMsg := &protocol.Message{
-		Type:     protocol.MsgStreamEnd,
-		ID:       uuid.New().String(),
-		StreamID: streamID,
-		Payload:  protocol.StreamEnd{StreamID: streamID, OK: true, Received: total, Digest: digest},
-	}
-	select {
-	case c.sendCh <- sendMsg{Message: endMsg}:
-	case <-ctx.Done():
-		return ctx.Err()
+	// 分块流式发送内容(压缩二进制帧),复用与 PushJob/Transport 一致的块语义。
+	if err := c.streamChunkedContent(ctx, streamID, total, digest, content); err != nil {
+		return err
 	}
 
 	// 传输副作用以收尾 ACK(MsgResponse)为结算点;失败(摘要/自检不过)会经 MsgError 返回。
@@ -247,50 +256,9 @@ func (c *Client) PushJob(ctx context.Context, relPath string, content []byte, on
 		return nil, ctx.Err()
 	}
 
-	// 分块流式发送内容(压缩二进制帧),复用 Client.Push 的块语义。
-	chunkSize := protocol.DefaultChunkSize
-	var offset int64
-	chunk := 0
-	for offset < total {
-		end := offset + int64(chunkSize)
-		if end > total {
-			end = total
-		}
-		piece := content[offset:end]
-		dataMsg := &protocol.Message{
-			Type:     protocol.MsgStreamData,
-			ID:       uuid.New().String(),
-			StreamID: streamID,
-			Payload: protocol.StreamData{
-				StreamID: streamID,
-				Offset:   offset,
-				Chunk:    chunk,
-			},
-		}
-		select {
-		case c.sendCh <- sendMsg{Message: dataMsg, Raw: protocol.Compress(piece)}:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-		offset = end
-		chunk++
-	}
-
-	endMsg := &protocol.Message{
-		Type:     protocol.MsgStreamEnd,
-		ID:       uuid.New().String(),
-		StreamID: streamID,
-		Payload: protocol.StreamEnd{
-			StreamID: streamID,
-			OK:       true,
-			Received: total,
-			Digest:   digest,
-		},
-	}
-	select {
-	case c.sendCh <- sendMsg{Message: endMsg}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	// 分块流式发送内容(压缩二进制帧),复用经传与 PushJob 一致的块语义。
+	if err := c.streamChunkedContent(ctx, streamID, total, digest, content); err != nil {
+		return nil, err
 	}
 
 	// 传输副作用以收尾 MsgResponse 为结算点:执行方跑完 jobs(或中转暂存)后回执。
@@ -332,49 +300,8 @@ func (c *Client) Transport(ctx context.Context, targetWatch, dest string, conten
 		return nil, ctx.Err()
 	}
 
-	chunkSize := protocol.DefaultChunkSize
-	var offset int64
-	chunk := 0
-	for offset < total {
-		end := offset + int64(chunkSize)
-		if end > total {
-			end = total
-		}
-		piece := content[offset:end]
-		dataMsg := &protocol.Message{
-			Type:     protocol.MsgStreamData,
-			ID:       uuid.New().String(),
-			StreamID: streamID,
-			Payload: protocol.StreamData{
-				StreamID: streamID,
-				Offset:   offset,
-				Chunk:    chunk,
-			},
-		}
-		select {
-		case c.sendCh <- sendMsg{Message: dataMsg, Raw: protocol.Compress(piece)}:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-		offset = end
-		chunk++
-	}
-
-	endMsg := &protocol.Message{
-		Type:     protocol.MsgStreamEnd,
-		ID:       uuid.New().String(),
-		StreamID: streamID,
-		Payload: protocol.StreamEnd{
-			StreamID: streamID,
-			OK:       true,
-			Received: total,
-			Digest:   digest,
-		},
-	}
-	select {
-	case c.sendCh <- sendMsg{Message: endMsg}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	if err := c.streamChunkedContent(ctx, streamID, total, digest, content); err != nil {
+		return nil, err
 	}
 
 	return c.execRoundTrip(ctx, ch, func(protocol.ExecChunk) {})

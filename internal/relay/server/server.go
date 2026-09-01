@@ -46,6 +46,9 @@ type Server struct {
 	// 校验与自检、落盘好的新二进制路径;闭包内做停旧/.prev 备份/替换/重启。仅为 nil 时
 	// (如测试)升级通道只回执 ACK 并清理暂存,不真实换装。
 	upgradeSwap func(newBin string)
+	// upgradeMu 串行化换装:仅允许一条 upgrade 会话到达 ReplaceBinaryWithKeep + 重启,
+	// 防止两个并发 token 会话在同一 os.Executable 上竞争(双 Exec / .prev 竞争)。
+	upgradeMu sync.Mutex
 }
 
 // pushRelayInfo 一次被中转发出的流式 push 的路由信息。

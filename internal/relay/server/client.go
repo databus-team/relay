@@ -280,8 +280,9 @@ func (c *Client) handleServerUpgrade(msg protocol.Message) {
 		streamID: streamID,
 		path:     tmpBin,
 		tmpPath:  partPath,
+		maxSize:  req.Size, // 升级流上限:超量即中止,防 /tmp 被无限写满
 		onDone: func() {
-			c.finishServerUpgrade(reqID, tmpBin, req.Digest)
+			c.finishServerUpgrade(reqID, tmpBin, req.Digest, req.Size)
 		},
 	}
 	c.streamMu.Unlock()
@@ -289,14 +290,20 @@ func (c *Client) handleServerUpgrade(msg protocol.Message) {
 
 // finishServerUpgrade 流式收盘后在 onDone 上执行:sha256 摘要比对 → 本地自检 → 自检通过
 // 则先回执成功 ACK(此时换装尚未开始),随后由 swapServerUpgrade(U3) 接手停旧/备份/换装/重启。
-func (c *Client) finishServerUpgrade(reqID, tmpBin, expectedDigest string) {
+func (c *Client) finishServerUpgrade(reqID, tmpBin, expectedDigest string, expectedSize int64) {
+	// 0) 尺寸校验:落盘大小必须与请求声明一致(拦截截断或声明不符的残件)。
+	if info, err := os.Stat(tmpBin); err == nil && expectedSize > 0 && info.Size() != expectedSize {
+		os.Remove(tmpBin)
+		c.SendError(reqID, fmt.Sprintf("server upgrade: size mismatch: received %d != declared %d", info.Size(), expectedSize))
+		return
+	}
 	// 1) 摘要与请求声明比对;不一致即中止,不触碰现行二进制。
 	if err := verifyFileDigest(tmpBin, expectedDigest); err != nil {
 		os.Remove(tmpBin)
 		c.SendError(reqID, "server upgrade: digest mismatch: "+err.Error())
 		return
 	}
-	// 1.5) 落盘二进制需可执行才能做子进程自检;置 0755(不影响真相校验)。
+	// 1.5) 落盘二进制需可扩展为做子进程自检;置 0755(不影响真相校验)。
 	_ = os.Chmod(tmpBin, 0o755)
 	// 2) 自检:子进程 `version` 探测是否可启动(超时 10s)。语义上限为防损坏/防不可启动。
 	if err := selfCheckBinary(context.Background(), tmpBin); err != nil {
@@ -304,13 +311,15 @@ func (c *Client) finishServerUpgrade(reqID, tmpBin, expectedDigest string) {
 		c.SendError(reqID, "server upgrade: self-check failed: "+err.Error())
 		return
 	}
-	// 3) 自检通过 → 先回执成功 ACK(AE4):请求方以这里为成功结算点,随后才换装。
+	// 3) 自检通过 → 先回执成功 ACK(AE4):随后通过 setUpgradeMu 串行化换装。
 	_ = c.SendResponse(reqID, map[string]interface{}{"ok": true, "verified": true})
 
 	// 4) 换装:ACK 已在先,随后执行停旧 → .prev 备份 → 替换 → 重启(R6)。换装由接线
-	//    方(SetUpgradeSwap)注入;未接线(如测试)则仅清理暂存、不真实换装。
+	//    方(SetUpgradeSwap)注入;upgradeMu 保证一次只有一个升级到达换装(防并发双 Exec)。
 	if swap := c.server.upgradeSwap; swap != nil {
+		c.server.upgradeMu.Lock()
 		swap(tmpBin)
+		c.server.upgradeMu.Unlock()
 	} else {
 		os.Remove(tmpBin)
 	}
@@ -574,6 +583,12 @@ func (c *Client) handleStreamData(msg protocol.Message) {
 	stream.buf = append(stream.buf, chunkData...)
 	stream.received += int64(len(chunkData))
 
+	// 升级流上限:已超过声明大小即中止并清理,防身份合法客户端写满 /tmp。
+	if stream.maxSize > 0 && stream.received > stream.maxSize {
+		c.abortStream(msg.StreamID, stream, "received exceeds declared size")
+		return
+	}
+
 	if len(stream.buf) > 64*1024 {
 		os.MkdirAll(filepath.Dir(stream.tmpPath), 0755)
 		f, err := os.OpenFile(stream.tmpPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -583,6 +598,21 @@ func (c *Client) handleStreamData(msg protocol.Message) {
 		}
 		stream.buf = stream.buf[:0]
 	}
+}
+
+// abortStream 中止一条在途接收流:清理临时文件并移除登记,防止超量/损坏流留下孤儿 /tmp 文件。
+func (c *Client) abortStream(streamID string, stream *ReceiveStream, reason string) {
+	if stream != nil {
+		if stream.tmpPath != "" {
+			os.Remove(stream.tmpPath)
+		}
+		if stream.path != "" && stream.path != stream.tmpPath {
+			os.Remove(stream.path)
+		}
+	}
+	c.streamMu.Lock()
+	delete(c.streams, streamID)
+	c.streamMu.Unlock()
 }
 
 // handleStreamEnd 处理流结束
@@ -654,6 +684,8 @@ type ReceiveStream struct {
 	tmpPath  string
 	received int64
 	buf      []byte
+	// 升级流上限(0 = 不限制)。内容总量超过即中止,防 /tmp 被无限写满(post 仍受摘要门限)。
+	maxSize int64
 	// onDone 在流完整落盘(rename 成功)后触发;push-job 回退暂存用来自动回执。
 	onDone func()
 }

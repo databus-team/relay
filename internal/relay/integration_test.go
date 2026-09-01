@@ -654,13 +654,42 @@ func TestIntegration_ServerUpgrade_NoToken(t *testing.T) {
 	}
 }
 
-// TestIntegration_ServerUpgrade_DigestMismatch:摘要不符 → 中止(AE1)。
+// newSpySwapServer 建一个装有「换装 spy」的中转 server:换装一旦被调用就往 ch 里写。
+func newSpySwapServer(t *testing.T, watchDir string) (*httptest.Server, string, chan string) {
+	t.Helper()
+	cfg := server.Config{
+		Addr:      ":0",
+		WatchDirs: []server.WatchDirConfig{{ID: "test-watch", Dir: watchDir}},
+		Auth:      server.AuthConfig{Type: "token", Tokens: []string{"test-token"}},
+	}
+	srv, err := server.New(cfg)
+	if err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	spy := make(chan string, 1)
+	srv.SetUpgradeSwap(func(tmpBin string) { spy <- tmpBin })
+	ts := httptest.NewServer(srv)
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/relay"
+	return ts, wsURL, spy
+}
+
+// assertNoSwap 断言换装 spy 未被调用(校验/自检失败不得进入换装)。
+func assertNoSwap(t *testing.T, spy chan string) {
+	t.Helper()
+	select {
+	case <-spy:
+		t.Fatal("swap hook must NOT be invoked on this abort path")
+	default:
+	}
+}
+
+// TestIntegration_ServerUpgrade_DigestMismatch:摘要不符 → 中止且不换装(AE1)。
 func TestIntegration_ServerUpgrade_DigestMismatch(t *testing.T) {
 	watchDir := t.TempDir()
-	ts, wsURL := setupTestServer(t, watchDir)
+	ts, wsURL, spy := newSpySwapServer(t, watchDir)
 	defer ts.Close()
 
-	// 内容合法但用错误摘要声明。
+	// 内容允许但用错误摘要声明。
 	content := []byte("some-bytes")
 	ok, errMsg := upgradeOverWS(t, wsURL, "test-token", content, "0000000000000000000000000000000000000000000000000000000000000000")
 	if ok {
@@ -669,15 +698,16 @@ func TestIntegration_ServerUpgrade_DigestMismatch(t *testing.T) {
 	if !strings.Contains(errMsg, "digest") {
 		t.Errorf("unexpected error: %q", errMsg)
 	}
+	assertNoSwap(t, spy)
 }
 
 // TestIntegration_ServerUpgrade_SelfCheckFail:自检失败 → 不换装、保留现行二进制(AE2)。
 func TestIntegration_ServerUpgrade_SelfCheckFail(t *testing.T) {
 	watchDir := t.TempDir()
-	ts, wsURL := setupTestServer(t, watchDir)
+	ts, wsURL, spy := newSpySwapServer(t, watchDir)
 	defer ts.Close()
 
-	// 正确的摘要,但内容是不可启动的垃圾字节(bin 非可执行/不能以 version 启动)。
+	// 正确的摘要,但内容是不可启动的垃圾字节(bin 非可执行/不可用 version 启动)。
 	content := []byte("#!/bin/sh\nexit 3\n")
 	sum := sha256.Sum256(content)
 	digest := hex.EncodeToString(sum[:])
@@ -689,6 +719,7 @@ func TestIntegration_ServerUpgrade_SelfCheckFail(t *testing.T) {
 	if !strings.Contains(errMsg, "self-check") {
 		t.Errorf("unexpected error: %q", errMsg)
 	}
+	assertNoSwap(t, spy)
 }
 
 // TestIntegration_ServerUpgrade_ACK:自检通过 → 先回执成功 ACK(AE4,换装前 U2 结算)。
