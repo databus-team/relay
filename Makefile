@@ -9,7 +9,7 @@ GOTEST := $(GOCMD) test
 GOCLEAN := $(GOCMD) clean
 GOMOD := $(GOCMD) mod
 
-.PHONY: all build build-release build-linux build-windows build-debug test test-coverage clean install deps fmt vet run help
+.PHONY: all build build-release build-linux build-windows build-debug test test-coverage clean install deps fmt vet run deploy deploy-remote deploy-transit help
 
 all: build
 
@@ -89,9 +89,21 @@ push:
 exec:
 	./$(BINARY_NAME) exec -w <watch_id> <command>
 
+## deploy-remote: Auto-deliver new binary to remote executor via relay (RESTART=1 to swap+restart)
+deploy-remote:
+	./scripts/relay-deploy.sh remote
+
+## deploy-transit: Build linux binary + print manual code-server steps for the transit server
+deploy-transit:
+	./scripts/relay-deploy.sh transit
+
+## deploy: Both remote and transit
+deploy:
+	./scripts/relay-deploy.sh all
+
 ## help: Show this help
 help:
-	@grep -E '^[##]+' $< | head -20
+	@grep -E '^[##]+' $(MAKEFILE_LIST) | head -30
 	@echo ""
 	@echo "Usage:"
 	@echo "  make build          Build the binary"
@@ -104,4 +116,7 @@ help:
 	@echo "  make fmt            Format code"
 	@echo "  make vet            Run go vet"
 	@echo "  make run            Run in daemon mode"
+	@echo "  make deploy-remote    Auto-deliver to remote executor (RESTART=1 to swap+restart)"
+	@echo "  make deploy-transit   Build + print manual transit server steps"
+	@echo "  make deploy           Both above"
 	@echo "  make help           Show this help"
