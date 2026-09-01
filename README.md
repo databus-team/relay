@@ -271,10 +271,12 @@ registered for the watch, `relay exec` fails with `no executor registered for wa
 
 | File | Description |
 |------|-------------|
-| `config.example.relay.yaml` | Client config with native relay backend |
+| `config.example.relay.yaml` | Unified config (`server:` + relay backend + workspaces) shared by transit server, remote executor and local CLI |
 | `config.example.fs-mcp.relay.yaml` | Client config with MCP backend |
 | `config.example.jumpserver.relay.yaml` | Client config with JumpServer backend |
-| `server.example.yaml` | Server configuration |
+
+The relay server configuration (addr / watch_root / auth / tls) lives in the `server:` section of
+`config.example.relay.yaml` — one file drives all three ends. No separate `server.yaml` is needed.
 
 ## Config Structure
 
