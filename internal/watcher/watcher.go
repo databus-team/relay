@@ -18,6 +18,7 @@ import (
 	"github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/config"
 	"github.com/user/relay/internal/exchange"
+	"github.com/user/relay/internal/logx"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -127,14 +128,20 @@ func (w *Watcher) runEventDriven(ctx context.Context, eb backend.EventBackend) e
 				return fmt.Errorf("event channel closed")
 			}
 
+			logx.Debugf("watch: event received name=%q path=%q size=%d", fi.Name, fi.Path, fi.Size)
+
 			watchCfg := w.findWatchForEvent(fi)
 			if watchCfg == nil {
+				logx.Debugf("watch: dropped event %q (no workspace matches path %q)", fi.Name, fi.Path)
 				continue
 			}
 
 			if !w.matchAnyPattern(fi.Name, watchCfg.Paths) {
+				logx.Debugf("watch: dropped event %q (no path pattern match in workspace %s)", fi.Name, watchCfg.ID)
 				continue
 			}
+
+			logx.Debugf("watch: routed %q -> workspace %s", fi.Path, watchCfg.ID)
 
 			filePath := fi.Path
 			if filePath == "" {
@@ -155,6 +162,8 @@ func (w *Watcher) runEventDriven(ctx context.Context, eb backend.EventBackend) e
 				}
 				w.processed[filePath] = true
 				w.jobResults = make(map[string]bool)
+
+				log.Printf("[watch] processing %s (workspace %s)", filePath, watchCfg.ID)
 
 				b, err := w.createBackend(*watchCfg)
 				if err != nil {
@@ -293,19 +302,6 @@ func (w *Watcher) heartbeat(ctx context.Context) {
 			}
 		}
 	}
-}
-
-func (w *Watcher) RunOnce(ctx context.Context) error {
-	return w.runOnce(ctx)
-}
-
-func (w *Watcher) RunOnceForWatch(ctx context.Context, watchID string) error {
-	for _, watchCfg := range w.cfg.Watch {
-		if watchCfg.ID == watchID {
-			return w.processWatch(ctx, watchCfg)
-		}
-	}
-	return fmt.Errorf("watch not found: %s", watchID)
 }
 
 func (w *Watcher) runOnce(ctx context.Context) error {
@@ -712,17 +708,6 @@ func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, remo
 	}
 
 	return nil
-}
-
-func (w *Watcher) runLocalCommand(cmd, cwd string) error {
-	execCmd := exec.Command("sh", "-c", cmd)
-	if cwd != "" {
-		execCmd.Dir = cwd
-	}
-	execCmd.Stdout = log.Writer()
-	execCmd.Stderr = log.Writer()
-
-	return execCmd.Run()
 }
 
 func (w *Watcher) evaluateCondition(cond string) (bool, error) {

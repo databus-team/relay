@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"github.com/user/relay/internal/config"
 	"github.com/user/relay/internal/exchange"
 	"github.com/user/relay/internal/jobrunner"
+	"github.com/user/relay/internal/logx"
 	_ "github.com/user/relay/internal/relay/backend"
 	_ "github.com/user/relay/internal/relay/server"
 	"github.com/user/relay/internal/watcher"
@@ -79,8 +81,12 @@ var (
 func main() {
 	kingpin.CommandLine.HelpFlag.Short('h')
 
+	// 统一日志基座:timetamps + 可选 verbose。所有端点(server/watch/exec/...)
+	// 的 log/Info 级输出都带日期时间,便于审计;--debug 额外打开 verbose 详情。
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	if *debugFlag {
 		backend.SetDebug(true)
+		logx.SetDebug(true)
 	}
 
 	switch kingpin.Parse() {
@@ -724,7 +730,9 @@ func runCleanup() {
 	}
 
 	ctx := context.Background()
-	commandDir := "/commands"
+	// 与 exec/heartbeat/命令处理统一默认(见其它端点),否则 relay/fs-mcp 模式下
+	// cleanup 会去 /commands 扑空。
+	commandDir := "/tmp/relay-commands"
 	if dir, ok := cfg.Backend.Config["command_dir"].(string); ok {
 		commandDir = dir
 	}
