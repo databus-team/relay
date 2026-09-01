@@ -108,6 +108,20 @@ func TestMessageRoundTrip(t *testing.T) {
 			},
 		},
 		{
+			name: "server_upgrade",
+			msg: Message{
+				Type:     MsgServerUpgrade,
+				ID:       "sup-id",
+				StreamID: "stream-1",
+				Payload: ServerUpgradeRequest{
+					WatchID:  "watch-1",
+					Size:     4096,
+					Digest:   "abcdef0123456789",
+					StreamID: "stream-1",
+				},
+			},
+		},
+		{
 			name: "stream_start",
 			msg: Message{
 				Type:     MsgStreamStart,
@@ -186,6 +200,57 @@ func TestMessageRoundTrip(t *testing.T) {
 				t.Errorf("stream_id: got %q, want %q", got.StreamID, tt.msg.StreamID)
 			}
 		})
+	}
+}
+
+func TestServerUpgradeRequestRoundTrip(t *testing.T) {
+	in := ServerUpgradeRequest{
+		WatchID:  "watch-1",
+		Size:     4096,
+		Digest:   "abcdef0123456789",
+		StreamID: "stream-1",
+	}
+
+	msg := Message{Type: MsgServerUpgrade, ID: "sup-id", StreamID: in.StreamID, Payload: in}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got Message
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	raw, err := json.Marshal(got.Payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	var p ServerUpgradeRequest
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+
+	if p.WatchID != in.WatchID || p.Size != in.Size || p.Digest != in.Digest || p.StreamID != in.StreamID {
+		t.Errorf("payload mismatch: got %+v, want %+v", p, in)
+	}
+}
+
+func TestServerUpgradeRequestNullPayload(t *testing.T) {
+	var req ServerUpgradeRequest
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(data) == "" {
+		t.Fatal("marshaled null struct should not be empty")
+	}
+	var got ServerUpgradeRequest
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.WatchID != "" || got.Size != 0 || got.Digest != "" || got.StreamID != "" {
+		t.Errorf("zero-value mismatch: got %+v", got)
 	}
 }
 
