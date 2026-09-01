@@ -423,6 +423,14 @@ func (b *RelayBackend) writePushedFile(relPath, srcPath string) (string, error) 
 	if base == "" {
 		base = "."
 	}
+	// Windows 上把 MSYS 绝对路径("/d/foo")转成原生盘符路径,再做 Abs。
+	// 否则 filepath.Abs("/d/Group_Projects") 会解析成当前盘(C:)下的 \d\...,
+	// 把 push 内容写进错误的目录(此处必须与 writeTransportFile 的转换保持一致)。
+	if runtime.GOOS == "windows" {
+		if w := msysToWindowsPath(base); w != base {
+			base = w
+		}
+	}
 	absBase, err := filepath.Abs(base)
 	if err != nil {
 		return "", err
