@@ -63,9 +63,11 @@ var (
 	jobRunFile  = jobRun.Arg("file", "Local file to bind to {file_path} and friends").String()
 
 	// Exec command - command forwarding (requires watch running)
-	execCmd    = kingpin.Command("exec", "Forward command to remote backend")
-	execWatch  = execCmd.Flag("watch", "Target watch ID").Short('w').String()
-	execCmdStr = execCmd.Arg("command", "Command to execute").Required().String()
+	execCmd   = kingpin.Command("exec", "Forward command to remote backend")
+	execWatch = execCmd.Flag("watch", "Target watch ID").Short('w').String()
+	// 支持多词命令:relay exec git status 会收成 ["git","status"] 再空格 join。
+	// 含以 - 开头参数的命令(如 git log --oneline)仍须整体加引号,避免被当 flag。
+	execCmdStr = execCmd.Arg("command", "Command to execute (multiple words are joined)").Required().Strings()
 
 	// Ping command - check remote watcher liveness
 	pingCmd   = kingpin.Command("ping", "Ping the remote watcher to check if it is alive")
@@ -701,27 +703,24 @@ func runExec() {
 		commandDir = dir
 	}
 
-	// Health check: verify remote watcher is running
+	// 健康检查:失败才打印,成功静默(不再每次输出 "Checking remote watcher... OK")。
 	if w != "" {
 		watchCfg, err := cfg.GetWatchByID(w)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 			os.Exit(1)
 		}
-
-		fmt.Print("Checking remote watcher... ")
 		if err := b.Ping(ctx, commandDir, watchCfg.ID); err != nil {
-			fmt.Fprintf(os.Stderr, "\nError: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Remote watcher check failed: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("OK")
-	} else {
-		fmt.Println("Note: Specify -w to check remote watcher before exec")
 	}
+
+	cmd := strings.Join(*execCmdStr, " ")
 
 	// 支持流式的后端(relay)逐帧实时转发输出,并以 exit code 收尾
 	if eb, ok := b.(backend.ExecStreamBackend); ok {
-		exit, err := eb.ExecStream(ctx, *execCmdStr, execCwd, 0, func(chunk backend.ExecChunk) {
+		exit, err := eb.ExecStream(ctx, cmd, execCwd, 0, func(chunk backend.ExecChunk) {
 			if chunk.Stdout {
 				os.Stdout.WriteString(chunk.Data)
 			} else {
@@ -738,7 +737,7 @@ func runExec() {
 		return
 	}
 
-	result, err := b.Exec(ctx, *execCmdStr, execCwd, 0)
+	result, err := b.Exec(ctx, cmd, execCwd, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Exec error: %v\n", err)
 		os.Exit(1)
