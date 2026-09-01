@@ -198,6 +198,54 @@ func TestEndToEnd_PushJob(t *testing.T) {
 	}
 }
 
+// 端到端:请求方 PushNoJobs(转 transport 通道,Jobs=false)把内容纯下发到执行方绝对路径,
+// 不触发任何 workspace job(无 "[pushed ...]" 提示流),字节完全一致。
+func TestEndToEnd_PushNoJobs(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
+	watchDir := t.TempDir()
+	execRoot := t.TempDir()
+	ts, wsURL := newTestHub(t, watchDir)
+	defer ts.Close()
+	defer client.CloseAll()
+
+	ctx := context.Background()
+
+	// 执行方:注册为 executor,配 executor_dir。
+	if _, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-exe", "watch_id": "test", "executor": true, "executor_dir": execRoot,
+	}); err != nil {
+		t.Fatalf("executor backend: %v", err)
+	}
+
+	reqBackend, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+	tn, ok := reqBackend.(bk.PushNoJobsSender)
+	if !ok {
+		t.Fatalf("requester backend does not implement PushNoJobsSender")
+	}
+
+	dest := filepath.Join(execRoot, "sub", "relay.new")
+	exit, err := tn.PushNoJobs(ctx, dest, []byte("deploy blob\n"))
+	if err != nil {
+		t.Fatalf("push no-jobs: %v", err)
+	}
+	if exit != 0 {
+		t.Fatalf("push no-jobs exit: %d", exit)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("pushed binary not present: %v", err)
+	}
+	if string(got) != "deploy blob\n" {
+		t.Errorf("content: %q", string(got))
+	}
+}
+
 // 大文件流式直达:请求方 PushJob 分块流式把数 MB 二进制安全落盘到执行方,字节完全一致。
 func TestEndEndPushJobLarge(t *testing.T) {
 	SetExecutorRole(true)

@@ -277,6 +277,19 @@ func (b *RelayBackend) PushJob(ctx context.Context, relPath string, content []by
 	return resp.ExitCode, nil
 }
 
+// PushNoJobs 把内容纯下发到本 watch 执行方的 dest 绝对路径(Jobs=false 的 transport 通道),
+// 不触发任何 workspace job。对应 `relay push --no-jobs --dest <abs>`。
+func (b *RelayBackend) PushNoJobs(ctx context.Context, dest string, content []byte) (int, error) {
+	if err := b.ensureConnected(ctx); err != nil {
+		return 0, err
+	}
+	resp, err := b.client.Transport(ctx, b.watchID, dest, content)
+	if err != nil {
+		return 0, err
+	}
+	return resp.ExitCode, nil
+}
+
 // ConfigSync 请求方把新配置经中转直达执行方落盘(WS 流式通道,不写 command 文件)。
 func (b *RelayBackend) ConfigSync(ctx context.Context, payload []byte) (int, error) {
 	if err := b.ensureConnected(ctx); err != nil {
@@ -666,3 +679,6 @@ var _ backend.PushJobCapable = (*RelayBackend)(nil)
 
 // Ensure RelayBackend implements PushJobSender at compile time.
 var _ backend.PushJobSender = (*RelayBackend)(nil)
+
+// Ensure RelayBackend implements PushNoJobsSender at compile time.
+var _ backend.PushNoJobsSender = (*RelayBackend)(nil)
