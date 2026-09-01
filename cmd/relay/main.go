@@ -54,10 +54,10 @@ var (
 	listWatch = listCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
 
 	// Push command - upload files, optionally without running workspace jobs
-	pushCmd   = kingpin.Command("push", "Push file to remote (optionally run/wait workspace jobs)")
-	pushWatch = pushCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
-	pushSrc   = pushCmd.Arg("source", "Source file to push").Required().String()
-	pushDest  = pushCmd.Flag("dest", "Destination absolute path on the executor (defaults to <watch_dir>/<filename>; requires --no-jobs)").String()
+	pushCmd    = kingpin.Command("push", "Push file to remote (optionally run/wait workspace jobs)")
+	pushWatch  = pushCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
+	pushSrc    = pushCmd.Arg("source", "Source file to push").Required().String()
+	pushDest   = pushCmd.Flag("dest", "Destination absolute path on the executor (defaults to <watch_dir>/<filename>; requires --no-jobs)").String()
 	pushNoJobs = pushCmd.Flag("no-jobs", "Transfer only; do not run workspace jobs on the remote").Bool()
 
 	// Job command - run config-defined jobs locally
@@ -101,7 +101,7 @@ var (
 	// server-remote command - 一键部署中转(受控自升级):上传新二进制 → 中转自检 → 换装 → 核验。
 	serverRemoteCmd = kingpin.Command("server-remote", "一键部署中转:上传新 relay 二进制并经中转受控自升级,断线重连后核验版本")
 	serverRemoteBin = serverRemoteCmd.Flag("binary", "Path to the new relay binary to send (default: current executable)").String()
-	)
+)
 
 func main() {
 	kingpin.CommandLine.HelpFlag.Short('h')
