@@ -244,6 +244,7 @@ func currentPushJobsHandler() backend.PushJobHandler {
 // handleInboundPushJob 收到转发来的流式 push-job:把临时落盘内容搬进本地 executor 目录,
 // 再调用已注册的回调在远端跑该工作区的 jobs,并逐一 job 输出回流向请求方。
 func (b *RelayBackend) handleInboundPushJob(sess *client.PushJobSession) {
+	log.Printf("[push] receiving %s (watch=%s)", sess.RelPath, sess.WatchID)
 	src := sess.Temp.Name()
 	absPath, err := b.writePushedFile(sess.RelPath, src)
 	os.Remove(src) // 临时文件已在会话结束前消费完,清理
@@ -265,6 +266,7 @@ func (b *RelayBackend) handleInboundPushJob(sess *client.PushJobSession) {
 
 	out := func(ch backend.ExecChunk) { _ = sess.Write(ch.Stdout, ch.Data) }
 	exit := h(sess.WatchID, sess.AbsPath, out)
+	log.Printf("[push] done %s -> %s (exit=%d)", sess.RelPath, absPath, exit)
 	_ = sess.Done(protocol.ExecResponse{ExitCode: exit})
 }
 
@@ -309,18 +311,23 @@ func (b *RelayBackend) registerExecutor() {
 	defer cancel()
 	if err := b.client.RegisterExecutor(ctx, b.watchID, "add"); err != nil {
 		log.Printf("[relay] register executor for %s: %v", b.watchID, err)
+		return
 	}
+	log.Printf("[relay] registered as executor for watch %s", b.watchID)
 }
 
 // handleInboundExec 执行中转转发来的命令,并把输出流式写回,最后回 exit code。
 func (b *RelayBackend) handleInboundExec(sess *client.ExecSession) {
+	log.Printf("[exec] receiving cmd=%q cwd=%q timeout=%ds (watch=%s)", sess.Cmd(), sess.Cwd(), sess.Timeout(), sess.WatchID())
 	start := time.Now()
 	exit := runStream(sess.Cmd(), sess.Cwd(), sess.Timeout(), func(stdout bool, data string) {
 		_ = sess.Write(stdout, data)
 	})
+	dur := time.Since(start)
+	log.Printf("[exec] done exit=%d duration=%s (watch=%s)", exit, dur.Round(time.Millisecond), sess.WatchID())
 	_ = sess.Done(protocol.ExecResponse{
 		ExitCode: exit,
-		Duration: time.Since(start).Milliseconds(),
+		Duration: dur.Milliseconds(),
 	})
 }
 

@@ -375,10 +375,11 @@ type ExecSession struct {
 	seq       atomic.Int64
 }
 
-// Cmd / Cwd / Timeout 返回本次入站请求的命令、工作目录与超时秒数。
-func (e *ExecSession) Cmd() string  { return e.req.Cmd }
-func (e *ExecSession) Cwd() string  { return e.req.Cwd }
-func (e *ExecSession) Timeout() int { return e.req.Timeout }
+// Cmd / Cwd / Timeout / WatchID 返回本次入站请求的命令、工作目录、超时秒数与目标 watch。
+func (e *ExecSession) Cmd() string     { return e.req.Cmd }
+func (e *ExecSession) Cwd() string     { return e.req.Cwd }
+func (e *ExecSession) Timeout() int    { return e.req.Timeout }
+func (e *ExecSession) WatchID() string { return e.req.WatchID }
 
 // SetExecHandler 设置入站 exec 处理回调。设置后,该客户端成为可被中转转发 exec 的执行方。
 func (c *Client) SetExecHandler(fn func(*ExecSession)) {
