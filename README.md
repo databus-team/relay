@@ -6,7 +6,7 @@ A Go-based daemon for monitoring remote directories and executing actions when f
 
 ## Features
 
-- **Watch Mode**: Monitor remote directories, trigger exec/file_delete jobs on file pattern matches
+- **Watch Mode**: Monitor remote directories, trigger exec jobs on file pattern matches
 - **Event-Driven Mode**: Real-time file change events via WebSocket (relay backend) — no polling
 - **Multiple Paths**: One watch supports multiple file glob patterns
 - **Multiple Jobs**: Each watch supports a chain of jobs with conditional execution (`if: jobs.X.success/failure`)
@@ -52,14 +52,14 @@ watch:
     watch_dir: projects/web-app/patches
     local_dir: /path/to/local/repo
     paths: ["*.patch"]
+    auto_cleanup: true        # jobs 全部成功后自动删除中转 watch_dir 源文件
     jobs:
       - id: apply
         type: exec
         cmd: git am --3way {file_path}
-      - id: cleanup
-        type: file_delete
-        path: "{file_remote_path}"
-        if: jobs.apply.success
+      - id: cleanup_local
+        type: exec
+        cmd: rm -f {file_path}   # 删除类工作统一用 exec
 
   - id: web-app-deploy
     watch_dir: projects/web-app/deploy
@@ -153,7 +153,7 @@ relay job run apply ./my.patch            # infer workspace from cwd
 relay job run -w web-app-patches apply ../my.patch
 ```
 
-Manually runs a job defined under the workspace's `jobs` in config, on the local machine. The optional file argument is bound to the `{file_path}`, `{file_name}` and `{file_dir}` variables. `exec` jobs run locally (defaulting to the workspace's `local_dir`), `file_delete` jobs delete the given local file. Job `if` conditions are ignored for manual runs. A job that references a file variable but is invoked without a file — or that fails — exits non-zero.
+Manually runs a job defined under the workspace's `jobs` in config, on the local machine. The optional file argument is bound to the `{file_path}`, `{file_name}` and `{file_dir}` variables. `exec` jobs run locally (defaulting to the workspace's `local_dir`). Job `if` conditions are ignored for manual runs. A job that references a file variable but is invoked without a file — or that fails — exits non-zero.
 
 ### cleanup — Remove Stale Command Files
 
@@ -364,33 +364,25 @@ Execute a shell command when file is detected.
   timeout: 120  # optional, seconds
 ```
 
-### file_delete
+### Deletion is via `exec` (no dedicated `file_delete` type)
 
-Delete a file (default: the remote copy on the backend's `watch_dir`).
-
-```yaml
-- id: cleanup_remote
-  type: file_delete
-  target: remote        # optional; "remote" is the default. Deletes {file_remote_path} on the backend's watch_dir.
-  path: "{file_remote_path}"
-  if: jobs.apply.success
-```
-
-With `target: local` the job runs `os.Remove` on the local machine (using a
-locally-synced path such as `{file_path}`), so you can clean up both copies:
+Jobs only have an `exec` type. To delete files, run a deletion command through
+`exec` (use `rm -f` for idempotency — it won't error if the file is already
+gone):
 
 ```yaml
-- id: cleanup_remote
-  type: file_delete
-  target: remote
-  path: "{file_remote_path}"
-  if: jobs.apply.success
 - id: cleanup_local
-  type: file_delete
-  target: local
-  path: "{file_path}"
+  type: exec
+  cmd: rm -f {file_path}
   if: jobs.apply.success
 ```
+
+Two cleanup paths to be aware of:
+- **Local copy** (`{file_path}`, the copy synced into `local_dir`): delete it
+  with an `exec` job like above.
+- **Transit source file** (the file on the backend's `watch_dir`, addressed by
+  `{file_remote_path}`): handled automatically by `auto_cleanup: true`, which
+  deletes it once all jobs have succeeded. You do not need a delete job for it.
 
 ## Built-in Variables
 
@@ -404,17 +396,17 @@ locally-synced path such as `{file_path}`), so you can clean up both copies:
 
 When a file matches, the watcher first downloads it into `local_dir` (the
 backend is a pure file-transfer layer and never executes commands), then runs
-the `jobs`/`exec` actions locally on the machine running `relay watch`. Use
-a `file_delete` job with `path: "{file_remote_path}"` (default `target:
-remote`) to remove the remote copy, and `path: "{file_path}"` with
-`target: local` to remove the locally-synced copy.
+the `jobs`/`exec` actions locally on the machine running `relay watch`. Set
+`auto_cleanup: true` to have the watcher remove the remote (`{file_remote_path}`)
+copy after all jobs succeed; delete the locally-synced copy with an
+`exec` job such as `rm -f {file_path}`.
 
 ## Conditional Execution
 
 ```yaml
 - id: cleanup
-  type: file_delete
-  path: "{file_remote_path}"
+  type: exec
+  cmd: rm -f {file_path}
   if: jobs.apply.success  # only execute if 'apply' succeeded
 ```
 

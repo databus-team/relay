@@ -6,7 +6,7 @@
 
 ## OVERVIEW
 
-Go-based file exchange & remote command execution system. Monitors remote directories via pluggable backends, triggers exec/file_delete jobs on file pattern matches. Supports config hot-reload without restart.
+Go-based file exchange & remote command execution system. Monitors remote directories via pluggable backends, triggers exec jobs on file pattern matches. Supports config hot-reload without restart.
 
 Stack: Go 1.25, kingpin (CLI), MCP SDK, yaml.v3
 
