@@ -19,6 +19,7 @@ type Client struct {
 	watchID   string
 	headers   http.Header // WebSocket 握手携带的自定义头(中转前置鉴权)
 	conn      *websocket.Conn
+	connMu    sync.RWMutex // 保护 conn:持久的写循环在重连后会写新 conn
 	connected atomic.Bool
 
 	sendCh    chan sendMsg
@@ -99,7 +100,6 @@ func (c *Client) dial(ctx context.Context) error {
 		}
 		return fmt.Errorf("dial: %w", err)
 	}
-	c.conn = conn
 
 	connectReq := &protocol.Message{
 		Type: protocol.MsgConnect,
@@ -128,12 +128,25 @@ func (c *Client) dial(ctx context.Context) error {
 		return fmt.Errorf("unexpected message type: %s", resp.Type)
 	}
 
+	c.setConn(conn)
 	return nil
 }
 
+func (c *Client) setConn(conn *websocket.Conn) {
+	c.connMu.Lock()
+	c.conn = conn
+	c.connMu.Unlock()
+}
+
+func (c *Client) getConn() *websocket.Conn {
+	c.connMu.RLock()
+	defer c.connMu.RUnlock()
+	return c.conn
+}
+
 func (c *Client) Disconnect() error {
-	if c.conn != nil {
-		c.conn.Close()
+	if conn := c.getConn(); conn != nil {
+		conn.Close()
 	}
 	c.connected.Store(false)
 	return nil
@@ -144,8 +157,10 @@ func (c *Client) CloseCh() <-chan struct{} {
 }
 
 func (c *Client) readLoop() {
+	// 每个连接各有一个 readLoop,只读它自己被创建时绑定的 conn(重连后换新 conn/新 readLoop)。
+	conn := c.getConn()
 	for {
-		msgType, data, err := c.conn.ReadMessage()
+		msgType, data, err := conn.ReadMessage()
 		if err != nil {
 			c.connected.Store(false)
 			go c.reconnectLoop(context.Background())
@@ -162,7 +177,7 @@ func (c *Client) readLoop() {
 		}
 
 		if msg.Type == protocol.MsgStreamData {
-			binType, binData, err := c.conn.ReadMessage()
+			binType, binData, err := conn.ReadMessage()
 			if err != nil {
 				continue
 			}
@@ -184,12 +199,18 @@ func (c *Client) attachBinaryToStreamData(msg *protocol.Message, raw []byte) {
 }
 
 func (c *Client) writeLoop() {
+	// writeLoop 是单例(仅 Connect 启动一次),随 sendCh 常驻;每次写都取当前 conn,
+	// 重连后自动写新连接。绝不重复启动,否则两个 goroutine 并发写同一 conn 会 panic。
 	for sm := range c.sendCh {
-		if err := c.conn.WriteJSON(sm.Message); err != nil {
+		conn := c.getConn()
+		if conn == nil {
+			continue
+		}
+		if err := conn.WriteJSON(sm.Message); err != nil {
 			continue
 		}
 		if len(sm.Raw) > 0 {
-			if err := c.conn.WriteMessage(websocket.BinaryMessage, sm.Raw); err != nil {
+			if err := conn.WriteMessage(websocket.BinaryMessage, sm.Raw); err != nil {
 				continue
 			}
 		}
