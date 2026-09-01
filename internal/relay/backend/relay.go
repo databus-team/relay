@@ -389,6 +389,7 @@ func (b *RelayBackend) forwardEvents() {
 	for event := range b.client.EventCh() {
 		fi := backend.FileInfo{
 			Name:    event.Name,
+			Path:    event.Path,
 			IsDir:   false,
 			Size:    event.Size,
 			ModTime: formatModTime(event.ModTime),

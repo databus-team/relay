@@ -249,3 +249,34 @@ func TestApplyPendingConfigAtomic(t *testing.T) {
 		t.Errorf("config content: got %q, want %q", string(data), "new config")
 	}
 }
+
+// findWatchForEvent 按事件子路径路由到对应 workspace。
+func TestFindWatchForEventRoutesBySubdir(t *testing.T) {
+	w := &Watcher{cfg: &config.Config{Watch: []config.WatchConfig{
+		{ID: "backend", WatchDir: "databus_backend", Paths: []string{"*.patch"}},
+		{ID: "web", WatchDir: "databus_web", Paths: []string{"*.patch"}},
+		{ID: "test", WatchDir: "databus_backend", Paths: []string{"*.test"}}, // 与 backend 同目录,靠模式区分
+	}}}
+
+	cases := []struct {
+		path string // 事件相对根路径
+		want string // 期望命中 workspace ID;空表示不应命中
+	}{
+		{"databus_backend/a.patch", "backend"},
+		{"databus_backend/sub/b.patch", "backend"},
+		{"databus_web/a.patch", "web"},
+		{"databus_backend/c.test", "test"}, // 同子目录下由不同模式分流
+		{"databus-pilot/x.patch", ""},      // 不在任何已知子目录
+	}
+	for _, c := range cases {
+		fi := backend.FileInfo{Name: filepath.Base(c.path), Path: c.path}
+		got := w.findWatchForEvent(fi)
+		var gotID string
+		if got != nil {
+			gotID = got.ID
+		}
+		if gotID != c.want {
+			t.Errorf("path %q: got workspace %q, want %q", c.path, gotID, c.want)
+		}
+	}
+}

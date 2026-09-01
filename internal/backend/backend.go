@@ -13,6 +13,7 @@ var (
 
 type FileInfo struct {
 	Name    string
+	Path    string // 相对 backend watch 根的路径(事件驱动路由 workspace 用)
 	IsDir   bool
 	Size    int64
 	ModTime string

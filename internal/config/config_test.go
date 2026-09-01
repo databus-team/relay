@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 func TestLoadConfig(t *testing.T) {
@@ -60,5 +61,70 @@ interval_seconds: 60
 	}
 	if cfg.Watch[0].ID != "test" {
 		t.Errorf("Expected watcher id 'test', got '%s'", cfg.Watch[0].ID)
+	}
+}
+
+// 统一 config.yaml:含 server 段 + watch.ttl;server 段只是被解析出来,不破坏既有字段。
+func TestLoadUnifiedConfigWithServer(t *testing.T) {
+	data := []byte(`
+name: relay
+version: 2
+
+server:
+  addr: ":9443"
+  watch_root: /data/relay
+  auth:
+    tokens: ["tok-a", "tok-b"]
+  tls:
+    enabled: true
+    cert_file: /x/cert.pem
+    key_file: /x/key.pem
+
+backend:
+  type: relay
+  config:
+    url: "wss://t:8443/relay"
+    watch_id: patches
+
+watch:
+  - id: patches
+    watch_dir: app/patches
+    local_dir: /srv/repo
+    paths: ["*.patch"]
+    ttl: 30m
+    jobs:
+      - id: apply
+        type: exec
+        cmd: git am {file_path}
+`)
+	cfg, err := LoadFromBytes(data)
+	if err != nil {
+		t.Fatalf("LoadFromBytes: %v", err)
+	}
+
+	if cfg.Server == nil {
+		t.Fatalf("expected server section to be parsed")
+	}
+	if cfg.Server.Addr != ":9443" {
+		t.Errorf("server.addr: %q", cfg.Server.Addr)
+	}
+	if cfg.Server.WatchRoot != "/data/relay" {
+		t.Errorf("server.watch_root: %q", cfg.Server.WatchRoot)
+	}
+	if len(cfg.Server.Auth.Tokens) != 2 || cfg.Server.Auth.Tokens[0] != "tok-a" {
+		t.Errorf("server.auth.tokens: %v", cfg.Server.Auth.Tokens)
+	}
+	if !cfg.Server.TLS.Enabled || cfg.Server.TLS.CertFile != "/x/cert.pem" {
+		t.Errorf("server.tls: %+v", cfg.Server.TLS)
+	}
+
+	if len(cfg.Watch) != 1 {
+		t.Fatalf("watches: %d", len(cfg.Watch))
+	}
+	if cfg.Watch[0].TTL != 30*time.Minute {
+		t.Errorf("watch.ttl: %v (want 30m)", cfg.Watch[0].TTL)
+	}
+	if len(cfg.Watch[0].Jobs) != 1 {
+		t.Errorf("jobs: %d", len(cfg.Watch[0].Jobs))
 	}
 }

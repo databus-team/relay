@@ -1,5 +1,25 @@
 name: relay
-version: 1
+version: 2
+
+# One config shared by all three ends: transit (relay server), remote executor
+# (relay watch), and local CLI (relay push/exec). Only the relevant section is
+# used on each side; run `relay sync` to push a copy to the remote watcher.
+#
+#   relay server -c config.yaml   # transit reads the `server:` block
+#   relay watch  -c config.yaml   # remote executor reads backend+watch (+executor)
+#   relay push   -c config.yaml   # local CLI reads backend+watch
+#   relay sync   -c config.yaml   # ship this same file to the remote executor
+
+# --- transit server block (only relay server reads this) ---
+server:
+  addr: ":8443"
+  watch_root: /data/relay          # each watch.watch_dir below is relative to this
+  auth:
+    tokens: ["${RELAY_TOKEN}"]
+  tls:
+    enabled: false                # enable with cert_file/key_file for wss://
+    cert_file: ""
+    key_file: ""
 
 # Example: native relay backend
 # WebSocket-based relay server with streaming, compression, and event push
@@ -18,10 +38,10 @@ backend:
 
 watch:
   - id: web-app-patches
-    watch_dir: .                       # relative to server's watch dir root
+    watch_dir: .                       # relative to server's watch_root (server) and remote dir (client)
     local_dir: /path/to/local/repo
     paths: ["*.patch"]
-    # These jobs also run on the watcher (file arrives) and can be triggered
+    ttl: 30m                           # transit auto-deletes files older than 30m (server-side only)
     # manually on the local machine with:
     #   relay job run apply ./my.patch
     jobs:

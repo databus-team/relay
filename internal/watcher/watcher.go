@@ -136,7 +136,10 @@ func (w *Watcher) runEventDriven(ctx context.Context, eb backend.EventBackend) e
 				continue
 			}
 
-			filePath := watchCfg.WatchDir + "/" + fi.Name
+			filePath := fi.Path
+			if filePath == "" {
+				filePath = watchCfg.WatchDir + "/" + fi.Name
+			}
 
 			debounceMu.Lock()
 			if timer, exists := debounce[filePath]; exists {
@@ -185,11 +188,43 @@ func (w *Watcher) runEventDriven(ctx context.Context, eb backend.EventBackend) e
 	}
 }
 
+// findWatchForEvent 把事件路由到对应 workspace。匹配同时满足「子目录前缀 + 文件模式」:
+//   - 事件携带相对根路径时,仅命中 watch_dir 覆盖该子目录、且文件名匹配其 paths 的 workspace;
+//   - 同一子目录下的多个 workspace 靠不同文件模式区分(如 *.patch 与 *.test 同目录);
+//   - 未携带子路径(兼容旧后端)回退到首个文件名匹配的 workspace。
+//
+// 无匹配返回 nil(事件被丢弃)。
 func (w *Watcher) findWatchForEvent(fi backend.FileInfo) *config.WatchConfig {
+	rel := normalizeRelPath(fi.Path)
+	dir := path.Dir(rel)
+
+	var fallback *config.WatchConfig
 	for i := range w.cfg.Watch {
-		return &w.cfg.Watch[i]
+		wc := &w.cfg.Watch[i]
+		if !w.matchAnyPattern(fi.Name, wc.Paths) {
+			continue
+		}
+		if rel != "" {
+			watchDir := strings.TrimSuffix(normalizeRelPath(wc.WatchDir), "/")
+			if watchDir == "" || watchDir == "." {
+				continue
+			}
+			if dir == watchDir || strings.HasPrefix(dir, watchDir+"/") {
+				return wc
+			}
+		} else if fallback == nil {
+			fallback = wc
+		}
 	}
-	return nil
+	return fallback
+}
+
+// normalizeRelPath 统一替换分隔符为 "/"(服务器与本地 OS 可能不同)。
+func normalizeRelPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	return path.Clean(strings.ReplaceAll(p, "\\", "/"))
 }
 
 func (w *Watcher) processCommandsLoop(ctx context.Context) {
