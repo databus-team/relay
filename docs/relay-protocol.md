@@ -108,6 +108,7 @@ const (
     MsgExec         MessageType = "exec"
     MsgDelete       MessageType = "delete"
     MsgSubscribe    MessageType = "subscribe"
+    MsgServerUpgrade MessageType = "server_upgrade" // 中转「受控自升级」(仅中转本地处理)
 
     // 响应
     MsgResponse     MessageType = "response"
@@ -344,7 +345,50 @@ type StreamEnd struct {
 }
 ```
 
-### 4.6 请求超时
+### 4.6 服务器自升级（中转「受控自升级」）
+
+中转盒作为一个「只文件交换、绝不本地执行」的节点，升级路径历来半自动（SSH 不可达、非
+executor，只能经 code-server 人工上传）。本消息为它的自升级开一条窄径：客户端把新构建的
+relay 二进制复用既有流式分块 + sha256 摘要交付，**仅由中转本地处理**，完成「自检 → 回执
+→ 换装」；不授予任意命令执行能力。
+
+```go
+// Client → Server: 服务器自升级请求(元数据头;二进制内容走流式 MsgStreamData/MsgStreamEnd)
+type ServerUpgradeRequest struct {
+    WatchID  string `json:"watch_id"`   // 归属 watch(信息性)
+    Size     int64  `json:"size"`       // 二进制字节数
+    Digest   string `json:"digest"`     // sha256 十六进制,落盘后校验
+    StreamID string `json:"stream_id"`  // 本升级流 ID
+}
+```
+
+**触发流程**
+
+```
+本地 CLI  中转 server              换装(daemon)
+  │────── MsgServerUpgrade(头+流式二进制+摘要)────▶│
+  │         │ sha256 校验 → 自检(子进程 `version`)
+  │         │ 自检通过
+  │◀────────│─ 回执 ACK(先回执,再换装)
+  │         │ daemon.Stop → 备份 .prev → ReplaceBinary → Start
+  │         │ 原地重启
+  ‖  断线重连,轮询 `relay version -r` 核验新构建
+```
+
+**安全信任边界**
+
+| 项 | 说明 |
+|---|---|
+| 鉴权 | 仅在已过握手 token 的会话上可用;且服务端**显式配置 token 时通道才开启**,未配置 token 时**默认关闭**(与既有「无 token 即放行」的文件通道区分) |
+| 完整性 | sha256 摘要 + 流式传输只保证「到达内容 == 发方声明」,不建立来源真实性 |
+| 可启动性 | 换装前本地自检(子进程 `version`)仅防损坏/防不可启动;不做真实性/授权校验 |
+| 受影响面 | 只做「自我升级」一个动作;R1–R3 之外指令一律不落地;落盘仅为服务端生成的中转临时文件,不放开任意位置写盘 |
+| 回退 | 换装前把现行二进制备份为 `.prev`;失败保留 `.prev`,无自动回滚 |
+
+> 真实性与授权:摘要/自检不建立来源可信;「token 持有者可替换并重启中转二进制」是已知、
+> 已评审的信任扩展。如需更强保证,可在发布侧加签名(可选)。
+
+### 4.7 请求超时
 
 所有请求默认超时 30 秒，可在请求中覆盖：
 
