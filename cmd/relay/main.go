@@ -696,19 +696,21 @@ func runLocalJobsForPush(watchID, absPath string, out func(backend.ExecChunk)) i
 	}
 
 	ctx := context.Background()
-	exit := 0
-	for _, job := range watchCfg.Jobs {
-		res, rerr := jobrunner.Run(ctx, watchCfg, job.ID, absPath)
-		if res.Stdout != "" {
-			out(backend.ExecChunk{Stdout: true, Data: res.Stdout})
+	step := 0
+	exit := jobrunner.RunJobs(ctx, watchCfg, absPath, func(st jobrunner.Step) {
+		r := st.Result
+		if st.Running {
+			step++
+			out(backend.ExecChunk{Stdout: true, Data: fmt.Sprintf("[jobs %d/%d] ▶ %s (%s)\n", step, st.Total, r.JobID, r.Type)})
+			return
 		}
-		if res.Stderr != "" {
-			out(backend.ExecChunk{Stdout: false, Data: res.Stderr})
+		mark, okc := "✔", "ok"
+		if r.Err != nil {
+			mark, okc = "✘", "failed"
 		}
-		if rerr != nil {
-			exit = 1
-		}
-	}
+		dur := r.Duration.Round(time.Millisecond)
+		out(backend.ExecChunk{Stdout: r.Err == nil, Data: fmt.Sprintf("[jobs %d/%d] %s %s %s (exit=%d, %s)\n", step, st.Total, mark, r.JobID, okc, r.ExitCode, dur)})
+	})
 	return exit
 }
 
@@ -1042,11 +1044,13 @@ func runJobRun() {
 		os.Exit(1)
 	}
 
+	fmt.Printf("[job] ▶ %s (%s)\n", *jobRunID, jobTypeOf(watchCfg, *jobRunID))
 	res, err := jobrunner.Run(context.Background(), watchCfg, *jobRunID, *jobRunFile)
 	if err != nil {
 		// The error already carries the captured stderr (for exec failures), so
 		// print only the error and exit non-zero; res.Stderr would repeat it.
 		fmt.Fprintf(os.Stderr, "Job error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[job] ✘ %s failed\n", *jobRunID)
 		os.Exit(1)
 	}
 
@@ -1056,6 +1060,18 @@ func runJobRun() {
 	if res.Stderr != "" {
 		fmt.Fprint(os.Stderr, res.Stderr)
 	}
+	fmt.Printf("[job] ✔ %s ok (exit=%d, %s)\n", *jobRunID, res.ExitCode, res.Duration.Round(time.Millisecond))
+}
+
+// jobTypeOf 返回给定 workspace 内 jobID 的类型,便于 job run 回显 step 标记;
+// 找不到时返回空串(不影响正常执行输出)。
+func jobTypeOf(watchCfg *config.WatchConfig, jobID string) string {
+	for i := range watchCfg.Jobs {
+		if watchCfg.Jobs[i].ID == jobID {
+			return watchCfg.Jobs[i].Type
+		}
+	}
+	return ""
 }
 
 func pushFile(ctx context.Context, b backend.FileTransferBackend, src, dest string) {
