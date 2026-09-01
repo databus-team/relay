@@ -686,32 +686,8 @@ func (w *Watcher) executeJobs(ctx context.Context, jobs []config.JobConfig, remo
 			w.jobResults[job.ID] = true
 			log.Printf("Exec job %s completed: %s", job.ID, stdout)
 
-		case "file_delete":
-			delPath := SubstituteVariables(job.Path, vars)
-			delTarget := job.Target
-			if delTarget == "" {
-				delTarget = "remote"
-			}
-			var err error
-			if delTarget == "local" {
-				// Delete the locally-synced copy (see {file_path}/{file_remote_path}).
-				// A missing local file is a no-op, not an error: the sync or a prior
-				// job may have already removed it.
-				err = os.Remove(delPath)
-				if err != nil && os.IsNotExist(err) {
-					err = nil
-				}
-			} else {
-				// Default target is "remote": delete the file on the backend's
-				// watch_dir (the original source of the synced file).
-				err = b.Delete(ctx, delPath)
-			}
-			if err != nil {
-				w.jobResults[job.ID] = false
-				return fmt.Errorf("file_delete job %s failed: %w", job.ID, err)
-			}
-			w.jobResults[job.ID] = true
-			log.Printf("File delete job %s completed (target=%s): %s", job.ID, delTarget, delPath)
+		// 不再有 file_delete 专有类型:删除一律用 exec(如 `rm -f {file_path}`)。
+		// 中转 watch_dir 源文件在 jobs 全部成功后由 auto_cleanup 自动删除(b.Delete)。
 
 		default:
 			return fmt.Errorf("unknown job type: %s", job.Type)

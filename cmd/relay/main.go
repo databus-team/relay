@@ -555,7 +555,6 @@ func toWorkspaceJSON(w config.WatchConfig) workspaceJSON {
 			Type:     j.Type,
 			Cmd:      j.Cmd,
 			Cwd:      j.Cwd,
-			Path:     j.Path,
 			If:       j.If,
 			KeepFile: j.KeepFile,
 			Timeout:  j.Timeout,

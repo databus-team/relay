@@ -19,7 +19,6 @@ func baseWatch() *config.WatchConfig {
 		Jobs: []config.JobConfig{
 			{ID: "apply", Type: "exec", Cmd: "echo {file_path}"},
 			{ID: "status", Type: "exec", Cmd: "echo hello"},
-			{ID: "clean", Type: "file_delete", Path: "{file_path}"},
 			{ID: "pwd", Type: "exec", Cmd: "echo $PWD"},
 		},
 	}
@@ -75,44 +74,11 @@ func TestRun_ExecDefaultsToLocalDir(t *testing.T) {
 	}
 }
 
-func TestRun_FileDeleteHardcodedPathNeedsNoFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "stale.log")
-	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	watch := baseWatch()
-	watch.Jobs = []config.JobConfig{{ID: "purge", Type: "file_delete", Path: path}}
-	if _, err := Run(context.Background(), watch, "purge", ""); err != nil {
-		t.Fatalf("file_delete with a hardcoded path should not demand a file arg: %v", err)
-	}
-	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
-		t.Errorf("expected hardcoded-path file to be deleted, stat err = %v", statErr)
-	}
-}
-
 func TestRun_ExecNeedsFileWhenCwdReferencesFile(t *testing.T) {
 	watch := baseWatch()
 	watch.Jobs = []config.JobConfig{{ID: "go", Type: "exec", Cmd: "pwd", Cwd: "{file_dir}"}}
 	if _, err := Run(context.Background(), watch, "go", ""); err == nil {
 		t.Fatal("expected a file-required error for a job referencing a file var in cwd")
-	}
-}
-
-func TestRun_FileDeleteDeletesLocalFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "a.patch")
-	if err := os.WriteFile(path, []byte("patch"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err := Run(context.Background(), baseWatch(), "clean", path)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
-		t.Errorf("expected file to be deleted, stat err = %v", statErr)
 	}
 }
 
@@ -138,10 +104,10 @@ func TestRunJobs_EmitsStepProgressAndExitCode(t *testing.T) {
 	}
 
 	watch := baseWatch()
-	// apply(exec) -> clean(file_delete) -> then a failing exec step.
+	// apply(exec) -> clean(exec) -> then a failing exec step.
 	watch.Jobs = []config.JobConfig{
 		{ID: "apply", Type: "exec", Cmd: "echo {file_path}"},
-		{ID: "clean", Type: "file_delete", Path: "{file_path}"},
+		{ID: "clean", Type: "exec", Cmd: "echo cleaned"},
 		{ID: "boom", Type: "exec", Cmd: "exit 3"},
 	}
 
