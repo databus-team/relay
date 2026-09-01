@@ -255,12 +255,12 @@ func transitSelfUpgrade(newBin string) {
 		log.Printf("[upgrade] resolve own executable: %v", err)
 		return
 	}
+	// 换装失败也要清理暂存二进制(不留 0755 的 /tmp 灰烬);成功后同样清理再原地重启。
+	defer os.Remove(newBin)
 	if err := daemon.ReplaceBinaryWithKeep(exe, newBin); err != nil {
 		log.Printf("[upgrade] swap failed, .prev retained: %v", err)
 		return
 	}
-	// 换装完成即清理暂存二进制(无灰烬);随后原地重启，不保留 .tmp 文件。
-	os.Remove(newBin)
 	if err := syscall.Exec(exe, os.Args, os.Environ()); err != nil {
 		log.Printf("[upgrade] in-place restart failed: %v", err)
 	}
