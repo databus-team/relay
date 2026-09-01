@@ -345,6 +345,52 @@ func TestIntegration_Version(t *testing.T) {
 	}
 }
 
+// TestIntegration_Transport:纯下发(Jobs=false)应把内容写到执行端目标路径、不跑 job。
+func TestIntegration_Transport(t *testing.T) {
+	watchDir := t.TempDir()
+
+	ts, wsURL := setupTestServer(t, watchDir)
+	defer ts.Close()
+
+	// 执行方客户端:注册为 test-watch,并安装 push 处理器(Jobs=false 时把内容写到目标路径)。
+	exec := connectTestClient(t, wsURL)
+	exec.SetPushJobHandler(func(sess *client.PushJobSession) {
+		dest := sess.RelPath
+		os.MkdirAll(filepath.Dir(dest), 0o755)
+		content, _ := os.ReadFile(sess.Temp.Name())
+		if err := os.WriteFile(dest, content, 0o755); err != nil {
+			_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: err.Error()})
+			return
+		}
+		_ = sess.Done(protocol.ExecResponse{ExitCode: 0})
+	})
+	if err := exec.RegisterExecutor(context.Background(), "test-watch", "add", "tx-test"); err != nil {
+		t.Fatalf("register executor: %v", err)
+	}
+	defer exec.Disconnect()
+
+	ctx := context.Background()
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	dest := filepath.Join(t.TempDir(), "payload.bin")
+	content := []byte("transport-bytes-123")
+	resp, err := c.Transport(ctx, "test-watch", dest, content)
+	if err != nil {
+		t.Fatalf("transport: %v", err)
+	}
+	if resp.ExitCode != 0 {
+		t.Fatalf("transport exit=%d stderr=%s", resp.ExitCode, resp.Stderr)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read dest: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("dest content = %q, want %q", got, content)
+	}
+}
+
 func TestIntegration_Subscribe(t *testing.T) {
 	watchDir := t.TempDir()
 

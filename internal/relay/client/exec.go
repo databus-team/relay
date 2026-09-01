@@ -202,6 +202,98 @@ func (c *Client) PushJob(ctx context.Context, relPath string, content []byte, on
 	return c.execRoundTrip(ctx, ch, onChunk)
 }
 
+// Transport 将 content 以流式纯下发(targetWatch 上)写到执行端的绝对路径 dest,
+// 不触发任何 workspace job(Jobs=false)。返回执行的收尾响应。
+func (c *Client) Transport(ctx context.Context, targetWatch, dest string, content []byte) (*protocol.ExecResponse, error) {
+	if len(content) == 0 {
+		content = []byte{}
+	}
+
+	reqID := uuid.New().String()
+	streamID := uuid.New().String()
+
+	ch := make(chan *protocol.Message, 256)
+	c.execMu.Lock()
+	c.execStreams[reqID] = ch
+	c.execMu.Unlock()
+	defer func() {
+		c.execMu.Lock()
+		delete(c.execStreams, reqID)
+		c.execMu.Unlock()
+	}()
+
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+	total := int64(len(content))
+	jobs := false
+
+	header := &protocol.Message{
+		Type: protocol.MsgPushJob,
+		ID:   reqID,
+		Payload: protocol.PushJobRequest{
+			WatchID:  targetWatch,
+			RelPath:  dest,
+			Size:     total,
+			Digest:   digest,
+			StreamID: streamID,
+			Jobs:     &jobs,
+		},
+	}
+
+	select {
+	case c.sendCh <- sendMsg{Message: header}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	chunkSize := protocol.DefaultChunkSize
+	var offset int64
+	chunk := 0
+	for offset < total {
+		end := offset + int64(chunkSize)
+		if end > total {
+			end = total
+		}
+		piece := content[offset:end]
+		dataMsg := &protocol.Message{
+			Type:     protocol.MsgStreamData,
+			ID:       uuid.New().String(),
+			StreamID: streamID,
+			Payload: protocol.StreamData{
+				StreamID: streamID,
+				Offset:   offset,
+				Chunk:    chunk,
+			},
+		}
+		select {
+		case c.sendCh <- sendMsg{Message: dataMsg, Raw: protocol.Compress(piece)}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		offset = end
+		chunk++
+	}
+
+	endMsg := &protocol.Message{
+		Type:     protocol.MsgStreamEnd,
+		ID:       uuid.New().String(),
+		StreamID: streamID,
+		Payload: protocol.StreamEnd{
+			StreamID: streamID,
+			OK:       true,
+			Received: total,
+			Digest:   digest,
+		},
+	}
+	select {
+	case c.sendCh <- sendMsg{Message: endMsg}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	return c.execRoundTrip(ctx, ch, func(protocol.ExecChunk) {})
+}
+
 // PushJobSession 是一次入站 push-job(执行方视角)的写回句柄。
 // Temp 是流式内容落地的临时文件;执行方处理(writePushedFile)后把最终路径写回 AbsPath。
 type PushJobSession struct {
@@ -211,6 +303,7 @@ type PushJobSession struct {
 	RelPath   string
 	Temp      *os.File
 	AbsPath   string
+	Jobs      bool // true=跑 workspace jobs;false=纯传输(RelPath 为绝对落盘路径)
 	seq       atomic.Int64
 }
 
@@ -267,7 +360,9 @@ func (c *Client) handleInboundPushJob(msg protocol.Message) {
 		return
 	}
 
-	sess := &PushJobSession{client: c, requestID: msg.ID, WatchID: req.WatchID, RelPath: req.RelPath, Temp: tmp}
+	// Jobs 语义:未携带(nil)=跑 jobs;显式 false=纯传输(不跑 job,落盘后即完成)。
+	jobs := req.Jobs == nil || (req.Jobs != nil && *req.Jobs)
+	sess := &PushJobSession{client: c, requestID: msg.ID, WatchID: req.WatchID, RelPath: req.RelPath, Temp: tmp, Jobs: jobs}
 	pr := &inboundPushReceive{
 		streamID: req.StreamID,
 		stream:   sess,

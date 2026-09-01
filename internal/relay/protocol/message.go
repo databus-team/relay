@@ -148,15 +148,18 @@ type VersionResponse struct {
 	Nodes []VersionInfo `json:"nodes"`
 }
 
-// PushJobRequest push 一个文件直达远端执行方并在其本地跑 jobs。
+// PushJobRequest push 一个文件直达远端执行方。
 // 这是流式 push 的元数据头:文件内容分块走 MsgStreamData(二进制)/MsgStreamEnd。
+// 默认(Jobs=true)会触发所在 workspace 的 jobs;Jobs=false 时是纯下发传输,执行方
+// 把内容原子写到 RelPath(可为绝对路径,用于部署二进制等)即完成,不跑任何 job。
 type PushJobRequest struct {
 	WatchID  string `json:"watch_id"`
-	RelPath  string `json:"rel_path"` // 相对执行方项目根的路径
+	RelPath  string `json:"rel_path"` // 落盘目标:相对执行方项目根,或 Jobs=false 时的绝对路径
 	Mode     uint32 `json:"mode"`
 	Size     int64  `json:"size"`
 	Digest   string `json:"digest"` // sha256 十六进制,落盘后校验
 	StreamID string `json:"stream_id"`
+	Jobs     *bool  `json:"jobs,omitempty"` // nil/true=跑 jobs(默认);false=纯传输
 }
 
 // PushRequest 上传文件请求
