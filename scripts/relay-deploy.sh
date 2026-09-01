@@ -113,12 +113,17 @@ restart_binary() {
   read -r -d '' RCMD <<EOF || true
 STG='$st'
 DEST='$dest'
-# detached: 先返回本 exec 响应,3s 后停->换->起
+# detached: 先返回本 exec 响应,3s 后停旧->换->起
 ( sleep 3
   [ -z "\$DEST" ] && DEST="\$(command -v relay)"; [ -n "\$DEST" ] || DEST="\$HOME/.local/bin/relay"
-  for p in \$(ps -eo pid=,args= 2>/dev/null | grep '[r]elay watch' | awk '{print \$1}'); do
-    kill -9 "\$p" 2>/dev/null || true
-  done
+  # 平台相关的可靠终止:Windows 用 taskkill 按镜像名清掉所有 relay(msys kill 常失效);
+  # POSIX 用 pkill。确保不留堆叠的旧 daemon / 控制台窗口。
+  # 注意:MSYS_NO_PATHCONV=1 下必须用单斜杠 /F,双斜杠 //F 会给 system32 的 taskkill(解析不了)。
+  case "\$(uname -s 2>/dev/null)" in
+    *MINGW*|*MSYS*|*CYGWIN*) MSYS_NO_PATHCONV=1 taskkill /F /IM relay.exe >/dev/null 2>&1 || true ;;
+    *) pkill -9 -f 'relay watch' 2>/dev/null || true ;;
+  esac
+  sleep 1
   mv -f "\$STG" "\$DEST" && chmod +x "\$DEST"
   nohup "\$DEST" watch -c "\$HOME/.relay/config.yaml" >>"\$HOME/.relay/relay.log" 2>&1 &
   echo "restarted \$DEST"
