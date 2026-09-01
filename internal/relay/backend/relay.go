@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/user/relay/internal/backend"
+	"github.com/user/relay/internal/logx"
 	"github.com/user/relay/internal/relay/client"
 	"github.com/user/relay/internal/relay/protocol"
 	"github.com/user/relay/internal/version"
@@ -29,6 +30,11 @@ type RelayBackend struct {
 	execDir    string // push 落地根目录(执行方);空则用进程当前目录
 	eventCh    chan backend.FileInfo
 	mu         sync.RWMutex
+
+	// 注册成功日志只打一次(重连会反复 registerExecutor,信息本身每次都要发,
+	// 但成功提示按需降级为 debug,避免刷屏)。
+	regMu     sync.Mutex
+	regLogged bool
 }
 
 // 执行方共享处理器(进程级):多个 RelayBackend 实例会共享同一 pooled client,
@@ -314,7 +320,17 @@ func (b *RelayBackend) registerExecutor() {
 		log.Printf("[relay] register executor for %s: %v", b.watchID, err)
 		return
 	}
-	log.Printf("[relay] registered as executor for watch %s", b.watchID)
+
+	// 成功提示仅启动时打印一次;重连导致的重复注册以 debug 级别输出。
+	b.regMu.Lock()
+	first := !b.regLogged
+	b.regLogged = true
+	b.regMu.Unlock()
+	if first {
+		log.Printf("[relay] registered as executor for watch %s", b.watchID)
+	} else {
+		logx.Debugf("[relay] re-registered as executor for watch %s", b.watchID)
+	}
 }
 
 // handleInboundExec 执行中转转发来的命令,并把输出流式写回,最后回 exit code。
