@@ -247,3 +247,22 @@ func TestEndToEnd_ExecNoExecutor(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+func TestMsysToWindowsPath(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"/d/Group_Projects/databus_backend", `D:\Group_Projects\databus_backend`},
+		{"/d/foo", `D:\foo`},
+		{"/d", `D:\`},                              // 仅盘符根 -> D:\
+		{"/data/relay", `/data/relay`},             // 多字符盘名,不转换
+		{`D:\already\native`, `D:\already\native`}, // 已是原生,原样
+		{"relative/path", "relative/path"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := msysToWindowsPath(c.in); got != c.want {
+			t.Errorf("msysToWindowsPath(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

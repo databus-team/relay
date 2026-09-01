@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -323,6 +324,36 @@ func (b *RelayBackend) handleInboundExec(sess *client.ExecSession) {
 	})
 }
 
+// normalizeExecDir 把路径在转换成为原生存档形式供 chdir:
+// 在 Windows 上把 MSYS 风格 "/d/foo" 转成 "D:\foo",其余平台原样返回。
+func normalizeExecDir(dir string) string {
+	if runtime.GOOS != "windows" {
+		return dir
+	}
+	return msysToWindowsPath(dir)
+}
+
+// msysToWindowsPath 把 MSYS 风格 "/d/foo" 转成 Windows "D:\foo";非这种形式原样返回。
+// 独立函数便于跨平台单测。
+func msysToWindowsPath(dir string) string {
+	if len(dir) < 2 || dir[0] != '/' {
+		return dir
+	}
+	if !isAlphaByte(dir[1]) || (len(dir) > 2 && dir[2] != '/') {
+		return dir
+	}
+	drive := strings.ToUpper(string(dir[1]))
+	rest := dir[2:]
+	if rest == "" {
+		return drive + `:\` // "/d" -> "D:\"
+	}
+	return drive + ":" + strings.ReplaceAll(rest, "/", "\\")
+}
+
+func isAlphaByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
 // runStream 在本地 sh -c 执行命令,边跑边 emit 输出,返回 exit code(-1 表示超时/上下文取消)。
 func runStream(cmdStr, cwd string, timeout int, emit func(stdout bool, data string)) int {
 	if timeout <= 0 {
@@ -333,7 +364,9 @@ func runStream(cmdStr, cwd string, timeout int, emit func(stdout bool, data stri
 	defer cancel()
 
 	c := exec.CommandContext(ctx, "sh", "-c", cmdStr)
-	c.Dir = cwd
+	// cwd 可能来自远端/本机 client(config 里 MSYS 风格 /d/...)。执行方要用自己平台
+	// 能 chdir 的原生路径:在 Windows 上转成 D:\...。
+	c.Dir = normalizeExecDir(cwd)
 	c.Stdin = nil
 
 	stdoutPipe, err := c.StdoutPipe()
