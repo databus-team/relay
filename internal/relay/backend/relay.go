@@ -312,9 +312,6 @@ func (b *RelayBackend) enableExecutor() {
 	b.registerExecutor()
 }
 
-// ConfigSyncPath 回读执行方配置落盘目标(供部署/运维排查 r 用)。
-func (b *RelayBackend) ConfigSyncPath() string { return b.configPath }
-
 // handleInboundConfigSync 执行方收到流式 config-sync:解码、校验、原子落盘到自身
 // config_path,随后回执给请求方。复用 config.ApplyConfigFile 与文件命令交换同一份逻辑。
 func (b *RelayBackend) handleInboundConfigSync(sess *client.ConfigSyncSession) {
