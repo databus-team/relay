@@ -387,8 +387,11 @@ func runStream(cmdStr, cwd string, timeout int, emit func(stdout bool, data stri
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 	defer cancel()
 
-	c := exec.CommandContext(ctx, "sh", "-c", cmdStr)
-	// cwd 可能来自远端/本机 client(config 里 MSYS 风格 /d/...)。执行方要用自己平台
+	// shell 与 PATH 按平台解析(Windows 上加固 msys PATH,避免起子进程解析不到 sh/工具)。
+	shell, env := relayExecShell()
+	c := exec.CommandContext(ctx, shell, "-c", cmdStr)
+	c.Env = env
+	// cwd 可能来自远端/本地 client(config 里 MSYS 风格 /d/...)。执行方要用自己平台
 	// 能 chdir 的原生路径:在 Windows 上转成 D:\...。
 	c.Dir = normalizeExecDir(cwd)
 	c.Stdin = nil
