@@ -264,7 +264,7 @@ relay ws -w web-app   # details for a specific workspace
 
 ### status — Link Health & Version in One Shot
 
-One-shot check: `本地→中转→远程执行方` 三段时延(local→transit, transit→executor, 本地累计)+ 各端点版本台账,吸收原 `ping` 与 `version -r` 的职责于单一命令。
+One-shot check: `本地→中转→远程执行方` 三段时延(local→transit, transit→executor, 两段之和)+ 各端点版本台账,吸收原 `ping` 与 `version -r` 的职责于单一命令。每段报告的都是该跳的往返(RTT)耗时,`total` 是前两段 RTT 之和。
 
 ```sh
 relay status -w web-app          # three-segment latency + version ledger

@@ -387,7 +387,7 @@ func TestEndToEnd_Status(t *testing.T) {
 	}
 	rb := reqRaw.(*RelayBackend)
 
-	st, err := rb.Status(ctx)
+	st, err := rb.Status(ctx, "test")
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
@@ -433,7 +433,7 @@ func TestEndToEnd_Status_ExecutorOffline(t *testing.T) {
 	}
 	rb := reqRaw.(*RelayBackend)
 
-	st, err := rb.Status(ctx)
+	st, err := rb.Status(ctx, "test")
 	if err != nil {
 		t.Fatalf("status should succeed with executor offline: %v", err)
 	}
