@@ -27,6 +27,7 @@ const (
 	MsgPushJob          MessageType = "push_job"
 	MsgConfigSync       MessageType = "config_sync"
 	MsgVersion          MessageType = "version"
+	MsgStatus           MessageType = "status"
 	MsgServerUpgrade    MessageType = "server_upgrade"
 )
 
@@ -148,6 +149,27 @@ type VersionResponse struct {
 	OK    bool          `json:"ok"`
 	Error string        `json:"error,omitempty"`
 	Nodes []VersionInfo `json:"nodes"`
+}
+
+// StatusSegment 描述某一跳链路的单向时延。LatencyMS 为 nil 表示该段暂不可用
+// (例如远端执行方离线/未注册),Unavailable 给出断点原因,匹配 `relay status` 的降级语义。
+type StatusSegment struct {
+	LatencyMS   *int64 `json:"latency_ms,omitempty"` // nil = 该段不可用
+	Unavailable string `json:"unavailable,omitempty"`
+}
+
+// StatusResponse 中转对 MsgStatus 的应答,承接 `relay status` 的一站式连通性+版本台账。
+//   - Seg1:  本地→中转 单程时延(由请求方本地 `Ping` 计时,中转不填)
+//   - Seg2:  中转→执行方 单程时延(由中转探针测得;执行方离线/未注册时标不可用)
+//   - Total: Seg1 + Seg2 的本地单程累计(由请求方累加)
+//   - Nodes: 参与端点版本台账(中转 + 各在线执行方)
+type StatusResponse struct {
+	OK    bool           `json:"ok"`
+	Error string         `json:"error,omitempty"`
+	Seg1  StatusSegment  `json:"seg1"`
+	Seg2  StatusSegment  `json:"seg2"`
+	Total StatusSegment  `json:"total"`
+	Nodes []VersionInfo  `json:"nodes,omitempty"`
 }
 
 // PushJobRequest push 一个文件直达远端执行方。

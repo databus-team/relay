@@ -398,6 +398,31 @@ type RequestOptions struct {
 }
 ```
 
+### 4.8 连通性体检 (Client → Transit → Executor)
+
+`MsgStatus` 是 `relay status` 的底层载体:请求方(本地 CLI)向中转请求一段"本地→中转→执行方"的链路体检
+结果与参与端点版本台账。中转在收到后,用「待回包」协调表向指定 watch 的在线执行方发探针测
+`transit→executor` 段往返,并把测得延迟连同版本台账组装进 `StatusResponse` 回给请求方。
+
+```go
+type StatusSegment struct {
+    LatencyMS   *int64 `json:"latency_ms,omitempty"` // nil = 该段不可用
+    Unavailable string `json:"unavailable,omitempty"`
+}
+
+type StatusResponse struct {
+    OK    bool           `json:"ok"`
+    Error string         `json:"error,omitempty"`
+    Seg1  StatusSegment  `json:"seg1"`  // 本地→中转 单程(请求方本地 `Ping` 计时)
+    Seg2  StatusSegment  `json:"seg2"`  // 中转→执行方 单程(中转探针测得;离线/未注册=不可用)
+    Total StatusSegment  `json:"total"` // Seg1 + Seg2 本地单程累计
+    Nodes []VersionInfo  `json:"nodes,omitempty"` // 参与端点版本台账
+}
+```
+
+- 执行方离线/未注册时,`seg2.latency_ms` 为空、`seg2.unavailable` 注明断点原因,整条命令仍成功——语义是"中转在线、远端掉线"。
+- 旧 `ping` 的"本机→中转"心跳职责并入 `status`;`version` 收窄为纯本地构建信息,跨机版本台账由 `status` 承接。
+
 ---
 
 ## 5. 心跳与健康检测

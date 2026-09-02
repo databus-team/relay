@@ -236,6 +236,97 @@ func TestServerUpgradeRequestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStatusResponseRoundTrip(t *testing.T) {
+	lat := int64(42)
+	in := Message{
+		Type:      MsgStatus,
+		ID:        "status-id",
+		RequestID: "req-1",
+		Payload: StatusResponse{
+			OK: true,
+			Seg1: StatusSegment{
+				LatencyMS: &lat,
+			},
+			Seg2: StatusSegment{
+				Unavailable: "executor offline",
+			},
+			Total: StatusSegment{
+				LatencyMS: &lat,
+			},
+			Nodes: []VersionInfo{
+				{Role: "transit", Version: "1.0", GOOS: "linux", GOARCH: "amd64"},
+				{Role: "executor", WatchID: "watch-1", Version: "1.0", GOOS: "linux", GOARCH: "amd64"},
+			},
+		},
+	}
+
+	data, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got Message
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Type != MsgStatus {
+		t.Errorf("type: got %q, want %q", got.Type, MsgStatus)
+	}
+	if got.RequestID != "req-1" {
+		t.Errorf("request_id: got %q, want %q", got.RequestID, "req-1")
+	}
+
+	raw, err := json.Marshal(got.Payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	var p StatusResponse
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+
+	if !p.OK {
+		t.Error("ok: want true")
+	}
+	if p.Seg1.LatencyMS == nil || *p.Seg1.LatencyMS != lat {
+		t.Errorf("seg1.latency_ms: got %v, want %d", p.Seg1.LatencyMS, lat)
+	}
+	if p.Total.LatencyMS == nil || *p.Total.LatencyMS != lat {
+		t.Errorf("total.latency_ms: got %v, want %d", p.Total.LatencyMS, lat)
+	}
+	if p.Seg2.LatencyMS != nil {
+		t.Errorf("seg2.latency_ms: got %v, want nil (unavailable segment)", *p.Seg2.LatencyMS)
+	}
+	if p.Seg2.Unavailable != "executor offline" {
+		t.Errorf("seg2.unavailable: got %q, want %q", p.Seg2.Unavailable, "executor offline")
+	}
+	if len(p.Nodes) != 2 || p.Nodes[0].Role != "transit" {
+		t.Errorf("nodes mismatch: got %+v", p.Nodes)
+	}
+}
+
+func TestStatusSegmentNullLatencySerializesEmpty(t *testing.T) {
+	// 段不可用时 LatencyMS 为 nil:latency_ms 不应出现在 JSON 中(匹配 R2/AE2 "字段留空")。
+	seg := StatusSegment{Unavailable: "executor offline"}
+	data, err := json.Marshal(seg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("marshaled struct should not be empty")
+	}
+
+	var got map[string]interface{}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := got["latency_ms"]; ok {
+		t.Errorf("latency_ms should be absent when nil, got %+v", got)
+	}
+	if got["unavailable"] != "executor offline" {
+		t.Errorf("unavailable: got %v, want %q", got["unavailable"], "executor offline")
+	}
+}
+
 func TestServerUpgradeRequestNullPayload(t *testing.T) {
 	var req ServerUpgradeRequest
 	data, err := json.Marshal(req)
