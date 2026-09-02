@@ -417,6 +417,48 @@ func TestEndToEnd_Status(t *testing.T) {
 	}
 }
 
+// 端到端:status 探针目标取连接的 backend.config.watch_id,而非 CLI 的 `-w` 本地工作区 id。
+// 复现真实场景:多个 workspace 共享一根 relay 连接,`-w databus_backend` 这类本地 id 并非
+// 服务端 watch,不能原样透传(否则返回 unknown watch_id)。此处传一个与服务端 watch 不同的
+// 工作区 id("appB"),应仍探测到 watch "test" 的执行方,而不是失败。
+func TestEndToEnd_Status_ProbesBackendWatchNotCLIWorkspace(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
+	watchDir := t.TempDir()
+	ts, wsURL := newTestHub(t, watchDir)
+	defer ts.Close()
+	defer client.CloseAll()
+
+	ctx := context.Background()
+
+	if _, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-exe", "watch_id": "test", "watch_dir": ".", "executor": true,
+	}); err != nil {
+		t.Fatalf("executor backend: %v", err)
+	}
+
+	reqRaw, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+	rb := reqRaw.(*RelayBackend)
+
+	// CLI `-w` 传的是本地工作区 id(比如 databus_backend),服务端并不认识它;
+	// Status 应退而用连接的服务端 watch(config.watch_id="test")探活,而非把它当服务端 watch 直传。
+	st, err := rb.Status(ctx, "databus_workspace_not_a_server_watch")
+	if err != nil {
+		t.Fatalf("status should not fail on unknown watch_id: %v", err)
+	}
+	if st.Seg1.LatencyMS == nil {
+		t.Errorf("seg1 missing: %+v", st.Seg1)
+	}
+	if st.Seg2.LatencyMS == nil {
+		t.Errorf("seg2 should probe executor on backend watch: %+v", st.Seg2)
+	}
+}
+
 // 端到端:执行方离线时 status 段1 给出、段2 标不可用,仍成功(中转在线、远端掉线)。
 func TestEndToEnd_Status_ExecutorOffline(t *testing.T) {
 	watchDir := t.TempDir()

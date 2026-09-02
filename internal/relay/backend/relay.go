@@ -616,16 +616,18 @@ func (b *RelayBackend) Ping(ctx context.Context, commandDir, watchID string) err
 	return b.client.Ping(ctx)
 }
 
-// Status 返回中转让位于 watch 的一站式连通性快照:本地→中纪(段1,本地 Ping 计时)、
+// Status 返回中当前运行于某 watch 的一站式连通性快照:本地→中纪(段1,本地 Ping 计时)、
 // 中纪→执行方(段2,由中转探针测得)与 本地累计;并附各端点版本台账。
 // 执行方离线/探针超时 → 段2 为空(标不可用),命令仍成功;段2 不可用时累计跟着不可用。
-// watchID 为空时退回后端配置的 watch_id,从而 `relay status -w` 能实际选择被探活的执行方。
+//
+// 探针目的固定为本连接注册的服务端 watch (后端 config.watch_id):executor 正是经该 watch
+// 注册并接收转发(见 client.Connect 的 Subscribe),exec/push 也走它。而 CLI 的 `-w` 是
+// **本地工作区** id(多个 workspace 可共享一根 relay 连接),把它当服务端 watch 直传会得到
+// unknown watch_id。故发给中转的一律用 b.watchID;参数 `watchID` 仅作工作区标签,由上层
+// printStatus 展示,不参与探针寻址。
 func (b *RelayBackend) Status(ctx context.Context, watchID string) (protocol.StatusResponse, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return protocol.StatusResponse{}, err
-	}
-	if watchID == "" {
-		watchID = b.watchID
 	}
 
 	// 段1:本地→中转 → 本地 Ping 计时(往返 RTT)。
@@ -635,7 +637,7 @@ func (b *RelayBackend) Status(ctx context.Context, watchID string) (protocol.Sta
 	}
 	seg1 := time.Since(seg1Start).Milliseconds()
 
-	st, err := b.client.Status(ctx, watchID)
+	st, err := b.client.Status(ctx, b.watchID)
 	if err != nil {
 		return protocol.StatusResponse{}, err
 	}
