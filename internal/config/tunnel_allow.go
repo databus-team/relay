@@ -48,6 +48,8 @@ func (r *TunnelRule) matchesIP(ip net.IP) bool {
 }
 
 // ParseNetworkAllowlist 解析 network_allow 配置为可执行规则表。非法条目返回错误。
+// 对显式 @ 端口串做严格解析(fail-closed):带 @ 但解析不出任何合法端口 → 配置错误,绝不静默
+// 放宽成任意端口(空端口表 = 任意端口仅用于「无 @」的整机放行,不适用带 @ 的写法)。
 func ParseNetworkAllowlist(entries []string) ([]TunnelRule, error) {
 	var rules []TunnelRule
 	for _, e := range entries {
@@ -55,7 +57,10 @@ func ParseNetworkAllowlist(entries []string) ([]TunnelRule, error) {
 		if e == "" {
 			continue
 		}
-		host, ports := splitPortSpec(e)
+		host, hadAt, ports := splitPortSpec(e)
+		if hadAt && len(ports) == 0 {
+			return nil, fmt.Errorf("network_allow entry %q: invalid port list", e)
+		}
 		r, err := parseTunnelHost(host)
 		if err != nil {
 			return nil, fmt.Errorf("network_allow entry %q: %w", e, err)
@@ -66,14 +71,14 @@ func ParseNetworkAllowlist(entries []string) ([]TunnelRule, error) {
 	return rules, nil
 }
 
-// splitPortSpec 拆出 "host@ports",端口缺省(无 @)= 任意端口。用 @ 而非 ':' 作分隔,
-// 避免与 IPv6 字面量地址里的 ':' 冲突。
-func splitPortSpec(entry string) (host string, ports []int) {
+// splitPortSpec 拆出 "host@ports",返回是否带 @(用于「显式端口但解析不出 → 配置错误」的判定)。
+// 用 @ 而非 ':' 作分隔,避免与 IPv6 字面量地址里的 ':' 冲突。
+func splitPortSpec(entry string) (host string, hadAt bool, ports []int) {
 	if i := strings.LastIndex(entry, "@"); i >= 0 {
-		return strings.TrimSpace(entry[:i]), parsePortList(entry[i+1:])
+		return strings.TrimSpace(entry[:i]), true, parsePortList(entry[i+1:])
 	}
 	host = entry
-	return host, nil
+	return host, false, nil
 }
 
 // parsePortList 解析端口列表/范围:"443" -> [443];"80,443" -> [80,443];"8000-9000" -> 展开。

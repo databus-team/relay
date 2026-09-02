@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/config"
@@ -25,6 +26,9 @@ const (
 	socksRepSuccess = 0x00
 	socksRepFailure = 0x01
 	socksRepReject  = 0x07 // command not supported
+
+	// handshakeTimeout 本地 SOCKS5 握手上限:只连不发/半开连接在限定时间内结束。
+	handshakeTimeout = 10 * time.Second
 )
 
 // runTunnel 本地 SOCKS5 出网隧道:监听本地端口,把每个客户端 CONNECT 目标的访问经中转转发到
@@ -103,12 +107,16 @@ func runTunnel() {
 	}
 }
 
-// handleTunnelConn 处理一条本地 SOCKS5 连接:SOCKS5 握手解析目标 → TunnelOpen → 建连成功后
-// 双向字节泵(本地 SOCKS ↔ 远端 executor 的真实连接)。连接失败时仅向 SOCKS 回失败帧,不建内网流量。
+// handleTunnelConn 处理一条本地 SOCKS5 连接:SOCKS5 握手解 → TunnelOpen → 建连成功后
+// 双向字节泵(本地 SOCKS ↔ 远端 executor 的真实连接)。任一侧失败时仅向 SOCKS 回失败帧,不建内网流量。
 func handleTunnelConn(ctx context.Context, rb *relaybackend.RelayBackend, watchID string, soc net.Conn) {
 	defer soc.Close()
 
-	host, port, err := socks5Handshake(soc)
+	// 握手要有界:只连不发/半开的连接在限定时间内结束,不长期占用 fd/goroutine。
+	br := bufio.NewReader(soc)
+	_ = soc.SetDeadline(time.Now().Add(handshakeTimeout))
+	host, port, br, err := socks5Handshake(soc, br)
+	_ = soc.SetDeadline(time.Time{})
 	if err != nil {
 		if !errors.Is(err, io.EOF) {
 			socks5Reply(soc, socksRepFailure)
@@ -127,12 +135,13 @@ func handleTunnelConn(ctx context.Context, rb *relaybackend.RelayBackend, watchI
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	// 本地 SOCKS → 远端:读到字节即经隧道发往目标;断开/出错则端隧道。
+	// 本地 SOCKS → 远端:从与握手共享的 bufio.Reader 读,确保客户端随 CONNECT 管道化的首段
+	// 应用字节不被握手的内部缓冲吞噬;读到字节即经隧道发往目标;读完/出错→#5 端隧道。
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 32*1024)
 		for {
-			n, rerr := soc.Read(buf)
+			n, rerr := br.Read(buf)
 			if n > 0 {
 				if serr := stream.Send(buf[:n]); serr != nil {
 					break
@@ -161,36 +170,36 @@ func handleTunnelConn(ctx context.Context, rb *relaybackend.RelayBackend, watchI
 	wg.Wait()
 }
 
-// socks5Handshake 完成 RFC1928「无认证」握手并解析 CONNECT 目标,返回 (host, port)。
-func socks5Handshake(conn net.Conn) (string, uint16, error) {
-	br := bufio.NewReader(conn)
-
+// socks5Handshake 完成 RFC1928「无认证」握手并解析 CONNECT 目标,返回 (host, port, br)。
+// 传入复用同一 bufio.Reader(握手后由调用方继续从 br 读取应用字节,避免管道化数据被封存在
+// 握手的内部缓冲里被丢弃);回复中写入仍经原始 conn。
+func socks5Handshake(conn net.Conn, br *bufio.Reader) (string, uint16, *bufio.Reader, error) {
 	// 版本 + 认证方式协商
 	hdr := make([]byte, 2)
 	if _, err := io.ReadFull(br, hdr); err != nil {
-		return "", 0, err
+		return "", 0, br, err
 	}
 	if hdr[0] != socksVer5 {
-		return "", 0, fmt.Errorf("bad SOCKS version %d", hdr[0])
+		return "", 0, br, fmt.Errorf("bad SOCKS version %d", hdr[0])
 	}
 	methods := make([]byte, int(hdr[1]))
 	if _, err := io.ReadFull(br, methods); err != nil {
-		return "", 0, err
+		return "", 0, br, err
 	}
 	if _, err := conn.Write([]byte{socksVer5, 0x00}); err != nil { // 无认证
-		return "", 0, err
+		return "", 0, br, err
 	}
 
 	// CONNECT 请求
 	req := make([]byte, 4)
 	if _, err := io.ReadFull(br, req); err != nil {
-		return "", 0, err
+		return "", 0, br, err
 	}
 	if req[0] != socksVer5 {
-		return "", 0, fmt.Errorf("bad request version %d", req[0])
+		return "", 0, br, fmt.Errorf("bad request version %d", req[0])
 	}
 	if req[1] != socksCmdConnect {
-		return "", 0, errors.New("only CONNECT supported")
+		return "", 0, br, errors.New("only CONNECT supported")
 	}
 
 	var host string
@@ -198,34 +207,34 @@ func socks5Handshake(conn net.Conn) (string, uint16, error) {
 	case 0x01: // IPv4
 		ip := make([]byte, 4)
 		if _, err := io.ReadFull(br, ip); err != nil {
-			return "", 0, err
+			return "", 0, br, err
 		}
 		host = fmt.Sprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3])
 	case 0x04: // IPv6
 		ip := make([]byte, 16)
 		if _, err := io.ReadFull(br, ip); err != nil {
-			return "", 0, err
+			return "", 0, br, err
 		}
 		host = net.IP(ip).String()
 	case 0x03: // 域名
 		l := make([]byte, 1)
 		if _, err := io.ReadFull(br, l); err != nil {
-			return "", 0, err
+			return "", 0, br, err
 		}
 		domain := make([]byte, int(l[0]))
 		if _, err := io.ReadFull(br, domain); err != nil {
-			return "", 0, err
+			return "", 0, br, err
 		}
 		host = string(domain)
 	default:
-		return "", 0, fmt.Errorf("unsupported address type %d", req[3])
+		return "", 0, br, fmt.Errorf("unsupported address type %d", req[3])
 	}
 
 	portb := make([]byte, 2)
 	if _, err := io.ReadFull(br, portb); err != nil {
-		return "", 0, err
+		return "", 0, br, err
 	}
-	return host, binary.BigEndian.Uint16(portb), nil
+	return host, binary.BigEndian.Uint16(portb), br, nil
 }
 
 // socks5Reply 回写 SOCKS5 连接结果帧(REP)。

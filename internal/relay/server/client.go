@@ -450,6 +450,19 @@ func (c *Client) handleTunnelConnect(msg protocol.Message) {
 
 // handleTunnelData 双向字节流帧:按 streamID 在中转两侧原样透传(不落盘/不解释/不聚合 R3)。
 // 请求方(本地 SOCKS5)→ 执行方;执行方 → 请求方。不再是本隧道任何一端时丢弃。
+// tunnelPeer 解析一条隧道在除本端之外的另端 client ID;本端既非请求方也非执行方时返回 false。
+// handleTunnelData 与 handleTunnelEnd 共用同一路由规则,避免把对端解析复制两份。
+func (c *Client) tunnelPeer(entry tunnelEntry) (string, bool) {
+	switch c.id {
+	case entry.requesterID:
+		return entry.executorID, true
+	case entry.executorID:
+		return entry.requesterID, true
+	default:
+		return "", false
+	}
+}
+
 func (c *Client) handleTunnelData(msg protocol.Message) {
 	streamID := msg.StreamID
 	if streamID == "" {
@@ -459,32 +472,22 @@ func (c *Client) handleTunnelData(msg protocol.Message) {
 	if !ok {
 		return
 	}
-	var target string
-	switch c.id {
-	case entry.requesterID:
-		target = entry.executorID
-	case entry.executorID:
-		target = entry.requesterID
-	default:
+	target, ok := c.tunnelPeer(entry)
+	if !ok {
 		return
 	}
 	_ = c.server.SendTo(target, msg)
 }
 
-// handleTunnelEnd 隧道关闭:任一端发来即拆除注册表并向另一端转发关闭以关停本地连接。
+// handleTunnelEnd 隧道关闭。拆除注册表并向另一端转发关闭,让另一端关停本地连接。
 func (c *Client) handleTunnelEnd(msg protocol.Message) {
 	streamID := msg.StreamID
 	entry, ok := c.server.getTunnel(streamID)
 	if !ok {
 		return
 	}
-	var target string
-	switch c.id {
-	case entry.requesterID:
-		target = entry.executorID
-	case entry.executorID:
-		target = entry.requesterID
-	default:
+	target, ok := c.tunnelPeer(entry)
+	if !ok {
 		return
 	}
 	c.server.deleteTunnel(streamID)

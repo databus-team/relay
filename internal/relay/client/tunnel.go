@@ -8,10 +8,18 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/user/relay/internal/relay/protocol"
 )
+
+// tunnelConnectTimeout 等待隧道建连确认(executor 白名单校验 + 真实连接)的上限。
+// 超时即放弃并把该 stream 的注册表条目拆除,避免请求方无界挂起或泄漏中转槽位(与 status 探针的分析同构)。
+const tunnelConnectTimeout = 15 * time.Second
+
+// tunnelWriteTimeout 是 executor 向真实目标写数据时的单次写上限,防止慢/停读目标把处理方读循环无限阻塞。
+const tunnelWriteTimeout = 60 * time.Second
 
 // 隧道在客户端侧的两条通路:
 //   - 入站(executor 角色):(c.handleInboundTunnelConnect)一端收建连,白名单 + 真实连接,经
@@ -29,7 +37,11 @@ type tunnelConn struct {
 func (tc *tunnelConn) Write(p []byte) (int, error) {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
-	return tc.conn.Write(p)
+	// 写加上限:慢/停读目标最多阻塞一个写周期,避免把处理方 readLoop 无限卡死(把无限阻塞转成有界错误)。
+	_ = tc.conn.SetWriteDeadline(time.Now().Add(tunnelWriteTimeout))
+	n, err := tc.conn.Write(p)
+	_ = tc.conn.SetWriteDeadline(time.Time{})
+	return n, err
 }
 
 // SetTunnelHandler 设置入站隧道建连回调(执行方角色)。设置了它,该客户端才会处理 MsgTunnelConnect。
@@ -163,7 +175,16 @@ func (c *Client) handleInboundTunnelData(msg protocol.Message) {
 		raw, _ := json.Marshal(msg.Payload)
 		_ = json.Unmarshal(raw, &td)
 		if len(td.Data) > 0 {
-			_, _ = tc.Write(td.Data)
+			if _, err := tc.Write(td.Data); err != nil {
+				// 目标写失败(停读/超时/对端关闭):拆除该隧道并把关闭通知给远端,防止读循环持续阻塞。
+				c.takeInboundTunnel(streamID)
+				_ = c.sendMessage(&protocol.Message{
+					Type:     protocol.MsgTunnelEnd,
+					ID:       uuid.New().String(),
+					StreamID: streamID,
+					Payload:  protocol.TunnelEnd{StreamID: streamID, Reason: "target write failed: " + err.Error()},
+				})
+			}
 		}
 		return
 	}
@@ -201,7 +222,8 @@ type TunnelStream struct {
 }
 
 // TunnelOpen 打开一条离站的 SOCKS5 隧道(requester 视角):发 MsgTunnelConnect 并等待建连确认。
-// 成功返回 *TunnelStream;失败(执行方掉线/白名单拒绝/未开通道)返回错误,不建立内网流量。
+// 成功返回 *TunnelStream;失败(执行方不可达/白名单拒/无在线执行方/超时)返回错误,并把该 stream
+// 的中转注册表条目拆除(发 MsgTunnelEnd),避免被拒/超时建连泄漏中转槽位(耗尽 maxTunnels)。
 func (c *Client) TunnelOpen(ctx context.Context, watchID, target string, port uint16) (*TunnelStream, error) {
 	id := uuid.New().String()
 	msg := &protocol.Message{
@@ -216,29 +238,17 @@ func (c *Client) TunnelOpen(ctx context.Context, watchID, target string, port ui
 		},
 	}
 
-	respCh := make(chan *protocol.Response, 1)
-	c.pendingMu.Lock()
-	c.pending[id] = respCh
-	c.pendingMu.Unlock()
-	defer func() {
-		c.pendingMu.Lock()
-		delete(c.pending, id)
-		c.pendingMu.Unlock()
-	}()
-
-	select {
-	case c.sendCh <- sendMsg{Message: msg}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-
-	var resp *protocol.Response
-	select {
-	case resp = <-respCh:
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	// 建连确认只在等待期内有效;超时视为失败并拆除该 stream(复用 sendAndWait 的 pending/send 语义,
+	// 但就建连这一等待单独加上限,防止对黑洞目标无界挂起)。
+	waitCtx, cancel := context.WithTimeout(ctx, tunnelConnectTimeout)
+	defer cancel()
+	resp, err := c.sendAndWait(waitCtx, msg)
+	if err != nil {
+		c.sendAbortTunnel(id, "connect wait: "+err.Error())
+		return nil, fmt.Errorf("tunnel connect: %w", err)
 	}
 	if !resp.OK {
+		c.sendAbortTunnel(id, tunnelAckError(resp))
 		return nil, fmt.Errorf("tunnel connect failed: %s", tunnelAckError(resp))
 	}
 
@@ -322,6 +332,17 @@ func (ts *TunnelStream) Close() {
 		ID:       uuid.New().String(),
 		StreamID: ts.ID,
 		Payload:  protocol.TunnelEnd{StreamID: ts.ID, Reason: "local closed"},
+	})
+}
+
+// sendAbortTunnel 在建连失败/放弃时对该 stream 发 MsgTunnelEnd,让中转拆除注册表条目,
+// 并把关闭通知给(可能已经 accept 的)执行方。对从未注册的 stream 发是无害的空操作。
+func (c *Client) sendAbortTunnel(streamID, reason string) {
+	_ = c.sendMessage(&protocol.Message{
+		Type:     protocol.MsgTunnelEnd,
+		ID:       uuid.New().String(),
+		StreamID: streamID,
+		Payload:  protocol.TunnelEnd{StreamID: streamID, Reason: reason},
 	})
 }
 

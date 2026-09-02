@@ -1212,3 +1212,89 @@ func echoAddr(addr string) (string, uint16) {
 	fmt.Sscanf(p, "%d", &pu)
 	return h, pu
 }
+
+// setupTunnelServerLimit 建一个开启隧道通道、并限定并发隧道上限的中转。
+func setupTunnelServerLimit(t *testing.T, watchDir string, maxTunnels int) (*httptest.Server, string) {
+	t.Helper()
+	cfg := server.Config{
+		Addr:          ":0",
+		WatchDirs:     []server.WatchDirConfig{{ID: "test-watch", Dir: watchDir}},
+		Auth:          server.AuthConfig{Type: "token", Tokens: []string{"test-token"}},
+		TunnelEnabled: true,
+		MaxTunnels:    maxTunnels,
+	}
+	srv, err := server.New(cfg)
+	if err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/relay"
+	return ts, wsURL
+}
+
+// TestTunnel_MaxTunnelsCap:并发隧道上限应在其耗尽时拒绝新开隧道(坐标 U/T 测 400#13)。
+func TestTunnel_MaxTunnelsCap(t *testing.T) {
+	watchDir := t.TempDir()
+	ts, wsURL := setupTunnelServerLimit(t, watchDir, 1)
+	defer ts.Close()
+
+	exec := registerTunnelExecutor(t, wsURL, "test-watch", true)
+	defer exec.Disconnect()
+
+	es, target := newEchoServer(t)
+	defer es.ln.Close()
+	host, port := echoAddr(target)
+
+	ctx := context.Background()
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	sa, err := c.TunnelOpen(ctx, "test-watch", host, port)
+	if err != nil {
+		t.Fatalf("first tunnel open: %v", err)
+	}
+	defer sa.Close()
+
+	if _, err := c.TunnelOpen(ctx, "test-watch", host, port); err == nil {
+		t.Fatal("expected second concurrent tunnel to be rejected by the cap, got nil")
+	} else if !strings.Contains(err.Error(), "too many concurrent") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestTunnel_DeniedDoesNotLeak:executor 拒绝(未命中/拨号失败)的建连不得保留中转注册表槽位——
+// 修完被拒泄漏后,拒绝一条再开的合法隧道仍应成功(否则单时泄漏会把共享 maxTunnels 占光)。
+func TestTunnel_DeniedDoesNotLeak(t *testing.T) {
+	watchDir := t.TempDir()
+	ts, wsURL := setupTunnelServerLimit(t, watchDir, 1)
+	defer ts.Close()
+
+	// allow=true:拨号不可达目标 → Reject;拨号回显服 → Accept。
+	exec := registerTunnelExecutor(t, wsURL, "test-watch", true)
+	defer exec.Disconnect()
+
+	// 造一个「不可达」目标:先 listen 再立即关闭。
+	resv, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve addr: %v", err)
+	}
+	dead := resv.Addr().String()
+	resv.Close()
+	deadHost, deadPort := echoAddr(dead)
+
+	ctx := context.Background()
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	if _, err := c.TunnelOpen(ctx, "test-watch", deadHost, deadPort); err == nil {
+		t.Fatal("expected connect to unreachable target to fail, got nil")
+	}
+
+	// 槽位应已被释放:合法隧道仍能开。
+	es, target := newEchoServer(t)
+	defer es.ln.Close()
+	host, port := echoAddr(target)
+	if _, err := c.TunnelOpen(ctx, "test-watch", host, port); err != nil {
+		t.Fatalf("valid tunnel open after a denied one must succeed (registry must not leak): %v", err)
+	}
+}

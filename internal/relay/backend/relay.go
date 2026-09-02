@@ -370,6 +370,9 @@ func (b *RelayBackend) handleInboundConfigSync(sess *client.ConfigSyncSession) {
 	_ = sess.Done(protocol.ExecResponse{ExitCode: 0, Stdout: fmt.Sprintf("config applied to %s; restart relay watch to take effect", b.configPath)})
 }
 
+// tunnelDialTimeout 是 executor 向目标发真实 TCP 拨号的上限,防止黑洞目标导致建连确认无界等待。
+const tunnelDialTimeout = 10 * time.Second
+
 // handleInboundTunnelConnect 执行方收到中转转发来的隧道建连:校验 network_allow 白名单,
 // 命中则向**已校验的 IP 字面量**发起真实 TCP(dial 用 IP 而非原始 hostname,防 DNS 重绑 TOCTOU),
 // 连成回执 OK 并交回给 session 泵双向字节流;未命中/dial 失败一律 Reject、不建任何内网连接(默认拒绝)。
@@ -383,7 +386,8 @@ func (b *RelayBackend) handleInboundTunnelConnect(sess *client.TunnelSession) {
 	}
 
 	addr := net.JoinHostPort(ip.String(), strconv.Itoa(int(sess.Port())))
-	conn, err := net.Dial("tcp", addr)
+	// 用有界超时拨号:黑洞/不可达目标在限定时间内报错,避免请求方无界等待建连确认。
+	conn, err := net.DialTimeout("tcp", addr, tunnelDialTimeout)
 	if err != nil {
 		log.Printf("[tunnel] dial %s failed: %v", addr, err)
 		sess.Reject("dial " + addr + ": " + err.Error())
