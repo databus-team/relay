@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -168,18 +169,27 @@ func (c *Client) CloseCh() <-chan struct{} {
 	return c.closeCh
 }
 
+// readDeadline 是单次 WS 读的续读间隔(由每一条入站帧刷新,含心跳 pong)。中转经 NAT/代理
+// 重启时,执行器这边往往拿不到 EOF/RST,ReadMessage 会一直阻塞——靠它把半开连接强制判定为
+// 读超时 → readLoop 走重连,不必再死等心跳的 pong 计龄(见 heartbeatTimeout)兜底。
+const readDeadline = 45 * time.Second
+
 func (c *Client) readLoop() {
 	// 每个连接各有一个 readLoop,只读它自己被创建时绑定的 conn(重连后换新 conn/新 readLoop)。
 	conn := c.getConn()
+	_ = conn.SetReadDeadline(time.Now().Add(readDeadline))
 	for {
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
 			c.connected.Store(false)
-			// 传输断开:先拆空隧道(出站流中止/入站连接关闭),避免重连后本地仍以为隧道黑盒仍开着。
+			// 传输断开:先关重隧道(拆解流中止/入站连接关闭),避免重连后本地仍以为隧道黑盒仍开着。
 			c.closeAllTunnels("transport lost")
 			go c.reconnectLoop(context.Background())
 			return
 		}
+
+		// 收到任一帧(含心跳 pong)说明连接还活着,续期读 deadline,把超时窗口前移。
+		_ = conn.SetReadDeadline(time.Now().Add(readDeadline))
 
 		if msgType == websocket.BinaryMessage {
 			continue
