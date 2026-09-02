@@ -231,12 +231,15 @@ verify_executor() {
 
 # ---- 远端段:枚举在线执行器并逐一部署 ----
 remote_all() {
-  local E W rc=0 i
-  local -a EXEC_IDS wanted exec_online
-  mapfile -t EXEC_IDS < <(list_online_executors)
+  local E W rc=0 i line
+  local -a EXEC_IDS wanted
+  # 不用 mapfile(Bash 3.2 的 macOS /bin/bash 无此内建),用 while read 逐行进数组。
+  EXEC_IDS=()
+  while IFS= read -r line; do [[ -n "$line" ]] && EXEC_IDS+=("$line"); done < <(list_online_executors)
   if [[ -n "${EXECS:-}" ]]; then
     # 用户点名(逗号/空格分隔的 watch_id)且在线的那部分;点名的离线也跳过。
-    mapfile -t wanted < <(printf '%s\n' ${EXECS//[,]/ })
+    wanted=()
+    while IFS= read -r line; do [[ -n "$line" ]] && wanted+=("$line"); done < <(printf '%s\n' ${EXECS//[,]/ })
     exec_online="$(printf '%s\n' "${EXEC_IDS[@]}")"
     EXEC_IDS=()
     for E in "${wanted[@]}"; do grep -qx "$E" <<<"$exec_online" && EXEC_IDS+=("$E"); done
