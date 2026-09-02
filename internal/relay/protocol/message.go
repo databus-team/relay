@@ -169,12 +169,12 @@ type StatusRequest struct {
 //   - Total: Seg1 + Seg2 的本地单程累计(由请求方累加)
 //   - Nodes: 参与端点版本台账(中转 + 各在线执行方)
 type StatusResponse struct {
-	OK    bool           `json:"ok"`
-	Error string         `json:"error,omitempty"`
-	Seg1  StatusSegment  `json:"seg1"`
-	Seg2  StatusSegment  `json:"seg2"`
-	Total StatusSegment  `json:"total"`
-	Nodes []VersionInfo  `json:"nodes,omitempty"`
+	OK    bool          `json:"ok"`
+	Error string        `json:"error,omitempty"`
+	Seg1  StatusSegment `json:"seg1"`
+	Seg2  StatusSegment `json:"seg2"`
+	Total StatusSegment `json:"total"`
+	Nodes []VersionInfo `json:"nodes,omitempty"`
 }
 
 // PushJobRequest push 一个文件直达远端执行方。
