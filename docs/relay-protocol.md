@@ -462,12 +462,14 @@ type TunnelEnd  struct { StreamID string `json:"stream_id"`; Reason string `json
 
 ### 4.10 多 executor 与工作区隧道选择
 
-一台中转可同时挂载**多台**远端 executor(每台各自的 watch/工作区)。`relay status` / 版本台账按 watch
-逐条展示每台在线执行方及其构建版本,用户据此得知有哪些出口可选。`relay tunnel --watch` 的取值是
-**执行方注册所在的服务端 watch_id**(见 `relay status` 的 `executor watch=...`),**不是**本地工作区名——
-与 `exec`/`push`/`status` 的 `-w`(工作区,client 端再映射到连接的 watch_id)语义不同、也不做 cwd 推断,
-`--watch` 必填。多台 executor 同时在线时,本地可并起多条 `relay tunnel`(不同 `--listen` 端口、各自
-`--watch`),分别经各自 executor 访问各自内网白名单目标,互不干扰(关闭一条不影响其它)。
+一台中转可同时挂载**多台**远端 executor(每台各自独立的 watch_id)。执行方的 watch_id 由执行方自声明并
+**动态注册**(`MsgRegisterExecutor`),不要求预先出现在中转 watch 白名单——中转只是路由层。`relay status` /
+版本台账按 watch 逐条展示每台在线执行方及其构建版本,用户据此得知有哪些出口可选。`relay exec` / `relay push`
+在选定 workspace 后,按该 workspace 的 `executor:` 字段取其目标执行方的 watch_id 作为路由键;`relay tunnel
+--watch` 的取值同样直接是**执行方注册的服务端 watch_id**(见 `relay status` 的 `executor watch=...`),与
+`exec`/`push`/`status` 的 `-w`(工作区名,client 端再映射到目标执行方 watch_id)语义不同、也不做 cwd 推断,
+`--watch` 必填。多台 executor 同时在线时,本地可并排多条 `relay tunnel`(不同 `--listen` 端口、各自
+`--watch`),分别经各自执行器访问各自内网白名单目标,互不干扰(一台不影响其它)。
 
 ---
 
@@ -789,7 +791,7 @@ backend:
   config:
     url: "wss://server:8443/relay"
     token: "${RELAY_TOKEN}"
-    watch_id: "web-app"               # 关联的 watch ID
+    watch_id: "web-app"               # 执行方(relay watch)自注册的身份;exec/push/tunnel 按此路由
     # 或 auto 模式: 订阅所有事件，客户端过滤
     auto_subscribe: false
 
@@ -826,7 +828,10 @@ backend:
       ping: 5s
 ```
 
-### 8.2 Server 配置
+### 8.2 Server 配置(遗留独立 server.yaml)
+
+> 新的统一 config 用顶层 `server:` 段(addr/watch_root/auth/tls/tunnel_enabled/max_tunnels),见 8.3。
+> 下列 `relay_server:` 顶层格式为遗留独立 `server.yaml`,经 `--server-config` 或检测「无 `server:` 段」时按旧式解析,仍以 `watch:`(带 `dir:`)声明存储目录。
 
 ```yaml
 relay_server:
@@ -858,6 +863,54 @@ relay_server:
     chunk_size: 65536
     max_concurrent: 3
 ```
+
+### 8.3 Unified config:workspaces 与执行器绑定
+
+统一的 `config.yaml` 由三端共用(server / executor / 本地 CLI),每端只读自己相关段。顶层作业配置列表
+原来是 `watch:`;为与执行方自注册的 `watch_id`(一台执行器的身份)区分,现改名为 **`workspaces:`**。每个
+条目是「一份作业配置」,可经 **`executor:`** 字段显式绑定到某台执行器(其值即执行器侧 `backend.config.watch_id`)。
+
+```yaml
+# server 段:仅 relay server 读取(单根 vs 工作区见 8.2;列表模式这里不填 watch_root)
+server:
+  addr: ":8443"
+  auth:
+    tokens: ["${RELAY_TOKEN}"]
+  tunnel_enabled: true   # 隧道路由通道
+
+# executor 侧(relay watch)身份:
+backend:
+  type: relay
+  config:
+    url: "wss://server:8443/relay"
+    token: "${RELAY_TOKEN}"
+    watch_id: "site-a"       # 这台执行器自注册的 watch_id
+    executor: true           # 本配置对应的进程以执行方角色注册
+
+workspaces:
+  - id: databus_backend
+    watch_dir: databus_backend
+    local_dir: /d/Group_Projects/databus_backend
+    paths: ["*.patch"]
+    executor: site-a         # 路由到 watch_id=site-a 的执行器(留空 = 单根回退)
+    jobs:
+      - id: apply
+        type: exec
+        cmd: git am --3way {file_path}
+```
+
+**路由语义**
+- 请求方(`relay exec` / `relay push`)选定某 workspace 后,以 `workspace.executor` 为目标执行方的
+  `watch_id` 作为请求的 `watch_id`/`targetWatch` 路由键;中转按该 watch_id 在线执行方转发。
+- `executor` 留空(或 workspace 直接就是单台根配置)时,沿用单根回退:请求路由到本端 backend
+  的 `watch_id`(`c.watchID`),与历史行为一致。
+- 执行方收到 push 落地后,按「其注册 watch_id 是否等于 workspace 的 `executor`」优先认领该 workspace
+  (多个绑定到同一执行器时,再按落盘路径中 `watch_dir`/id 段消歧),最后才用路径推断兜底。
+- **动态注册**:执行方的 `watch_id` 无需预存在中转 watch 白名单;`MsgRegisterExecutor` 直接登记,
+  中转按 `executors[watch_id]` 路由(`relay exec` / `relay push` / `relay tunnel`)。文件存储类操作
+  (list/pull/delete/subscribe/暂存回退)仍按中转的 watch 目录判。
+
+---
 
 ---
 
