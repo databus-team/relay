@@ -318,15 +318,14 @@ func TestStatusResponseRoundTrip(t *testing.T) {
 			Seg1: StatusSegment{
 				LatencyMS: &lat,
 			},
-			Seg2: StatusSegment{
-				Unavailable: "executor offline",
-			},
-			Total: StatusSegment{
-				LatencyMS: &lat,
-			},
-			Nodes: []VersionInfo{
-				{Role: "transit", Version: "1.0", GOOS: "linux", GOARCH: "amd64"},
-				{Role: "executor", WatchID: "watch-1", Version: "1.0", GOOS: "linux", GOARCH: "amd64"},
+			Transit: VersionInfo{Role: "transit", Version: "1.0", GOOS: "linux", GOARCH: "amd64"},
+			Executors: []ExecutorHealth{
+				{
+					WatchID: "watch-1",
+					Version: "1.0",
+					Seg2:    StatusSegment{LatencyMS: &lat},
+					Total:   StatusSegment{LatencyMS: &lat},
+				},
 			},
 		},
 	}
@@ -361,17 +360,21 @@ func TestStatusResponseRoundTrip(t *testing.T) {
 	if p.Seg1.LatencyMS == nil || *p.Seg1.LatencyMS != lat {
 		t.Errorf("seg1.latency_ms: got %v, want %d", p.Seg1.LatencyMS, lat)
 	}
-	if p.Total.LatencyMS == nil || *p.Total.LatencyMS != lat {
-		t.Errorf("total.latency_ms: got %v, want %d", p.Total.LatencyMS, lat)
+	if p.Transit.Role != "transit" || p.Transit.Version != "1.0" {
+		t.Errorf("transit mismatch: got %+v", p.Transit)
 	}
-	if p.Seg2.LatencyMS != nil {
-		t.Errorf("seg2.latency_ms: got %v, want nil (unavailable segment)", *p.Seg2.LatencyMS)
+	if len(p.Executors) != 1 {
+		t.Fatalf("executors: got %d, want 1", len(p.Executors))
 	}
-	if p.Seg2.Unavailable != "executor offline" {
-		t.Errorf("seg2.unavailable: got %q, want %q", p.Seg2.Unavailable, "executor offline")
+	e := p.Executors[0]
+	if e.WatchID != "watch-1" || e.Version != "1.0" {
+		t.Errorf("executor headers mismatch: got %+v", e)
 	}
-	if len(p.Nodes) != 2 || p.Nodes[0].Role != "transit" {
-		t.Errorf("nodes mismatch: got %+v", p.Nodes)
+	if e.Seg2.LatencyMS == nil || *e.Seg2.LatencyMS != lat {
+		t.Errorf("executor seg2.latency_ms: got %v, want %d", e.Seg2.LatencyMS, lat)
+	}
+	if e.Total.LatencyMS == nil || *e.Total.LatencyMS != lat {
+		t.Errorf("executor total.latency_ms: got %v, want %d", e.Total.LatencyMS, lat)
 	}
 }
 

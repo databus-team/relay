@@ -398,11 +398,12 @@ type RequestOptions struct {
 }
 ```
 
-### 4.8 连通性体检 (Client → Transit → Executor)
+### 4.8 连通性体检 (Client ↔ Transit ↔ 每个 Executor)
 
-`MsgStatus` 是 `relay status` 的底层载体:请求方(本地 CLI)向中转请求一段"本地→中转→执行方"的链路体检
-结果与参与端点版本台账。中转在收到后,用「待回包」协调表向指定 watch 的在线执行方发探针测
-`transit→executor` 段往返,并把测得延迟连同版本台账组装进 `StatusResponse` 回给请求方。
+`MsgStatus` 是 `relay status` 的底层载体。status 面向**整座部署**(中转 + 所有执行方),请求方不携带 watch:
+中转用「待回包」协调表对每个已注册执行方各并发发一条探针,测各自 `transit→executor` 段往返 RTT,连同
+中转节点信息组装进 `StatusResponse` 回给请求方。请求方再补 `seg1`(本地→中转)与各执行方的累计
+(seg1 + seg2)。
 
 ```go
 type StatusSegment struct {
@@ -410,17 +411,25 @@ type StatusSegment struct {
     Unavailable string `json:"unavailable,omitempty"`
 }
 
+type ExecutorHealth struct {
+    WatchID string        `json:"watch_id"`          // 执行方自注册的 watch_id(身份)
+    Version string        `json:"version,omitempty"` // 执行方构建版本(含 commit)
+    Seg2    StatusSegment `json:"seg2"`              // 中转→执行方 往返 RTT(离线/超时=不可用)
+    Total   StatusSegment `json:"total,omitempty"`   // Seg1 + Seg2(请求方累加)
+}
+
 type StatusResponse struct {
-    OK    bool           `json:"ok"`
-    Error string         `json:"error,omitempty"`
-    Seg1  StatusSegment  `json:"seg1"`  // 本地→中转 往返 RTT(请求方本地 `Ping` 计时)
-    Seg2  StatusSegment  `json:"seg2"`  // 中转→执行方 往返 RTT(中转探针测得;离线/未注册=不可用)
-    Total StatusSegment  `json:"total"` // Seg1 + Seg2 两段 RTT 之和
-    Nodes []VersionInfo  `json:"nodes,omitempty"` // 参与端点版本台账
+    OK        bool             `json:"ok"`
+    Error     string           `json:"error,omitempty"`
+    Seg1      StatusSegment    `json:"seg1"`            // 本地→中转 往返 RTT(请求方本地 Ping 计时)
+    Transit   VersionInfo      `json:"transit,omitempty"` // 中转节点构建信息
+    Executors []ExecutorHealth `json:"executors,omitempty"` // 各在线执行方;全部离线=空列表
 }
 ```
 
-- 执行方离线/未注册时,`seg2.latency_ms` 为空、`seg2.unavailable` 注明断点原因,整条命令仍成功——语义是"中转在线、远端掉线"。
+- `relay status` **不携带 `-w`**:status 报告整个部署,而非单个 workspace/executor。
+- 执行方离线/超时时,其 `seg2.latency_ms` 为空、`seg2.unavailable` 注明断点原因;全部执行方离线时
+  `executors` 为空列表,命令仍成功——语义是"中转在线、远端掉线",绝不因无执行方而报错。
 - 旧 `ping` 的"本机→中转"心跳职责并入 `status`;`version` 收窄为纯本地构建信息,跨机版本台账由 `status` 承接。
 
 ### 4.9 出网隧道 (本地 SOCKS5 → executor)
@@ -466,9 +475,9 @@ type TunnelEnd  struct { StreamID string `json:"stream_id"`; Reason string `json
 **动态注册**(`MsgRegisterExecutor`),不要求预先出现在中转 watch 白名单——中转只是路由层。`relay status` /
 版本台账按 watch 逐条展示每台在线执行方及其构建版本,用户据此得知有哪些出口可选。`relay exec` / `relay push`
 在选定 workspace 后,按该 workspace 的 `executor:` 字段取其目标执行方的 watch_id 作为路由键;`relay tunnel
---watch` 的取值同样直接是**执行方注册的服务端 watch_id**(见 `relay status` 的 `executor watch=...`),与
-`exec`/`push`/`status` 的 `-w`(工作区名,client 端再映射到目标执行方 watch_id)语义不同、也不做 cwd 推断,
-`--watch` 必填。多台 executor 同时在线时,本地可并排多条 `relay tunnel`(不同 `--listen` 端口、各自
+--watch` 的取值同样直接是**执行方注册的服务端 watch_id**(见 `relay status` 的 `executors[]`),这与
+`relay exec` / `relay push` 的 `-w`(工作区名,client 端再映射到目标执行方 watch_id)语义不同、也不做
+cwd 推断,`--watch` 必填。`relay status` 不需要 `-w`:它报告整座部署。多台 executor 同时在线时,本地可并排多条 `relay tunnel`(不同 `--listen` 端口、各自
 `--watch`),分别经各自执行器访问各自内网白名单目标,互不干扰(一台不影响其它)。
 
 ---

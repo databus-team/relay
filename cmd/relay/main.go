@@ -74,10 +74,9 @@ var (
 	// 含以 - 开头参数的命令(如 git log --oneline)仍须整体加引号,避免被当 flag。
 	execCmdStr = execCmd.Arg("command", "Command to execute (multiple words are joined)").Required().Strings()
 
-	// Status command - 一站式连通性体检:本地→中转→执行方 三段时延 + 各端点版本台账。
-	// 继承原 `ping` 的探活职责并把 `version -r` 的远端台账职责一并归一到此命令。
-	statusCmd     = kingpin.Command("status", "一站式连通性体检:本地→中转→执行方 三段时延与各端点版本")
-	statusWatch   = statusCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
+	// Status command - 整座部署连通性体检:本地→中转 一段 + 中转→每个执行方 的时延与版本。
+	// 不携带 -w(status 面向整座部署);继承原 `ping` 探活职责并把 `version -r` 台账归一到此。
+	statusCmd     = kingpin.Command("status", "整座部署连通性体检:本地→中转 与 中转→每个执行方 的时延及版本")
 	statusJSONOut = statusCmd.Flag("json", "Output as JSON").Bool()
 
 	// Cleanup command - remove stale command files
@@ -105,7 +104,7 @@ var (
 	// Tunnel command - 本地 SOCKS5 出网隧道,经所选 executor 出口访问内网白名单目标。
 	tunnelCmd    = kingpin.Command("tunnel", "本地 SOCKS5 出网隧道:经所选 executor 访问其内网白名单目标")
 	tunnelListen = tunnelCmd.Flag("listen", "Local SOCKS5 listen address").Default("127.0.0.1:1080").String()
-	tunnelWatch  = tunnelCmd.Flag("watch", "Egress executor's server watch id (see `relay status` -> executor watch=...); required").Short('w').Required().String()
+	tunnelWatch  = tunnelCmd.Flag("watch", "Egress executor's server watch id (see `relay status` -> executors[] watch_id); required").Short('w').Required().String()
 )
 
 func main() {
@@ -914,29 +913,14 @@ func runExec() {
 // statusTimeout 是 `relay status` 单条命令的上限(含对中转 status 请求的等待)。
 const statusTimeout = 15 * time.Second
 
-// runStatus 一站式连通性体检:按 watch 输出 本地→中转 / 中转→执行方 / 本地累计 三段时延,
-// 并附各端点版本台账。relay 后端给出完整三段;其余后端(local/fs-mcp/jumpserver)尽力而为,
-// 只有单跳段可达,段2/累计标「不可用」,保持相同列结构与 --json 字段。
+// runStatus 整座部署连通性体检:输出 本地→中转 一段 + 中转→每个执行方的时延与版本。
+// 不携带 `-w`:status 面向整座部署(中转 + 全部执行方),而非单个 workspace/executor。
+// relay 后端给出完整结果;其余后端(local/fs-mcp/jumpserver)尽力而为,只有单跳段可达,
+// 执行方向为空,保持相同列结构与 --json 字段。
 func runStatus() {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
-		os.Exit(1)
-	}
-
-	w := *statusWatch
-	if w == "" {
-		if inferred, err := resolveWorkspaceID(cfg, ""); err == nil {
-			w = inferred
-		}
-	}
-	if w == "" {
-		fmt.Fprintf(os.Stderr, "Specify -w. Available: %s\n", joinAvailable(cfg.Workspaces))
-		os.Exit(1)
-	}
-	watchCfg, err := cfg.GetWorkspaceByID(w)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -946,73 +930,77 @@ func runStatus() {
 		os.Exit(1)
 	}
 
-	// relay 后端专属:完整三段 + 版本台账。
+	// relay 后端专属:整座部署——本地→中转 + 中转→每个执行方 + 版本台账。
 	if rb, ok := b.(*relaybackend.RelayBackend); ok {
 		ctx, cancel := context.WithTimeout(context.Background(), statusTimeout)
 		defer cancel()
-		st, err := rb.Status(ctx, watchCfg.ID)
+		st, err := rb.Status(ctx)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		printStatus(watchCfg.ID, cfg.Backend.Type, st, *statusJSONOut)
+		printStatus(cfg.Backend.Type, st, *statusJSONOut)
 		return
 	}
 
-	// 非 relay 端点:单跳可达(沿用 runPing 的 b.Ping),段2/累计明确标不可用。
+	// 非 relay 端点:单段可达(仅 本地→后端),执行方向不可用。
 	commandDir := "/tmp/relay-commands"
 	if dir, ok := cfg.Backend.Config["command_dir"].(string); ok && dir != "" {
 		commandDir = dir
 	}
 	start := time.Now()
-	if err := b.Ping(context.Background(), commandDir, watchCfg.ID); err != nil {
+	bufwatch := ""
+	if inferred, err := resolveWorkspaceID(cfg, ""); err == nil {
+		bufwatch = inferred
+	}
+	if err := b.Ping(context.Background(), commandDir, bufwatch); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 	ms := time.Since(start).Milliseconds()
-	reason := "not supported on " + cfg.Backend.Type + " backend"
 	st := protocol.StatusResponse{
-		OK:    true,
-		Seg1:  protocol.StatusSegment{LatencyMS: &ms},
-		Seg2:  protocol.StatusSegment{Unavailable: reason},
-		Total: protocol.StatusSegment{Unavailable: reason},
+		OK:   true,
+		Seg1: protocol.StatusSegment{LatencyMS: &ms},
 	}
-	printStatus(watchCfg.ID, cfg.Backend.Type, st, *statusJSONOut)
+	printStatus(cfg.Backend.Type, st, *statusJSONOut)
 }
 
 // printStatus 渲染 `relay status` 结果:--json 输出与文本一致的相同字段,段不可用时 latency_ms
-// 留空并给出 unavailable 原因。
-func printStatus(watchID, backendName string, st protocol.StatusResponse, jsonOut bool) {
+// 留空并给出 unavailable 原因。status 面向整座部署:本地→中转 一段 + 中转→每个执行方
+// 各自的段与时延(Total=段1+段2),执行方离线时其段标不可用,全部离线时执行方列表为空。
+func printStatus(backendName string, st protocol.StatusResponse, jsonOut bool) {
 	if jsonOut {
 		rep := map[string]interface{}{
-			"watch":   watchID,
-			"backend": backendName,
-			"seg1":    st.Seg1,
-			"seg2":    st.Seg2,
-			"total":   st.Total,
-			"nodes":   st.Nodes,
+			"backend":   backendName,
+			"seg1":      st.Seg1,
+			"transit":   st.Transit,
+			"executors": st.Executors,
 		}
 		enc, _ := json.MarshalIndent(rep, "", "  ")
 		fmt.Println(string(enc))
 		return
 	}
 
-	fmt.Printf("status %q (%s backend)\n", watchID, backendName)
-	fmt.Printf("  local→transit     %s\n", segmentText(st.Seg1))
-	fmt.Printf("  transit→executor  %s\n", segmentText(st.Seg2))
-	fmt.Printf("  local total       %s\n", segmentText(st.Total))
-	if len(st.Nodes) == 0 {
-		fmt.Println("  endpoints: (none reported)")
+	fmt.Printf("status (%s backend)\n", backendName)
+	fmt.Printf("  local→transit  %s\n", segmentText(st.Seg1))
+	fmt.Printf("  transit        %s (%s/%s)\n", ident(st.Transit), st.Transit.GOOS, st.Transit.GOARCH)
+	if len(st.Executors) == 0 {
+		fmt.Println("  executors: (none registered/online)")
 		return
 	}
-	fmt.Println("  endpoints:")
-	for _, n := range st.Nodes {
-		if n.Role == "transit" {
-			fmt.Printf("    transit   %s  (%s/%s)\n", ident(n), n.GOOS, n.GOARCH)
-		} else {
-			fmt.Printf("    executor  watch=%s  %s\n", n.WatchID, ident(n))
-		}
+	fmt.Println("  executors:")
+	for _, e := range st.Executors {
+		fmt.Printf("    %s  transit→executor %s  total %s  (%s)\n",
+			e.WatchID, segmentText(e.Seg2), segmentText(e.Total), identStr(e.Version))
 	}
+}
+
+// identStr 把版本号渲染成标识(空版本给 unknown)。
+func identStr(v string) string {
+	if v == "" {
+		return "unknown"
+	}
+	return v
 }
 
 // ident 把 VersionInfo 渲染成可用于对比的标识符(带 commit 时版+commit)。

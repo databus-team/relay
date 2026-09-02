@@ -361,7 +361,7 @@ func TestEndToEnd_ExecNoExecutor(t *testing.T) {
 	}
 }
 
-// 端到端:执行方在线时,relay 后端 status 返回 三段 + 台账(中转+执行方)。
+// 端到端:单个执行方在线时,relay 后端 status 返回 段1 + 该执行方的段2/累计 + 中转版本。
 func TestEndToEnd_Status(t *testing.T) {
 	SetExecutorRole(true)
 	defer SetExecutorRole(false)
@@ -387,41 +387,33 @@ func TestEndToEnd_Status(t *testing.T) {
 	}
 	rb := reqRaw.(*RelayBackend)
 
-	st, err := rb.Status(ctx, "test")
+	st, err := rb.Status(ctx)
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
 	if st.Seg1.LatencyMS == nil || *st.Seg1.LatencyMS < 0 {
 		t.Errorf("seg1.latency_ms missing: %+v", st.Seg1)
 	}
-	if st.Seg2.LatencyMS == nil || *st.Seg2.LatencyMS < 0 {
-		t.Errorf("seg2 missing (executor should be online): %+v", st.Seg2)
+	if st.Transit.Role != "transit" || st.Transit.Version == "" {
+		t.Errorf("transit node missing: %+v", st.Transit)
 	}
-	if st.Total.LatencyMS == nil || *st.Total.LatencyMS != *st.Seg1.LatencyMS+*st.Seg2.LatencyMS {
-		t.Errorf("total should equal seg1+seg2: %+v", st.Total)
+	if len(st.Executors) != 1 {
+		t.Fatalf("executors: got %d, want 1: %+v", len(st.Executors), st.Executors)
 	}
-
-	var hasTransit, hasExecutor bool
-	for _, n := range st.Nodes {
-		switch n.Role {
-		case "transit":
-			hasTransit = true
-		case "executor":
-			if n.WatchID == "test" {
-				hasExecutor = true
-			}
-		}
+	e := st.Executors[0]
+	if e.WatchID != "test" {
+		t.Errorf("executor watch: got %q, want %q", e.WatchID, "test")
 	}
-	if !hasTransit || !hasExecutor {
-		t.Errorf("ledger should include transit and executor: %+v", st.Nodes)
+	if e.Seg2.LatencyMS == nil || *e.Seg2.LatencyMS < 0 {
+		t.Errorf("seg2 missing (executor should be online): %+v", e.Seg2)
+	}
+	if e.Total.LatencyMS == nil || *e.Total.LatencyMS != *st.Seg1.LatencyMS+*e.Seg2.LatencyMS {
+		t.Errorf("total should equal seg1+seg2: %+v", e.Total)
 	}
 }
 
-// 端到端:status 探针目标取连接的 backend.config.watch_id,而非 CLI 的 `-w` 本地工作区 id。
-// 复现真实场景:多个 workspace 共享一根 relay 连接,`-w databus_backend` 这类本地 id 并非
-// 服务端 watch,不能原样透传(否则返回 unknown watch_id)。此处传一个与服务端 watch 不同的
-// 工作区 id("appB"),应仍探测到 watch "test" 的执行方,而不是失败。
-func TestEndToEnd_Status_ProbesBackendWatchNotCLIWorkspace(t *testing.T) {
+// 端到端:多执行方,status 返回所有已注册执行方,且各自段的时延互不影响。
+func TestEndToEnd_Status_MultiExecutor(t *testing.T) {
 	SetExecutorRole(true)
 	defer SetExecutorRole(false)
 	watchDir := t.TempDir()
@@ -431,35 +423,40 @@ func TestEndToEnd_Status_ProbesBackendWatchNotCLIWorkspace(t *testing.T) {
 
 	ctx := context.Background()
 
-	if _, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-exe", "watch_id": "test", "watch_dir": ".", "executor": true,
-	}); err != nil {
-		t.Fatalf("executor backend: %v", err)
+	for _, wid := range []string{"site-a", "site-b"} {
+		if _, err := NewRelayBackend(map[string]interface{}{
+			"url": wsURL, "token": "tok-exe", "watch_id": wid, "watch_dir": ".", "executor": true,
+		}); err != nil {
+			t.Fatalf("executor backend %s: %v", wid, err)
+		}
 	}
 
 	reqRaw, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+		"url": wsURL, "token": "tok-req", "watch_id": "site-a", "watch_dir": ".",
 	})
 	if err != nil {
 		t.Fatalf("requester backend: %v", err)
 	}
 	rb := reqRaw.(*RelayBackend)
 
-	// CLI `-w` 传的是本地工作区 id(比如 databus_backend),服务端并不认识它;
-	// Status 应退而用连接的服务端 watch(config.watch_id="test")探活,而非把它当服务端 watch 直传。
-	st, err := rb.Status(ctx, "databus_workspace_not_a_server_watch")
+	st, err := rb.Status(ctx)
 	if err != nil {
-		t.Fatalf("status should not fail on unknown watch_id: %v", err)
+		t.Fatalf("status: %v", err)
 	}
-	if st.Seg1.LatencyMS == nil {
-		t.Errorf("seg1 missing: %+v", st.Seg1)
+	if len(st.Executors) != 2 {
+		t.Fatalf("executors: got %d, want 2: %+v", len(st.Executors), st.Executors)
 	}
-	if st.Seg2.LatencyMS == nil {
-		t.Errorf("seg2 should probe executor on backend watch: %+v", st.Seg2)
+	for _, e := range st.Executors {
+		if e.Seg2.LatencyMS == nil || *e.Seg2.LatencyMS < 0 {
+			t.Errorf("executor %q seg2 missing: %+v", e.WatchID, e.Seg2)
+		}
+		if e.Total.LatencyMS == nil {
+			t.Errorf("executor %q total missing: %+v", e.WatchID, e.Total)
+		}
 	}
 }
 
-// 端到端:执行方离线时 status 段1 给出、段2 标不可用,仍成功(中转在线、远端掉线)。
+// 端到端:全部执行方离线时 status 段1 给出、执行方列表为空,仍成功(中转在线、远端掉线)。
 func TestEndToEnd_Status_ExecutorOffline(t *testing.T) {
 	watchDir := t.TempDir()
 	ts, wsURL := newTestHub(t, watchDir)
@@ -475,21 +472,15 @@ func TestEndToEnd_Status_ExecutorOffline(t *testing.T) {
 	}
 	rb := reqRaw.(*RelayBackend)
 
-	st, err := rb.Status(ctx, "test")
+	st, err := rb.Status(ctx)
 	if err != nil {
-		t.Fatalf("status should succeed with executor offline: %v", err)
+		t.Fatalf("status should succeed with all executors offline: %v", err)
 	}
 	if st.Seg1.LatencyMS == nil {
 		t.Errorf("seg1 should be present (transit online): %+v", st.Seg1)
 	}
-	if st.Seg2.LatencyMS != nil {
-		t.Errorf("seg2.latency_ms should be nil when executor offline, got %d", *st.Seg2.LatencyMS)
-	}
-	if st.Seg2.Unavailable == "" {
-		t.Error("seg2 should mark executor offline")
-	}
-	if st.Total.LatencyMS != nil {
-		t.Errorf("total should be unavailable when seg2 unavailable, got %d", *st.Total.LatencyMS)
+	if len(st.Executors) != 0 {
+		t.Errorf("executors should be empty when all offline, got %+v", st.Executors)
 	}
 }
 

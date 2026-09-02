@@ -168,13 +168,14 @@ verify() {
   sleep 3
   log "核验执行方版本 (relay status --json, 等待新提交 $want, 至多 ~60s) ..."
   for i in $(seq 1 15); do
-    js="$(relay status --json -c "$CONFIG" -w "$w" 2>/dev/null)" || { log "  重试 $i/15 status 查询 ..."; sleep 2; continue; }
-    # status --json 的 nodes[] 里,执行方节点的 commit 上报为 `"commit": "<GIT_COMMIT>"`。
-    if grep -q "\"commit\": \"$want\"" <<<"$js"; then
-      log "执行方已返回新提交 $want ✔"
+    js="$(relay status --json -c "$CONFIG" 2>/dev/null)" || { log "  重试 $i/15 status 查询 ..."; sleep 2; continue; }
+    # status --json 的各节点版本上报为 `"version": "<VERSION>+<COMMIT>"`(中转与执行方同源)。
+    # 整座部署(中转 + 各执行方)任一节点切到新提交即视为换装成功。
+    if grep -q "\"version\": \"[^\"]*+${want}\"" <<<"$js"; then
+      log "节点已返回新提交 $want ✔"
       return 0
     fi
-    log "  重试 $i/15 等待执行方切到新提交 ..."
+    log "  重试 $i/15 等待节点切到新提交 ..."
     sleep 2
   done
   log "核验超时:执行方未切到新提交 $want(RESTART=0 未换装时属预期)。"

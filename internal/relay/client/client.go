@@ -459,11 +459,12 @@ func (c *Client) Version(ctx context.Context) (protocol.VersionResponse, error) 
 	return vr, nil
 }
 
-// Status 向中转查询指定 watch 的连通性状态:中转→执行方 段与各端点版本台账。段1(本地→中转
-// 单程)由请求方本地 Ping 计时、累计由请求方累加,故此方法只返回中转侧组装的结果。
-func (c *Client) Status(ctx context.Context, watchID string) (protocol.StatusResponse, error) {
+// Status 向中转查询整座部署的连通状态:中转对每个执行方的探针结果(Executors)与中转节点
+// 信息(Transit)。段1(本地→中转往返)由请求方本地 Ping 计时、各执行方的累计(Total)由
+// 请求方按 段1+段2 求和,故此处只返回中转侧组装的结果。
+func (c *Client) Status(ctx context.Context) (protocol.StatusResponse, error) {
 	var st protocol.StatusResponse
-	resp, err := c.Request(ctx, protocol.MsgStatus, protocol.StatusRequest{WatchID: watchID})
+	resp, err := c.Request(ctx, protocol.MsgStatus, protocol.StatusRequest{})
 	if err != nil {
 		return st, err
 	}

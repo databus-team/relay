@@ -527,55 +527,87 @@ func (c *Client) handleVersion(msg protocol.Message) {
 	c.SendResponse(msg.ID, protocol.VersionResponse{OK: true, Nodes: c.versionLedger()})
 }
 
-// handleStatus 处理 `relay status` 的连通性体检:对指定执行方 watch 发探针并带回包超时,
-// 测「中转→执行方」段时延,连同版本台账(futures)组装成 StatusResponse 回给请求方。
-// 执行方 watch_id 按动态注册解析,不依赖 server 的 watch 白名单;不在线 / 时延超时该段标
-// 「不可用」,整条命令仍成功——语义是「中转在线、远端掉线」。
+// handleStatus 处理 `relay status` 的连通性体检。status 面向整座部署(不携带 watch):
+// 中转对**所有**已注册执行方各并发探针一次,测「中转→执行方」段时延,连同中转节点信息
+// 组装成 StatusResponse 回给请求方。全部执行方离线时仍成功回执(Executors 为空列表),
+// 语义是「中转在线、远端掉线」——绝不因无执行方而报错。
 func (c *Client) handleStatus(msg protocol.Message) {
-	payload, _ := msg.Payload.(map[string]interface{})
-	watchID := toString(payload["watch_id"])
-
-	executorID, ok := c.server.GetExecutor(watchID)
-	if !ok {
-		// 查询一个从未注册过执行方的 watch:一样回 success + offline,保持 status 幂等。
-		resp := protocol.StatusResponse{OK: true, Nodes: c.versionLedger()}
-		resp.Seg2 = protocol.StatusSegment{Unavailable: "executor offline"}
+	resp := protocol.StatusResponse{OK: true, Transit: c.transitVersion()}
+	endpoints := c.server.ExecutorEndpoints()
+	if len(endpoints) == 0 {
+		// 全部执行方离线/未注册:仍回 success + 空执行方列表。
 		c.SendResponse(msg.ID, resp)
 		return
 	}
 
-	resp := protocol.StatusResponse{OK: true, Nodes: c.versionLedger()}
-
-	probeID := uuid.New().String()
-	probeCh := c.server.registerPending(probeID)
-
-	// 探针复用 MsgPing→MsgPong:执行方在自身连接上回 MsgPong(RequestID=probeID),由
-	// 下方的 case MsgPong 命中 pending 并投递。RTT 即「中转→执行方」段。
-	// 发送带写超时兜底,防止 half-open 连接把探针写卡死(与等待回包一起受 statusProbeTimeout 约束)。
-	start := time.Now()
-	if err := c.server.sendProbe(executorID, protocol.Message{Type: protocol.MsgPing, ID: probeID}, statusProbeTimeout); err != nil {
-		c.server.deletePending(probeID)
-		resp.Seg2 = protocol.StatusSegment{Unavailable: "executor unavailable"}
-		c.SendResponse(msg.ID, resp)
-		return
+	watchIDs := make([]string, 0, len(endpoints))
+	for wid := range endpoints {
+		watchIDs = append(watchIDs, wid)
 	}
+	sort.Strings(watchIDs)
 
-	// 等待回包放到独立 goroutine,避免阻塞请求方连接的读循环(读循环是这台连接的唯一读者,
-	// 若在此同步等待 5s,该连接上其它入站帧(心跳/exec 回包/文件事件)都会被堵住)。
-	// 连接断开时 `c.closeCh` 关闭 → 立即返回并由 defer 清掉 pending,不必等满超时。
+	results := make([]protocol.ExecutorHealth, len(watchIDs))
+	// 各执行方独立连接,并发探针互不争用同一连接的写锁。回包等待放 goroutine,
+	// 避免阻塞请求方连接的读循环(读循环是这台连接的唯一读者,若在此同步阻塞,该连接上
+	// 其它入站帧——心跳/exec 回包/文件事件——都会被堵住)。连接断开时 `c.closeCh` 关闭,
+	// 各等待方由 defer 清 pending 直接返回,不必等满超时。
 	go func() {
-		defer c.server.deletePending(probeID)
-		select {
-		case <-probeCh:
-			latency := time.Since(start).Milliseconds()
-			resp.Seg2 = protocol.StatusSegment{LatencyMS: &latency}
-		case <-time.After(statusProbeTimeout):
-			resp.Seg2 = protocol.StatusSegment{Unavailable: "executor probe timeout"}
-		case <-c.closeCh:
-			return
+		var wg sync.WaitGroup
+		for i, wid := range watchIDs {
+			i, wid := i, wid // loop 变量捕获
+			ep := endpoints[wid]
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				results[i] = protocol.ExecutorHealth{
+					WatchID: wid,
+					Version: ep.Version,
+					Seg2:    c.probeExecutor(ep.ClientID),
+				}
+			}()
 		}
+		wg.Wait()
+		resp.Executors = results
 		_ = c.SendResponse(msg.ID, resp)
 	}()
+}
+
+// transitVersion 返回中转节点的构建信息(role=transit)。
+func (c *Client) transitVersion() protocol.VersionInfo {
+	return protocol.VersionInfo{
+		Role:      "transit",
+		Version:   version.Version,
+		Commit:    version.Commit,
+		BuildTime: version.Date,
+		GOOS:      runtime.GOOS,
+		GOARCH:    runtime.GOARCH,
+		Go:        runtime.Version(),
+	}
+}
+
+// probeExecutor 对单个执行方连接发一条探针并等待回过包,测「中纪→执行方」段往返 RTT。
+// 探针复用 MsgPing→MsgPong:执行方在自身连接上回 MsgPong(RequestID=probeID),由
+// maybeResolvePending 命中 pending 并投递。发送带写超时兜底,防止 half-open 连接把探针
+// 写卡死(与等待回包一同受 statusProbeTimeout 约束)。失败返回不可用段,不把错误上抛。
+func (c *Client) probeExecutor(executorID string) protocol.StatusSegment {
+	probeID := uuid.New().String()
+	probeCh := c.server.registerPending(probeID)
+	defer c.server.deletePending(probeID)
+
+	start := time.Now()
+	if err := c.server.sendProbe(executorID, protocol.Message{Type: protocol.MsgPing, ID: probeID}, statusProbeTimeout); err != nil {
+		return protocol.StatusSegment{Unavailable: "executor unavailable"}
+	}
+
+	select {
+	case <-probeCh:
+		latency := time.Since(start).Milliseconds()
+		return protocol.StatusSegment{LatencyMS: &latency}
+	case <-time.After(statusProbeTimeout):
+		return protocol.StatusSegment{Unavailable: "executor probe timeout"}
+	case <-c.closeCh:
+		return protocol.StatusSegment{Unavailable: "disconnected"}
+	}
 }
 
 // maybeResolvePending 把执行方的探针回包(带 RequestID 的 MsgPong)交给 `pending` 中的等待方。

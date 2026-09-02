@@ -446,6 +446,24 @@ func (s *Server) GetExecutor(watchID string) (string, bool) {
 	return e, ok
 }
 
+// ExecutorEndpoint 中转记录的单个已注册执行方端点(身份 + 构建版本)。
+type ExecutorEndpoint struct {
+	ClientID string
+	Version  string
+}
+
+// ExecutorEndpoints 返回全部已注册执行方的快照(watchID → 端点)。供 `relay status`
+// 对整座部署逐执行方探针;副本返回以保证调用方并发安全。
+func (s *Server) ExecutorEndpoints() map[string]ExecutorEndpoint {
+	s.executorMu.RLock()
+	defer s.executorMu.RUnlock()
+	out := make(map[string]ExecutorEndpoint, len(s.executors))
+	for wid, cid := range s.executors {
+		out[wid] = ExecutorEndpoint{ClientID: cid, Version: s.executorVers[wid]}
+	}
+	return out
+}
+
 // registerPending 登记一个中转探针的「待回包」通道(probeID → chan)。执行方回 MsgPong
 // 时按 RequestID 命中并投递,配合超时实现对 execution 段的 RTT 测量。
 func (s *Server) registerPending(probeID string) chan protocol.Message {

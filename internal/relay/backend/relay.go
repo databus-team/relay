@@ -685,28 +685,23 @@ func (b *RelayBackend) Ping(ctx context.Context, commandDir, watchID string) err
 	return b.client.Ping(ctx)
 }
 
-// Status 返回中当前运行于某 watch 的一站式连通性快照:本地→中纪(段1,本地 Ping 计时)、
-// 中纪→执行方(段2,由中转探针测得)与 本地累计;并附各端点版本台账。
-// 执行方离线/探针超时 → 段2 为空(标不可用),命令仍成功;段2 不可用时累计跟着不可用。
-//
-// 探针目的固定为本连接注册的服务端 watch (后端 config.watch_id):executor 正是经该 watch
-// 注册并接收转发(见 client.Connect 的 Subscribe),exec/push 也走它。而 CLI 的 `-w` 是
-// **本地工作区** id(多个 workspace 可共享一根 relay 连接),把它当服务端 watch 直传会得到
-// unknown watch_id。故发给中转的一律用 b.watchID;参数 `watchID` 仅作工作区标签,由上层
-// printStatus 展示,不参与探针寻址。
-func (b *RelayBackend) Status(ctx context.Context, watchID string) (protocol.StatusResponse, error) {
+// Status 查询整座部署(中转 + 所有执行方)的连通性快照:本地→中转 段1(本地 Ping 计时)、
+// 中转→各执行方 段2(中转过探针测得)以及本地累计(段1+段2)。执行方离线/探针超时时其
+// Seg2 标不可用、Total 留空,整条命令仍成功;全部执行方离线时空列表,仍输出「中转正常、
+// 执行方为空」。status 不针对单一执行方,故不再有 watch 参数。
+func (b *RelayBackend) Status(ctx context.Context) (protocol.StatusResponse, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return protocol.StatusResponse{}, err
 	}
 
-	// 段1:本地→中转 → 本地 Ping 计时(往返 RTT)。
+	// 段1:本地→中继 → 本地 Ping 计时(往返 RTT)。
 	seg1Start := time.Now()
 	if err := b.client.Ping(ctx); err != nil {
 		return protocol.StatusResponse{}, fmt.Errorf("ping transit: %w", err)
 	}
 	seg1 := time.Since(seg1Start).Milliseconds()
 
-	st, err := b.client.Status(ctx, b.watchID)
+	st, err := b.client.Status(ctx)
 	if err != nil {
 		return protocol.StatusResponse{}, err
 	}
@@ -715,11 +710,14 @@ func (b *RelayBackend) Status(ctx context.Context, watchID string) (protocol.Sta
 	}
 
 	st.Seg1 = protocol.StatusSegment{LatencyMS: &seg1}
-	if st.Seg2.LatencyMS != nil {
-		total := seg1 + *st.Seg2.LatencyMS
-		st.Total = protocol.StatusSegment{LatencyMS: &total}
-	} else {
-		st.Total = protocol.StatusSegment{Unavailable: st.Seg2.Unavailable}
+	for i := range st.Executors {
+		eh := &st.Executors[i]
+		if eh.Seg2.LatencyMS != nil {
+			total := seg1 + *eh.Seg2.LatencyMS
+			eh.Total = protocol.StatusSegment{LatencyMS: &total}
+		} else {
+			eh.Total = protocol.StatusSegment{Unavailable: eh.Seg2.Unavailable}
+		}
 	}
 	return st, nil
 }

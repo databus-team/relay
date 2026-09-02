@@ -367,7 +367,7 @@ func decodeStatus(t *testing.T, resp *protocol.Response) protocol.StatusResponse
 	return st
 }
 
-// TestIntegration_Status_Full:执行方在线时 status 返回 段2(>0)与 台账(中转+执行方)。
+// TestIntegration_Status_Full:执行方在线时 status 返回该执行端的探针(段2>0)与中转节点。
 func TestIntegration_Status_Full(t *testing.T) {
 	watchDir := t.TempDir()
 
@@ -381,7 +381,7 @@ func TestIntegration_Status_Full(t *testing.T) {
 	c := connectTestClient(t, wsURL)
 	defer c.Disconnect()
 
-	resp, err := c.Request(ctx, protocol.MsgStatus, protocol.StatusRequest{WatchID: "test-watch"})
+	resp, err := c.Request(ctx, protocol.MsgStatus, protocol.StatusRequest{})
 	if err != nil {
 		t.Fatalf("status query: %v", err)
 	}
@@ -389,27 +389,22 @@ func TestIntegration_Status_Full(t *testing.T) {
 		t.Fatalf("status not OK: %s", resp.Error)
 	}
 	st := decodeStatus(t, resp)
-	if st.Seg2.LatencyMS == nil || *st.Seg2.LatencyMS < 0 {
-		t.Errorf("seg2.latency_ms should be present >=0, got %v", st.Seg2.LatencyMS)
+	if len(st.Executors) != 1 {
+		t.Fatalf("executors: got %d, want 1: %+v", len(st.Executors), st.Executors)
 	}
-
-	var hasTransit, hasExecutor bool
-	for _, n := range st.Nodes {
-		switch n.Role {
-		case "transit":
-			hasTransit = true
-		case "executor":
-			if n.WatchID == "test-watch" && n.Version == "test-build-1" {
-				hasExecutor = true
-			}
-		}
+	e := st.Executors[0]
+	if e.WatchID != "test-watch" || e.Version != "test-build-1" {
+		t.Errorf("executor headers: got %+v", e)
 	}
-	if !hasTransit || !hasExecutor {
-		t.Errorf("status ledger should include transit and executor; got %+v", st.Nodes)
+	if e.Seg2.LatencyMS == nil || *e.Seg2.LatencyMS < 0 {
+		t.Errorf("executor seg2.latency_ms should be present >=0, got %v", e.Seg2.LatencyMS)
+	}
+	if st.Transit.Role != "transit" || st.Transit.Version == "" {
+		t.Errorf("transit node missing/empty: %+v", st.Transit)
 	}
 }
 
-// TestIntegration_Status_NoExecutor:无执行方时 段2 标不可用,命令仍成功(中转在线、远端掉线)。
+// TestIntegration_Status_NoExecutor:全部执行方离线时 Executors 为空列表,命令仍成功。
 func TestIntegration_Status_NoExecutor(t *testing.T) {
 	watchDir := t.TempDir()
 
@@ -420,7 +415,7 @@ func TestIntegration_Status_NoExecutor(t *testing.T) {
 	c := connectTestClient(t, wsURL)
 	defer c.Disconnect()
 
-	resp, err := c.Request(ctx, protocol.MsgStatus, protocol.StatusRequest{WatchID: "test-watch"})
+	resp, err := c.Request(ctx, protocol.MsgStatus, protocol.StatusRequest{})
 	if err != nil {
 		t.Fatalf("status query: %v", err)
 	}
@@ -428,11 +423,8 @@ func TestIntegration_Status_NoExecutor(t *testing.T) {
 		t.Fatalf("status should succeed even with executor offline: %s", resp.Error)
 	}
 	st := decodeStatus(t, resp)
-	if st.Seg2.LatencyMS != nil {
-		t.Errorf("seg2.latency_ms should be nil when executor offline, got %v", *st.Seg2.LatencyMS)
-	}
-	if st.Seg2.Unavailable == "" {
-		t.Errorf("seg2.unavailable should name the outage reason, got empty")
+	if len(st.Executors) != 0 {
+		t.Errorf("executors should be empty when none registered, got %+v", st.Executors)
 	}
 }
 
@@ -1336,7 +1328,7 @@ func TestIntegration_ExecutorDynamicWatch(t *testing.T) {
 	// status 必须能路由到动态 watch 且带出版本台账。
 	c := connectTestClient(t, wsURL)
 	defer c.Disconnect()
-	resp, err := c.Request(ctx, protocol.MsgStatus, protocol.StatusRequest{WatchID: "extraneous"})
+	resp, err := c.Request(ctx, protocol.MsgStatus, protocol.StatusRequest{})
 	if err != nil {
 		t.Fatalf("status for dynamic watch: %v", err)
 	}
@@ -1344,14 +1336,14 @@ func TestIntegration_ExecutorDynamicWatch(t *testing.T) {
 		t.Fatalf("status not OK for dynamic watch: %s", resp.Error)
 	}
 	st := decodeStatus(t, resp)
-	var hasExecutor bool
-	for _, n := range st.Nodes {
-		if n.Role == "executor" && n.WatchID == "extraneous" && n.Version == "dyn-build" {
-			hasExecutor = true
+	var found bool
+	for _, e := range st.Executors {
+		if e.WatchID == "extraneous" && e.Version == "dyn-build" {
+			found = true
 		}
 	}
-	if !hasExecutor {
-		t.Errorf("status ledger should include the dynamically-registered executor; got %+v", st.Nodes)
+	if !found {
+		t.Errorf("status executors should include the dynamically-registered executor; got %+v", st.Executors)
 	}
 
 	// exec 必须透明转发到动态 watch 的执行方并拿到回执。

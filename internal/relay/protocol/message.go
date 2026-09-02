@@ -163,23 +163,34 @@ type StatusSegment struct {
 	Unavailable string `json:"unavailable,omitempty"`
 }
 
-// StatusRequest 请求对某个 watch 做连通性体检(本地→中转→执行方)。
-type StatusRequest struct {
-	WatchID string `json:"watch_id"`
+// StatusRequest 请求对整座中转做连通性体检。不携带 watch:中转对全部已注册执行方
+// 各做一次 中→执行方 探针,请求方再补 本地→中转 段。无 watch 参数,因为 status 面向
+// 整座部署(中转 + 所有执行方),而非单个 workspace/executor。
+type StatusRequest struct{}
+
+// ExecutorHealth 中转对单个已注册执行方的体检结果。
+//   - WatchID: 执行方自注册的 watch_id(executor 身份)
+//   - Version: 该执行方的 relay 构建版本
+//   - Seg2:    中→执行方 往返 RTT;执行方离线/探针超时标不可用
+//   - Total:   Seg1(本地→中转)+ Seg2,由请求方在本地累加
+type ExecutorHealth struct {
+	WatchID string        `json:"watch_id"`
+	Version string        `json:"version,omitempty"`
+	Seg2    StatusSegment `json:"seg2"`
+	Total   StatusSegment `json:"total,omitempty"`
 }
 
 // StatusResponse 中转对 MsgStatus 的应答,承接 `relay status` 的一站式连通性+版本台账。
-//   - Seg1:  本地→中转 往返 RTT(由请求方本地 `Ping` 计时,中转不填)
-//   - Seg2:  中转→执行方 往返 RTT(由中转探针测得;执行方离线/未注册时标不可用)
-//   - Total: Seg1 + Seg2 两段 RTT 之和(由请求方累加)
-//   - Nodes: 参与端点版本台账(中转 + 各在线执行方)
+// status 面向整座部署:请求方不传 watch,中转对**所有**已注册执行方各探针一次。
+//   - Seg1:      本地→中转 往返 RTT(由请求方本地 `Ping` 计时,中转不填)
+//   - Transit:   中转节点构建信息
+//   - Executors: 各在线/已注册执行方的体检;全部离线则为空列表(而非报错)
 type StatusResponse struct {
-	OK    bool          `json:"ok"`
-	Error string        `json:"error,omitempty"`
-	Seg1  StatusSegment `json:"seg1"`
-	Seg2  StatusSegment `json:"seg2"`
-	Total StatusSegment `json:"total"`
-	Nodes []VersionInfo `json:"nodes,omitempty"`
+	OK        bool             `json:"ok"`
+	Error     string           `json:"error,omitempty"`
+	Seg1      StatusSegment    `json:"seg1"`
+	Transit   VersionInfo      `json:"transit,omitempty"`
+	Executors []ExecutorHealth `json:"executors,omitempty"`
 }
 
 // PushJobRequest push 一个文件直达远端执行方。
