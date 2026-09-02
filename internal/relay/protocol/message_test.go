@@ -122,6 +122,44 @@ func TestMessageRoundTrip(t *testing.T) {
 			},
 		},
 		{
+			name: "tunnel_connect",
+			msg: Message{
+				Type:     MsgTunnelConnect,
+				ID:       "tunnel-id-1",
+				StreamID: "tunnel-id-1",
+				Payload: TunnelConnectRequest{
+					WatchID:  "site-a",
+					Target:   "api.internal.com",
+					Port:     443,
+					StreamID: "tunnel-id-1",
+				},
+			},
+		},
+		{
+			name: "tunnel_data",
+			msg: Message{
+				Type:     MsgTunnelData,
+				ID:       "tun-data",
+				StreamID: "tunnel-id-1",
+				Payload: TunnelData{
+					StreamID: "tunnel-id-1",
+					Data:     []byte("hello-bytes"),
+				},
+			},
+		},
+		{
+			name: "tunnel_end",
+			msg: Message{
+				Type:     MsgTunnelEnd,
+				ID:       "tun-end",
+				StreamID: "tunnel-id-1",
+				Payload: TunnelEnd{
+					StreamID: "tunnel-id-1",
+					Reason:   "closed",
+				},
+			},
+		},
+		{
 			name: "stream_start",
 			msg: Message{
 				Type:     MsgStreamStart,
@@ -232,6 +270,39 @@ func TestServerUpgradeRequestRoundTrip(t *testing.T) {
 	}
 
 	if p.WatchID != in.WatchID || p.Size != in.Size || p.Digest != in.Digest || p.StreamID != in.StreamID {
+		t.Errorf("payload mismatch: got %+v, want %+v", p, in)
+	}
+}
+
+func TestTunnelConnectRequestRoundTrip(t *testing.T) {
+	in := TunnelConnectRequest{
+		WatchID:  "site-a",
+		Target:   "10.0.0.5",
+		Port:     8080,
+		StreamID: "tunnel-9",
+	}
+
+	msg := Message{Type: MsgTunnelConnect, ID: in.StreamID, StreamID: in.StreamID, Payload: in}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got Message
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	raw, err := json.Marshal(got.Payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	var p TunnelConnectRequest
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+
+	if p.WatchID != in.WatchID || p.Target != in.Target || p.Port != in.Port || p.StreamID != in.StreamID {
 		t.Errorf("payload mismatch: got %+v, want %+v", p, in)
 	}
 }

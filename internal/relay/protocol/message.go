@@ -29,6 +29,9 @@ const (
 	MsgVersion          MessageType = "version"
 	MsgStatus           MessageType = "status"
 	MsgServerUpgrade    MessageType = "server_upgrade"
+	MsgTunnelConnect    MessageType = "tunnel_connect"
+	MsgTunnelData       MessageType = "tunnel_data"
+	MsgTunnelEnd        MessageType = "tunnel_end"
 )
 
 // Message 是所有消息的通用包装
@@ -209,6 +212,31 @@ type ServerUpgradeRequest struct {
 	Size     int64  `json:"size"`
 	Digest   string `json:"digest"` // sha256 十六进制,落盘后校验
 	StreamID string `json:"stream_id"`
+}
+
+// 隧道消息族(经 executor 出网的 SOCKS5 隧道):
+//   - MsgTunnelConnect  本地请求方 → 中转 → executor 的建连请求(携带目标与出口 watch)。
+//   - MsgTunnelData     双向字节流帧。
+//   - MsgTunnelEnd       隧道关闭(任一端断开);另一端收到后关停本地连接。
+// 建连确认(成功/失败)经 MsgResponse/MsgError 回执(以建连消息 ID 作 RequestID),
+// 复用 exec 的转发-回包路径。多 executor 由 TunnelConnectRequest.WatchID 选定出口。
+type TunnelConnectRequest struct {
+	WatchID  string `json:"watch_id,omitempty"` // 出口 executor 拥有的 watch;空=按 WatchID 推断
+	Target   string `json:"target"`             // 目标主机(域名/IP 字面量)
+	Port     uint16 `json:"port"`               // 目标端口
+	StreamID string `json:"stream_id"`          // 隧道 ID(全局唯一)
+}
+
+// TunnelData 双向隧道字节流帧。Data 经 JSON base64 承载(与 ws 流式帧同风味,不走二进制帧)。
+type TunnelData struct {
+	StreamID string `json:"stream_id"`
+	Data     []byte `json:"data,omitempty"`
+}
+
+// TunnelEnd 隧道关闭:任一端断开即发,告知/关停另一端。
+type TunnelEnd struct {
+	StreamID string `json:"stream_id"`
+	Reason   string `json:"reason,omitempty"`
 }
 
 // PushRequest 上传文件请求
