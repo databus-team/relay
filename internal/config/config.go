@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -61,12 +62,12 @@ type BackendConfig struct {
 }
 
 type JobConfig struct {
-	ID       string `yaml:"id"`
-	Type     string `yaml:"type"` // 仅 exec;删除统一用 exec(如 `rm -f {file_path}`)
-	Cmd      string `yaml:"cmd,omitempty"`
-	Cwd      string `yaml:"cwd,omitempty"`
-	If       string `yaml:"if,omitempty"`
-	Timeout  int    `yaml:"timeout,omitempty"` // seconds, optional per-job timeout
+	ID      string `yaml:"id"`
+	Type    string `yaml:"type"` // 仅 exec;删除统一用 exec(如 `rm -f {file_path}`)
+	Cmd     string `yaml:"cmd,omitempty"`
+	Cwd     string `yaml:"cwd,omitempty"`
+	If      string `yaml:"if,omitempty"`
+	Timeout int    `yaml:"timeout,omitempty"` // seconds, optional per-job timeout
 }
 
 // ExpandHome expands a leading "~" in path to the user's home directory and
@@ -155,6 +156,149 @@ func ApplyConfigFile(payload []byte, configPath string) error {
 		return fmt.Errorf("atomic replace config: %w", err)
 	}
 	return nil
+}
+
+// ExecutorOwnedKeys 是执行方自身身份/角色/本机相关的 backend.config 键,config-sync
+// 不得覆盖,应从执行方当前落盘配置保留。本地(协调方)配置缺这些字段无碍;执行方缺了
+// 会导致注册失败——如 `executor: true`(角色开关,缺则 enableExecutor 不执行)与
+// `watch_id`(注册身份)被覆盖掉最典型。
+var ExecutorOwnedKeys = []string{
+	"watch_id", "watch_dir", "command_dir", "executor",
+	"executor_dir", "config_path", "network_allow", "headers",
+}
+
+// MergeConfigPreservingIdentity 把 incoming 配置叠加到 configPath 的当前配置上,其中
+// backend.config 里属于 ExecutorOwnedKeys 的键从当前配置保留,其余(workspaces / name /
+// version / url / token / 其它 backend.config 键)取 incoming。返回合并后的 YAML 字节,
+// 供后续 ApplyConfigFile 原子写回。这是两条 config-sync 通道(relay WS 与 watcher 命令
+// 文件)共用的接缝,修复"本地直推会把执行器身份覆写掉"的问题。
+//
+// 合并行为:当前文件不存在或不可解析 → 原样返回 incoming(退化为整体覆写,无身份可保留);
+// incoming 不可解析 → 返回 error(拒绝写,与现有校验一致);owned 键只在当前文件存在时
+// 保留(base 胜出),绝不凭空造键;其它 incoming 键/结构一律不删。
+func MergeConfigPreservingIdentity(incoming []byte, configPath string) ([]byte, error) {
+	var inc yaml.Node
+	if err := yaml.Unmarshal(incoming, &inc); err != nil {
+		return nil, fmt.Errorf("parse incoming config: %w", err)
+	}
+
+	baseBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		return incoming, nil // 无当前文件可保留 → 退化为整体覆写
+	}
+	var base yaml.Node
+	if err := yaml.Unmarshal(baseBytes, &base); err != nil {
+		return incoming, nil // 当前文件不可解析 → 同样退化为整体覆写
+	}
+
+	incRoot := nodeRoot(&inc)
+	baseRoot := nodeRoot(&base)
+	baseBackend := mapKey(baseRoot, "backend")
+	if baseBackend == nil || baseBackend.Kind != yaml.MappingNode {
+		return incoming, nil // 当前配置没有 backend 段可保留
+	}
+	baseCfg := mapKey(baseBackend, "config")
+	if baseCfg == nil || baseCfg.Kind != yaml.MappingNode {
+		return incoming, nil
+	}
+
+	// incoming 无 backend.config 时补一个空 mapping,好让身份字段有地方落。
+	incBackend := mapKey(incRoot, "backend")
+	if incBackend == nil {
+		incBackend = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		incRoot.Content = append(incRoot.Content, keyNode("backend"), incBackend)
+	} else if incBackend.Kind != yaml.MappingNode {
+		return incoming, nil // incoming backend 非映射,无从合并,退化为整体覆写
+	}
+	incCfg := mapKey(incBackend, "config")
+	if incCfg == nil {
+		incCfg = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		incBackend.Content = append(incBackend.Content, keyNode("config"), incCfg)
+	} else if incCfg.Kind != yaml.MappingNode {
+		return incoming, nil
+	}
+
+	for _, k := range ExecutorOwnedKeys {
+		baseVal := mapKey(baseCfg, k)
+		if baseVal == nil {
+			continue // 当前文件无此键,不凭空造
+		}
+		repl := cloneNode(baseVal)
+		if i, ok := mapIndex(incCfg, k); ok {
+			incCfg.Content[i+1] = repl
+		} else {
+			incCfg.Content = append(incCfg.Content, keyNode(k), repl)
+		}
+	}
+
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(&inc); err != nil {
+		return nil, fmt.Errorf("marshal merged config: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// nodeRoot 返回文档的根映射节点(剥掉 DocumentNode)。
+func nodeRoot(n *yaml.Node) *yaml.Node {
+	if n.Kind == yaml.DocumentNode && len(n.Content) > 0 {
+		return n.Content[0]
+	}
+	return n
+}
+
+// mapKey 在映射节点中取 key 对应的值节点;m 非映射或找不到返回 nil。
+func mapKey(m *yaml.Node, key string) *yaml.Node {
+	if m == nil || m.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			return m.Content[i+1]
+		}
+	}
+	return nil
+}
+
+// mapIndex 返回 key 在映射节点 Content 中的下标(i 指向键),命中则 i+1 为值节点。
+func mapIndex(m *yaml.Node, key string) (int, bool) {
+	if m == nil || m.Kind != yaml.MappingNode {
+		return 0, false
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// keyNode 构造一个 yaml.v3 的标量键节点。
+func keyNode(key string) *yaml.Node {
+	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}
+}
+
+// cloneNode 深度拷贝 yaml.Node,保证切片/映射等嵌套结构原样往返,且不与其他站点共享节点。
+func cloneNode(n *yaml.Node) *yaml.Node {
+	c := &yaml.Node{
+		Kind:        n.Kind,
+		Tag:         n.Tag,
+		Value:       n.Value,
+		Style:       n.Style,
+		Anchor:      n.Anchor,
+		Alias:       n.Alias,
+		LineComment: n.LineComment,
+		HeadComment: n.HeadComment,
+		FootComment: n.FootComment,
+	}
+	if len(n.Content) > 0 {
+		c.Content = make([]*yaml.Node, len(n.Content))
+		for i := range n.Content {
+			c.Content[i] = cloneNode(n.Content[i])
+		}
+	}
+	return c
 }
 
 func (c *Config) GetBackendType() string {

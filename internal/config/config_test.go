@@ -4,6 +4,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestLoadConfig(t *testing.T) {
@@ -127,4 +129,175 @@ workspaces:
 	if len(cfg.Workspaces[0].Jobs) != 1 {
 		t.Errorf("jobs: %d", len(cfg.Workspaces[0].Jobs))
 	}
+}
+
+// 表驱动测试:config-sync 保留执行方身份字段(MergeConfigPreservingIdentity)。
+func TestMergeConfigPreservingIdentity(t *testing.T) {
+	baseCfg := `name: relay
+version: 2
+backend:
+  type: relay
+  config:
+    url: ws://transit:8443/relay
+    token: tok
+    watch_id: site-b
+    executor: true
+    executor_dir: /remote/proj
+    network_allow:
+      - "10.0.0.0/8@80,443"
+      - "api.internal.com@443"
+    headers:
+      Cookie: "sid=abc"
+`
+	incomingTrimmed := `name: relay
+version: 3
+backend:
+  type: relay
+  config:
+    url: ws://newhost:8443/relay
+    token: newtok
+workspaces:
+  - id: web-app-patches
+    watch_dir: .
+    paths: ["*.patch"]
+`
+
+	t.Run("identity survives + shared overlaid", func(t *testing.T) {
+		dir := t.TempDir()
+		p := dir + "/config.yaml"
+		if err := os.WriteFile(p, []byte(baseCfg), 0644); err != nil {
+			t.Fatal(err)
+		}
+		merged, err := MergeConfigPreservingIdentity([]byte(incomingTrimmed), p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := unmarshalMap(t, merged)
+		got := m["backend"].(map[string]interface{})["config"].(map[string]interface{})
+		if got["watch_id"] != "site-b" {
+			t.Errorf("watch_id = %v (want preserved site-b)", got["watch_id"])
+		}
+		if got["executor"] != true {
+			t.Errorf("executor = %v (want preserved true)", got["executor"])
+		}
+		if got["executor_dir"] != "/remote/proj" {
+			t.Errorf("executor_dir = %v", got["executor_dir"])
+		}
+		// 共享字段取 incoming
+		if got["url"] != "ws://newhost:8443/relay" {
+			t.Errorf("url = %v (want incoming)", got["url"])
+		}
+		if got["token"] != "newtok" {
+			t.Errorf("token = %v (want incoming)", got["token"])
+		}
+		// 切片/映射完整往返
+		na := got["network_allow"].([]interface{})
+		if len(na) != 2 || na[0] != "10.0.0.0/8@80,443" {
+			t.Errorf("network_allow = %v", got["network_allow"])
+		}
+		hd := got["headers"].(map[string]interface{})
+		if hd["Cookie"] != "sid=abc" {
+			t.Errorf("headers = %v", got["headers"])
+		}
+	})
+
+	t.Run("base wins when both present", func(t *testing.T) {
+		stdin := `backend:
+  config:
+    executor: false
+    watch_id: shadow
+`
+		dir := t.TempDir()
+		p := dir + "/config.yaml"
+		if err := os.WriteFile(p, []byte(baseCfg), 0644); err != nil {
+			t.Fatal(err)
+		}
+		merged, err := MergeConfigPreservingIdentity([]byte(stdin), p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := unmarshalMap(t, merged)["backend"].(map[string]interface{})["config"].(map[string]interface{})
+		if got["executor"] != true {
+			t.Errorf("executor = %v (want base true)", got["executor"])
+		}
+		if got["watch_id"] != "site-b" {
+			t.Errorf("watch_id = %v (want base site-b)", got["watch_id"])
+		}
+	})
+
+	t.Run("no base file degrades to incoming", func(t *testing.T) {
+		dir := t.TempDir()
+		merged, err := MergeConfigPreservingIdentity([]byte(incomingTrimmed), dir+"/missing.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := unmarshalMap(t, merged)["backend"].(map[string]interface{})["config"].(map[string]interface{})
+		if _, ok := m["watch_id"]; ok {
+			t.Errorf("watch_id should be absent (identity not invented)")
+		}
+		if m["url"] != "ws://newhost:8443/relay" {
+			t.Errorf("url = %v", m["url"])
+		}
+	})
+
+	t.Run("incoming without backend.config still keeps identity", func(t *testing.T) {
+		incomingNoBackend := `name: relay
+version: 3
+workspaces:
+  - id: w
+`
+		dir := t.TempDir()
+		p := dir + "/config.yaml"
+		if err := os.WriteFile(p, []byte(baseCfg), 0644); err != nil {
+			t.Fatal(err)
+		}
+		merged, err := MergeConfigPreservingIdentity([]byte(incomingNoBackend), p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := unmarshalMap(t, merged)
+		cfg := m["backend"].(map[string]interface{})["config"].(map[string]interface{})
+		if cfg["executor"] != true || cfg["watch_id"] != "site-b" {
+			t.Errorf("identity not preserved: %v", cfg)
+		}
+		if len(m["workspaces"].([]interface{})) != 1 {
+			t.Errorf("workspaces not overlaid")
+		}
+	})
+
+	t.Run("corrupt base → falls back to incoming", func(t *testing.T) {
+		dir := t.TempDir()
+		p := dir + "/config.yaml"
+		if err := os.WriteFile(p, []byte(":::not yaml"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		merged, err := MergeConfigPreservingIdentity([]byte(incomingTrimmed), p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := unmarshalMap(t, merged)["backend"].(map[string]interface{})["config"].(map[string]interface{})
+		if _, ok := m["executor"]; ok {
+			t.Errorf("executor should be absent from corrupt-base fallback")
+		}
+	})
+
+	t.Run("bad incoming → error", func(t *testing.T) {
+		dir := t.TempDir()
+		p := dir + "/config.yaml"
+		if err := os.WriteFile(p, []byte(baseCfg), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := MergeConfigPreservingIdentity([]byte("not: [valid"), p); err == nil {
+			t.Errorf("want parse error for invalid incoming")
+		}
+	})
+}
+
+func unmarshalMap(t *testing.T, b []byte) map[string]interface{} {
+	t.Helper()
+	var m map[string]interface{}
+	if err := yaml.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal merged: %v\n%s", err, b)
+	}
+	return m
 }

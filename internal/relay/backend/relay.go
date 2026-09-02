@@ -373,7 +373,15 @@ func (b *RelayBackend) handleInboundConfigSync(sess *client.ConfigSyncSession) {
 		_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: "config-sync: bad base64: " + err.Error()})
 		return
 	}
-	if err := config.ApplyConfigFile(payload, b.configPath); err != nil {
+	// 保留执行方自身身份字段(watch_id/executor/... 见 config.ExecutorOwnedKeys):
+	// 本地协调方配置通常没有这些,整体覆写会把执行方身份清掉导致注册失败。
+	merged, err := config.MergeConfigPreservingIdentity(payload, b.configPath)
+	if err != nil {
+		log.Printf("[config-sync] merge failed: %v", err)
+		_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: err.Error()})
+		return
+	}
+	if err := config.ApplyConfigFile(merged, b.configPath); err != nil {
 		log.Printf("[config-sync] apply failed: %v", err)
 		_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: err.Error()})
 		return

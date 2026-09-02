@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	bk "github.com/user/relay/internal/backend"
+	"github.com/user/relay/internal/config"
 	"github.com/user/relay/internal/relay/client"
 	"github.com/user/relay/internal/relay/server"
 )
@@ -143,7 +144,71 @@ func TestEndToEnd_ConfigSync(t *testing.T) {
 	}
 }
 
-// end-to-end: 请求方 PushJob 直达执行方,执行方落盘并跑本地 job,推送流回。
+// 端到端:config-sync 必须保留执行方身份字段(executor/watch_id),不得被本地协调方
+// 配置覆写,否则注册失败。
+func TestEndToEnd_ConfigSyncPreservesExecutorIdentity(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
+
+	watchDir := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	// seed 一份带执行器身份的运行配置
+	if err := os.WriteFile(configPath, []byte("name: relay\nversion: 2\nbackend:\n  type: relay\n  config:\n    watch_id: test\n    executor: true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ts, wsURL := newTestHub(t, watchDir)
+	defer ts.Close()
+	defer client.CloseAll()
+
+	ctx := context.Background()
+
+	if _, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-exe", "watch_id": "test", "executor": true,
+		"config_path": configPath,
+	}); err != nil {
+		t.Fatalf("executor backend: %v", err)
+	}
+	reqBackend, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+	cs, ok := reqBackend.(bk.ConfigSyncCapable)
+	if !ok {
+		t.Fatalf("requester backend does not implement ConfigSyncCapable")
+	}
+
+	// 推来的本地协调方配置不含 watch_id/executor
+	payload := []byte("name: relay\nversion: 3\nbackend:\n  type: relay\n  config:\n    url: ws://x:8443/relay\nworkspaces:\n  - id: w\n    paths: [\"*.patch\"]\n")
+	exit, err := cs.ConfigSync(ctx, "", payload)
+	if err != nil {
+		t.Fatalf("config sync: %v", err)
+	}
+	if exit != 0 {
+		t.Fatalf("config sync exit: %d", exit)
+	}
+
+	got, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read synced config: %v", err)
+	}
+	cfg, err := config.LoadFromBytes(got)
+	if err != nil {
+		t.Fatalf("parse synced config: %v", err)
+	}
+	if cfg.Backend.Config["executor"] != true {
+		t.Errorf("executor identity lost: %#v", cfg.Backend.Config["executor"])
+	}
+	if cfg.Backend.Config["watch_id"] != "test" {
+		t.Errorf("watch_id identity lost: got %v", cfg.Backend.Config["watch_id"])
+	}
+	if v, _ := cfg.Backend.Config["url"].(string); v != "ws://x:8443/relay" {
+		t.Errorf("shared url not overlaid: %v", cfg.Backend.Config["url"])
+	}
+}
+
+// end-to-end: 请求方 PushJob 直达执行方,目的端落盘并跑本地 job,推送流回。
 func TestEndToEnd_PushJob(t *testing.T) {
 	SetExecutorRole(true)
 	defer SetExecutorRole(false)

@@ -504,12 +504,22 @@ func (w *Watcher) handleConfigSync(ctx context.Context, cmd exchange.CmdFile, b 
 	}
 	log.Printf("[commands] Config backed up to: %s", backupPath)
 
+	// 保留执行方自身身份字段(watch_id/executor/... 见 config.ExecutorOwnedKeys):
+	// 本地协调方配置通常没有这些,整体覆写会把执行方身份清掉导致注册失败。
+	merged, err := config.MergeConfigPreservingIdentity(payload, w.configPath)
+	if err != nil {
+		result.ExitCode = 1
+		result.Stderr = "failed to merge config: " + err.Error()
+		log.Printf("[commands] Config sync merge failed: %v", err)
+		return result, nil
+	}
+
 	// 立刻落盘,而不是"stage 到下一次 runOnce":事件驱动模式(relay 后端)的主循环
-	// 从不调用 runOnce → applyPending 只在 interval 模式被调用,导致 sync 后配置
-	// 永远不落盘(日志显示成功但文件仍旧)。这里先存入 pending 再立即 apply 原子写盘,
-	// 两种模式对同步发起的配置变更都即时生效。
+	// 从不调用 runOnce → applyConfig 只在非执行模式被调用,导致 sync 后配置
+	// 永远不落盘(日志显示成功但文件仍旧)。这里 patch 存入 pending 后先存 merged
+	// 再立即 apply 原子写盘,两种模式对同步发起的配置变更都即时生效。
 	w.pendingConfigMu.Lock()
-	w.pendingConfig = payload
+	w.pendingConfig = merged
 	w.pendingConfigMu.Unlock()
 
 	if err := w.applyPendingConfig(); err != nil {

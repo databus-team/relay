@@ -247,6 +247,55 @@ func TestHandleConfigSyncAppliesImmediately(t *testing.T) {
 	}
 }
 
+// handleConfigSync 必须保留执行方身份字段(config-sync 不得覆写 executor/watch_id 等)。
+func TestHandleConfigSyncPreservesExecutorIdentity(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	// seed 一份带执行器身份的运行配置
+	if err := os.WriteFile(configPath, []byte("name: relay\nversion: 2\nbackend:\n  type: relay\n  config:\n    watch_id: site-b\n    executor: true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := &Watcher{cfg: &config.Config{}, configPath: configPath}
+
+	// 推来的本地协调方配置不含 watch_id/executor
+	payload := []byte("name: relay\nversion: 3\nbackend:\n  type: relay\n  config:\n    url: ws://x:8443/relay\nworkspaces:\n  - id: w\n    paths: [\"*.patch\"]\n")
+	cmd := exchange.CmdFile{
+		ID:      "sync-2",
+		Op:      exchange.ConfigSyncOp,
+		Payload: base64.StdEncoding.EncodeToString(payload),
+	}
+
+	res, err := w.handleConfigSync(context.Background(), cmd, nil)
+	if err != nil {
+		t.Fatalf("handleConfigSync: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("exit=%d stderr=%s", res.ExitCode, res.Stderr)
+	}
+
+	got, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read applied config: %v", err)
+	}
+	cfg, err := config.LoadFromBytes(got)
+	if err != nil {
+		t.Fatalf("parse applied config: %v", err)
+	}
+	if cfg.Backend.Config["executor"] != true {
+		t.Errorf("executor identity lost: %#v", cfg.Backend.Config["executor"])
+	}
+	if cfg.Backend.Config["watch_id"] != "site-b" {
+		t.Errorf("watch_id identity lost: got %v", cfg.Backend.Config["watch_id"])
+	}
+	if v, _ := cfg.Backend.Config["url"].(string); v != "ws://x:8443/relay" {
+		t.Errorf("shared url not overlaid: %v", cfg.Backend.Config["url"])
+	}
+	if len(cfg.Workspaces) != 1 || cfg.Workspaces[0].ID != "w" {
+		t.Errorf("workspaces not overlaid: %+v", cfg.Workspaces)
+	}
+}
+
 // findWatchForEvent 按事件子路径路由到对应 workspace。
 func TestFindWatchForEventRoutesBySubdir(t *testing.T) {
 	w := &Watcher{cfg: &config.Config{Workspaces: []config.WorkspaceConfig{
