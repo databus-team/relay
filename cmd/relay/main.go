@@ -101,6 +101,11 @@ var (
 	// server-remote command - 一键部署中转(受控自升级):上传新二进制 → 中转自检 → 换装 → 核验。
 	serverRemoteCmd = kingpin.Command("server-remote", "一键部署中转:上传新 relay 二进制并经中转受控自升级,断线重连后核验版本")
 	serverRemoteBin = serverRemoteCmd.Flag("binary", "Path to the new relay binary to send (default: current executable)").String()
+
+	// Tunnel command - 本地 SOCKS5 出网隧道,经所选 executor 出口访问内网白名单目标。
+	tunnelCmd    = kingpin.Command("tunnel", "本地 SOCKS5 出网隧道:经所选 executor 访问其内网白名单目标")
+	tunnelListen = tunnelCmd.Flag("listen", "Local SOCKS5 listen address").Default("127.0.0.1:1080").String()
+	tunnelWatch  = tunnelCmd.Flag("watch", "Target watch ID for egress executor (defaults to current directory name)").Short('w').String()
 )
 
 func main() {
@@ -186,6 +191,8 @@ func main() {
 		runServerRemote()
 	case jobRun.FullCommand():
 		runJobRun()
+	case tunnelCmd.FullCommand():
+		runTunnel()
 	default:
 		app.Usage(os.Args)
 	}

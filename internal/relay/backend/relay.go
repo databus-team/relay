@@ -310,7 +310,17 @@ func (b *RelayBackend) PushNoJobs(ctx context.Context, dest string, content []by
 	return resp.ExitCode, nil
 }
 
-// ConfigSync 请求方把新配置经中转直达执行方落盘(WS 流式通道,不写 command 文件)。
+// TunnelOpen 打开一条到远端 exec 出网的隧道(本地 SOCKS5 端点按需调用)。`watchID` 声明选用
+// 哪台 executor 的出口(与 exec/push/status 的工作区寻址一致);命中 watch 无在线执行方时,
+// TunnelOpen 在建连确认即失败并返回可读错误(无可用执行方)。
+func (b *RelayBackend) TunnelOpen(ctx context.Context, watchID, target string, port uint16) (*client.TunnelStream, error) {
+	if err := b.ensureConnected(ctx); err != nil {
+		return nil, err
+	}
+	return b.client.TunnelOpen(ctx, watchID, target, port)
+}
+
+// ConfigSync 请求方把新配置经中转流式直达执行方落盘(WS 流式通道,不写 command 文件)。
 func (b *RelayBackend) ConfigSync(ctx context.Context, payload []byte) (int, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return 1, err
