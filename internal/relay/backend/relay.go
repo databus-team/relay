@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +35,9 @@ type RelayBackend struct {
 	configPath string // config-sync 落盘目标(执行方)
 	eventCh    chan backend.FileInfo
 	mu         sync.RWMutex
+
+	// tunnelAllow 是执行方 network_allow 出网白名单(已解析)。空 = 默认拒绝一切隧道建连(fail-closed)。
+	tunnelAllow []config.TunnelRule
 
 	// 注册成功日志只打一次(重连会反复 registerExecutor,信息本身每次都要发,
 	// 但成功提示按需降级为 debug,避免刷屏)。
@@ -69,45 +74,53 @@ func executorRoleOn() bool {
 }
 
 type Config struct {
-	URL         string            `mapstructure:"url" yaml:"url"`
-	Token       string            `mapstructure:"token" yaml:"token"`
-	WatchID     string            `mapstructure:"watch_id" yaml:"watch_id"`
-	WatchDir    string            `mapstructure:"watch_dir" yaml:"watch_dir"`
-	CommandDir  string            `mapstructure:"command_dir" yaml:"command_dir"`
-	ExecutorDir string            `mapstructure:"executor_dir" yaml:"executor_dir"`
-	Executor    bool              `mapstructure:"executor" yaml:"executor"`
-	ConfigPath  string            `mapstructure:"config_path" yaml:"config_path"` // 执行方 config-sync 落盘目标(缺省 ~/.relay/config.yaml)
-	Headers     map[string]string `mapstructure:"headers" yaml:"headers"`         // WS 握手自定义头(中转前置鉴权)
+	URL          string            `mapstructure:"url" yaml:"url"`
+	Token        string            `mapstructure:"token" yaml:"token"`
+	WatchID      string            `mapstructure:"watch_id" yaml:"watch_id"`
+	WatchDir     string            `mapstructure:"watch_dir" yaml:"watch_dir"`
+	CommandDir   string            `mapstructure:"command_dir" yaml:"command_dir"`
+	ExecutorDir  string            `mapstructure:"executor_dir" yaml:"executor_dir"`
+	Executor     bool              `mapstructure:"executor" yaml:"executor"`
+	ConfigPath   string            `mapstructure:"config_path" yaml:"config_path"`     // 执行方 config-sync 落盘目标(缺省 ~/.relay/config.yaml)
+	NetworkAllow []string          `mapstructure:"network_allow" yaml:"network_allow"` // 隧道出网白名单(host/IP/CIDR+端port);空=默认拒绝(fail-closed)
+	Headers      map[string]string `mapstructure:"headers" yaml:"headers"`             // WS 握手自定义头(中转前置鉴权)
 }
 
-func NewRelayBackend(config map[string]interface{}) (backend.FileTransferBackend, error) {
+func NewRelayBackend(params map[string]interface{}) (backend.FileTransferBackend, error) {
 	var cfg Config
 
-	if url, ok := config["url"].(string); ok {
+	if url, ok := params["url"].(string); ok {
 		cfg.URL = url
 	}
-	if token, ok := config["token"].(string); ok {
+	if token, ok := params["token"].(string); ok {
 		cfg.Token = token
 	}
-	if watchID, ok := config["watch_id"].(string); ok {
+	if watchID, ok := params["watch_id"].(string); ok {
 		cfg.WatchID = watchID
 	}
-	if watchDir, ok := config["watch_dir"].(string); ok {
+	if watchDir, ok := params["watch_dir"].(string); ok {
 		cfg.WatchDir = watchDir
 	}
-	if commandDir, ok := config["command_dir"].(string); ok {
+	if commandDir, ok := params["command_dir"].(string); ok {
 		cfg.CommandDir = commandDir
 	}
-	if exec, ok := config["executor"].(bool); ok {
+	if exec, ok := params["executor"].(bool); ok {
 		cfg.Executor = exec
 	}
-	if dir, ok := config["executor_dir"].(string); ok {
+	if dir, ok := params["executor_dir"].(string); ok {
 		cfg.ExecutorDir = dir
 	}
-	if cp, ok := config["config_path"].(string); ok {
+	if cp, ok := params["config_path"].(string); ok {
 		cfg.ConfigPath = cp
 	}
-	if raw, ok := config["headers"].(map[string]interface{}); ok {
+	if raw, ok := params["network_allow"].([]interface{}); ok {
+		for _, v := range raw {
+			if s, ok := v.(string); ok {
+				cfg.NetworkAllow = append(cfg.NetworkAllow, s)
+			}
+		}
+	}
+	if raw, ok := params["headers"].(map[string]interface{}); ok {
 		cfg.Headers = make(map[string]string, len(raw))
 		for k, v := range raw {
 			if s, ok := v.(string); ok {
@@ -154,6 +167,13 @@ func NewRelayBackend(config map[string]interface{}) (backend.FileTransferBackend
 		execDir:    cfg.ExecutorDir,
 		configPath: cfg.ConfigPath,
 		eventCh:    make(chan backend.FileInfo, 100),
+	}
+
+	// 出网白名单:解析失败即配置错误,初始化即拒绝(不静默放行)。
+	if allow, err := config.ParseNetworkAllowlist(cfg.NetworkAllow); err != nil {
+		return nil, fmt.Errorf("network_allow: %w", err)
+	} else {
+		b.tunnelAllow = allow
 	}
 
 	if cfg.Executor && executorRoleOn() {
@@ -317,6 +337,7 @@ func (b *RelayBackend) enableExecutor() {
 	b.client.SetExecHandler(func(sess *client.ExecSession) { b.handleInboundExec(sess) })
 	b.client.SetPushJobHandler(func(sess *client.PushJobSession) { b.handleInboundPushJob(sess) })
 	b.client.SetConfigSyncHandler(func(sess *client.ConfigSyncSession) { b.handleInboundConfigSync(sess) })
+	b.client.SetTunnelHandler(func(sess *client.TunnelSession) { b.handleInboundTunnelConnect(sess) })
 	b.client.SetOnReconnect(b.registerExecutor)
 	b.registerExecutor()
 }
@@ -337,6 +358,29 @@ func (b *RelayBackend) handleInboundConfigSync(sess *client.ConfigSyncSession) {
 	}
 	log.Printf("[config-sync] applied %d bytes -> %s (restart relay watch to take effect)", len(payload), b.configPath)
 	_ = sess.Done(protocol.ExecResponse{ExitCode: 0, Stdout: fmt.Sprintf("config applied to %s; restart relay watch to take effect", b.configPath)})
+}
+
+// handleInboundTunnelConnect 执行方收到中转转发来的隧道建连:校验 network_allow 白名单,
+// 命中则向**已校验的 IP 字面量**发起真实 TCP(dial 用 IP 而非原始 hostname,防 DNS 重绑 TOCTOU),
+// 连成回执 OK 并交回给 session 泵双向字节流;未命中/dial 失败一律 Reject、不建任何内网连接(默认拒绝)。
+// 空/缺省 network_allow → CheckTunnelTarget 恒不命中,全部拒绝(fail-closed,AE6)。
+func (b *RelayBackend) handleInboundTunnelConnect(sess *client.TunnelSession) {
+	ip, ok := config.CheckTunnelTarget(b.tunnelAllow, sess.Target(), int(sess.Port()))
+	if !ok {
+		log.Printf("[tunnel] deny target %s:%d (watch=%s) not in network_allow", sess.Target(), sess.Port(), sess.WatchID())
+		sess.Reject(fmt.Sprintf("target %s:%d not allowed by network_allow", sess.Target(), sess.Port()))
+		return
+	}
+
+	addr := net.JoinHostPort(ip.String(), strconv.Itoa(int(sess.Port())))
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		log.Printf("[tunnel] dial %s failed: %v", addr, err)
+		sess.Reject("dial " + addr + ": " + err.Error())
+		return
+	}
+	log.Printf("[tunnel] conn %s:%d via %s (watch=%s)", sess.Target(), sess.Port(), addr, sess.WatchID())
+	sess.Accept(conn)
 }
 
 // SetPushJobHandler 注册「push 文件落地后本地跑 jobs」的回调(由远端 relay watch 注入)。

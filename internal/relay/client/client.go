@@ -49,6 +49,12 @@ type Client struct {
 	pushRecvMu sync.RWMutex
 	pushRecv   map[string]*inboundPushReceive // streamID -> 入站流式 push 接收状态
 
+	tunnelHandler  func(*TunnelSession) // 执行方入站隧道建连回调
+	tunnelHandlerM sync.RWMutex
+	tunnelConns    map[string]*tunnelConn   // 入站隧道(executor):streamID -> 真实 TCP
+	tunnelStreams  map[string]*TunnelStream // 出站隧道(requester):streamID -> 本地 SOCKS/SOCKS 通
+	tunnelMu       sync.RWMutex
+
 	onReconnect   func() // 重连成功后的回调(执行方用于重新注册)
 	onReconnectMu sync.Mutex
 }
@@ -63,19 +69,21 @@ func WithHeaders(h http.Header) Option {
 
 func New(url, token, watchID string, opts ...Option) (*Client, error) {
 	c := &Client{
-		url:          url,
-		token:        token,
-		watchID:      watchID,
-		sendCh:       make(chan sendMsg, 100),
-		recvCh:       make(chan *protocol.Message, 100),
-		eventCh:      make(chan protocol.FileEvent, 100),
-		pending:      make(map[string]chan *protocol.Response),
-		closeCh:      make(chan struct{}),
-		reconnectCfg: DefaultReconnectConfig(),
-		streams:      make(map[string]*receiveStream),
-		streamDone:   make(map[string]chan error),
-		execStreams:  make(map[string]chan *protocol.Message),
-		pushRecv:     make(map[string]*inboundPushReceive),
+		url:           url,
+		token:         token,
+		watchID:       watchID,
+		sendCh:        make(chan sendMsg, 100),
+		recvCh:        make(chan *protocol.Message, 100),
+		eventCh:       make(chan protocol.FileEvent, 100),
+		pending:       make(map[string]chan *protocol.Response),
+		closeCh:       make(chan struct{}),
+		reconnectCfg:  DefaultReconnectConfig(),
+		streams:       make(map[string]*receiveStream),
+		streamDone:    make(map[string]chan error),
+		execStreams:   make(map[string]chan *protocol.Message),
+		pushRecv:      make(map[string]*inboundPushReceive),
+		tunnelConns:   make(map[string]*tunnelConn),
+		tunnelStreams: make(map[string]*TunnelStream),
 	}
 	for _, o := range opts {
 		o(c)
@@ -257,6 +265,12 @@ func (c *Client) handleMessage(msg protocol.Message) {
 	switch msg.Type {
 	case protocol.MsgExec:
 		c.handleInboundExec(msg)
+	case protocol.MsgTunnelConnect:
+		c.handleInboundTunnelConnect(msg)
+	case protocol.MsgTunnelData:
+		c.handleInboundTunnelData(msg)
+	case protocol.MsgTunnelEnd:
+		c.handleInboundTunnelEnd(msg)
 	case protocol.MsgPushJob:
 		c.handleInboundPushJob(msg)
 	case protocol.MsgConfigSync:
