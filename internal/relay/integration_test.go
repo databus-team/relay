@@ -234,7 +234,7 @@ func TestIntegration_ExecStream(t *testing.T) {
 	}
 	var chunks []chunk
 
-	resp, err := c.ExecStream(ctx, "whatever", "", 10, func(ch protocol.ExecChunk) {
+	resp, err := c.ExecStream(ctx, "", "whatever", "", 10, func(ch protocol.ExecChunk) {
 		chunks = append(chunks, chunk{stdout: ch.Stdout, data: ch.Data})
 	})
 	if err != nil {
@@ -1363,4 +1363,89 @@ func TestIntegration_ExecutorDynamicWatch(t *testing.T) {
 		t.Fatalf("exec to dynamic watch errored: %s", exresp.Error)
 	}
 	_ = dir
+}
+
+// registerExecClientAt 连接一个充当执行方的客户端:为指定 watchID 注册 executor,
+// 收到入站 exec 时回显 "<marker> <cmd>";用于验证 workspace 绑定的 executor 路由。
+func registerExecClientAt(t *testing.T, wsURL, watchID, marker string) *client.Client {
+	t.Helper()
+	ctx := context.Background()
+	exec := connectTestClient(t, wsURL)
+	exec.SetExecHandler(func(sess *client.ExecSession) {
+		go func() {
+			_ = sess.Write(true, marker+" "+sess.Cmd()+"\n")
+			_ = sess.Done(protocol.ExecResponse{ExitCode: 0})
+		}()
+	})
+	if err := exec.RegisterExecutor(ctx, watchID, "add", "route-build"); err != nil {
+		t.Fatalf("register executor %s: %v", watchID, err)
+	}
+	return exec
+}
+
+// TestWorkspaceExecutorRouting:同一请求方按 targetWatch 把 exec 路由到不同 executor。
+// 模拟一个 workspace 配了 executor: site-a、另一个配 site-b、无 executor 的走根回退。
+func TestWorkspaceExecutorRouting(t *testing.T) {
+	watchDir := t.TempDir()
+	cfg := server.Config{
+		Addr: ":0",
+		WatchDirs: []server.WatchDirConfig{
+			{ID: "site-a", Dir: watchDir},
+			{ID: "site-b", Dir: watchDir},
+			{ID: "test-watch", Dir: watchDir}, // requester 的根 watch
+		},
+		Auth: server.AuthConfig{Type: "token", Tokens: []string{"test-token"}},
+	}
+	srv, err := server.New(cfg)
+	if err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/relay"
+
+	execA := registerExecClientAt(t, wsURL, "site-a", "A")
+	defer execA.Disconnect()
+	execB := registerExecClientAt(t, wsURL, "site-b", "B")
+	defer execB.Disconnect()
+	execRoot := registerExecClientAt(t, wsURL, "test-watch", "ROOT")
+	defer execRoot.Disconnect()
+
+	ctx := context.Background()
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	// workspace.Executor=site-a -> 路由到 site-a
+	ra, err := c.ExecStream(ctx, "site-a", "echo x", "", 10, nil)
+	if err != nil || ra.ExitCode != 0 {
+		t.Fatalf("exec site-a: exit=%v err=%v", ra, err)
+	}
+	if !strings.Contains(ra.Stdout, "A echo x") {
+		t.Errorf("site-a stdout: %q", ra.Stdout)
+	}
+
+	// workspace.Executor=site-b -> 路由到 site-b
+	rb, err := c.ExecStream(ctx, "site-b", "echo y", "", 10, nil)
+	if err != nil || rb.ExitCode != 0 {
+		t.Fatalf("exec site-b: exit=%v err=%v", rb, err)
+	}
+	if !strings.Contains(rb.Stdout, "B echo y") {
+		t.Errorf("site-b stdout: %q", rb.Stdout)
+	}
+
+	// 无 executor 字段(空) -> 单根回退到根 watch
+	rr, err := c.ExecStream(ctx, "", "echo z", "", 10, nil)
+	if err != nil || rr.ExitCode != 0 {
+		t.Fatalf("exec root fallback: exit=%v err=%v", rr, err)
+	}
+	if !strings.Contains(rr.Stdout, "ROOT echo z") {
+		t.Errorf("root stdout: %q", rr.Stdout)
+	}
+
+	// 未注册执行方的 watch -> 明确报错(negative pin)
+	if _, err := c.ExecStream(ctx, "nowhere", "echo q", "", 10, nil); err == nil {
+		t.Fatal("expected error routing to unknown executor, got nil")
+	} else if !strings.Contains(err.Error(), "no executor") {
+		t.Errorf("unexpected error: %v", err)
+	}
 }

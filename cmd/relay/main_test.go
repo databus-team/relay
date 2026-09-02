@@ -67,7 +67,7 @@ backend:
   type: local
   config:
     base_dir: /tmp/relay
-watch:
+workspaces:
   - id: web-app-patches
     watch_dir: projects/web-app/patches
     local_dir: /home/me/repos/web
@@ -99,7 +99,7 @@ backend:
   type: local
   config:
     base_dir: /tmp/relay
-watch: []
+workspaces: []
 interval_seconds: 60
 `
 
@@ -110,7 +110,7 @@ backend:
   type: local
   config:
     base_dir: /tmp/relay
-watch:
+workspaces:
   - id: dup
     watch_dir: a
     local_dir: /a
@@ -309,7 +309,7 @@ func TestWorkspaces_NameHit_JSON(t *testing.T) {
 
 func TestResolveWatches_NoName_ReturnsAll(t *testing.T) {
 	cfg := &config.Config{}
-	cfg.Watch = []config.WatchConfig{
+	cfg.Workspaces = []config.WorkspaceConfig{
 		{ID: "a"}, {ID: "b"},
 	}
 	got, err := resolveWatches(cfg, "")
@@ -323,7 +323,7 @@ func TestResolveWatches_NoName_ReturnsAll(t *testing.T) {
 
 func TestResolveWatches_Hit_ReturnsSingle(t *testing.T) {
 	cfg := &config.Config{}
-	cfg.Watch = []config.WatchConfig{
+	cfg.Workspaces = []config.WorkspaceConfig{
 		{ID: "a", WatchDir: "x"},
 		{ID: "b", WatchDir: "y"},
 	}
@@ -341,21 +341,21 @@ func TestResolveWatches_Hit_ReturnsSingle(t *testing.T) {
 
 func TestResolveWatches_Miss_ReturnsCanonicalError(t *testing.T) {
 	cfg := &config.Config{}
-	cfg.Watch = []config.WatchConfig{{ID: "a"}}
+	cfg.Workspaces = []config.WorkspaceConfig{{ID: "a"}}
 
 	_, err := resolveWatches(cfg, "missing")
 	if err == nil {
 		t.Fatal("expected error for missing workspace, got nil")
 	}
-	if !strings.Contains(err.Error(), "watch not found: missing") {
+	if !strings.Contains(err.Error(), "workspace not found: missing") {
 		t.Errorf("error should contain canonical not-found message, got: %v", err)
 	}
 }
 
 func TestResolveWatches_FirstMatchOnDuplicateID(t *testing.T) {
-	// Pins existing GetWatchByID behavior so a future refactor notices.
+	// Pins existing GetWorkspaceByID behavior so a future refactor notices.
 	cfg := &config.Config{}
-	cfg.Watch = []config.WatchConfig{
+	cfg.Workspaces = []config.WorkspaceConfig{
 		{ID: "dup", WatchDir: "first"},
 		{ID: "dup", WatchDir: "second"},
 	}
@@ -421,5 +421,48 @@ func TestWorkspaces_WorkspacesAlias(t *testing.T) {
 		if selected != cmd.FullCommand() {
 			t.Errorf("kingpin.Parse(%q) = %q, want %q (alias should resolve to main name)", arg, selected, cmd.FullCommand())
 		}
+	}
+}
+
+// TestResolvePushWorkspace_ExecutorBinding:workspace 上的 executor 字段决定该 workspace
+// 由哪个执行器(watch_id)接收 push;无 executor 的走单根回退。
+func TestResolvePushWorkspace_ExecutorBinding(t *testing.T) {
+	cfg := &config.Config{Workspaces: []config.WorkspaceConfig{
+		{ID: "wa", WatchDir: "/proj/a", Executor: ""},
+		{ID: "wb", WatchDir: "/proj/b", Executor: "site-a"},
+		{ID: "wc", WatchDir: "/proj/c", Executor: "site-b"},
+	}}
+
+	// site-a 明确绑定的 workspace 只有一个 -> 直接命中 wb。
+	if wc := resolvePushWorkspace(cfg, "site-a", "/x/any/path/whatever"); wc == nil || wc.ID != "wb" {
+		t.Errorf("site-a should resolve to wb, got %v", wc)
+	}
+	// site-b -> wc。
+	if wc := resolvePushWorkspace(cfg, "site-b", "/x/any/path/whatever"); wc == nil || wc.ID != "wc" {
+		t.Errorf("site-b should resolve to wc, got %v", wc)
+	}
+	// 无 executor(根回退):按路径 watch_dir 命中 wa。
+	if wc := resolvePushWorkspace(cfg, "root", "/proj/wa/file.patch"); wc == nil || wc.ID != "wa" {
+		t.Errorf("root fallback should resolve to wa by path, got %v", wc)
+	}
+
+	if got := cfg.GetWorkspacesByExecutor("site-a"); len(got) != 1 || got[0].ID != "wb" {
+		t.Errorf("GetWorkspacesByExecutor(site-a) = %v, want [wb]", got)
+	}
+}
+
+// TestResolvePushWorkspace_MultiOwnerByPath:同一 executor 绑定多个 workspace 时按路径消歧。
+func TestResolvePushWorkspace_MultiOwnerByPath(t *testing.T) {
+	cfg := &config.Config{Workspaces: []config.WorkspaceConfig{
+		{ID: "wb", WatchDir: "/proj/b", Executor: "site-a"},
+		{ID: "we", WatchDir: "/proj/e", Executor: "site-a"},
+	}}
+	// site-a 拥有 wb、we 两个:落盘路径含 /proj/e -> we。
+	if wc := resolvePushWorkspace(cfg, "site-a", "/proj/e/file.patch"); wc == nil || wc.ID != "we" {
+		t.Errorf("multi-owner by path should resolve to we, got %v", wc)
+	}
+	// 路径不含任何 watch_dir(Dir stub)时兜底返回第一个 owned(确定性)。
+	if wc := resolvePushWorkspace(cfg, "site-a", "/tmp/all-else.none"); wc == nil {
+		t.Errorf("expected deterministic fallback to an owner, got nil")
 	}
 }

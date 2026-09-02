@@ -31,7 +31,7 @@ type Result struct {
 // is non-empty it is bound to the {file_path}, {file_name}, {file_dir} and
 // {file_remote_path} variables. Conditions (job.If) are deliberately ignored:
 // a manual run has no preceding job results to evaluate against.
-func Run(ctx context.Context, watchCfg *config.WatchConfig, jobID, file string) (Result, error) {
+func Run(ctx context.Context, watchCfg *config.WorkspaceConfig, jobID, file string) (Result, error) {
 	var job *config.JobConfig
 	for i := range watchCfg.Jobs {
 		if watchCfg.Jobs[i].ID == jobID {
@@ -47,7 +47,7 @@ func Run(ctx context.Context, watchCfg *config.WatchConfig, jobID, file string) 
 
 // runOne executes a single resolved job and returns its Result (with exit code,
 // duration and captured output) and a wrapped error on failure.
-func runOne(ctx context.Context, watchCfg *config.WatchConfig, job *config.JobConfig, file string) (Result, error) {
+func runOne(ctx context.Context, watchCfg *config.WorkspaceConfig, job *config.JobConfig, file string) (Result, error) {
 	start := time.Now()
 	done := func(r Result, err error) (Result, error) {
 		r.Duration = time.Since(start)
@@ -97,7 +97,7 @@ type Step struct {
 // its Result set. Conditions (job.If) are deliberately ignored, mirroring Run.
 // Returns the overall exit code: 0 if all steps succeeded, else the first
 // failing job's exit code (or 1 when it carried none).
-func RunJobs(ctx context.Context, watchCfg *config.WatchConfig, file string, report func(Step)) int {
+func RunJobs(ctx context.Context, watchCfg *config.WorkspaceConfig, file string, report func(Step)) int {
 	total := len(watchCfg.Jobs)
 	for i := range watchCfg.Jobs {
 		job := &watchCfg.Jobs[i]

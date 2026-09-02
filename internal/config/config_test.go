@@ -23,7 +23,7 @@ backend:
     base_dir: /tmp
     command_dir: /commands
 
-watch:
+workspaces:
   - id: test
     watch_dir: /tmp
     paths: ["*.txt"]
@@ -56,11 +56,11 @@ interval_seconds: 60
 	if cfg.Backend.Type != "local" {
 		t.Errorf("Expected backend type 'local', got '%s'", cfg.Backend.Type)
 	}
-	if len(cfg.Watch) != 1 {
-		t.Errorf("Expected 1 watcher, got %d", len(cfg.Watch))
+	if len(cfg.Workspaces) != 1 {
+		t.Errorf("Expected 1 watcher, got %d", len(cfg.Workspaces))
 	}
-	if cfg.Watch[0].ID != "test" {
-		t.Errorf("Expected watcher id 'test', got '%s'", cfg.Watch[0].ID)
+	if cfg.Workspaces[0].ID != "test" {
+		t.Errorf("Expected watcher id 'test', got '%s'", cfg.Workspaces[0].ID)
 	}
 }
 
@@ -86,7 +86,7 @@ backend:
     url: "wss://t:8443/relay"
     watch_id: patches
 
-watch:
+workspaces:
   - id: patches
     watch_dir: app/patches
     local_dir: /srv/repo
@@ -118,13 +118,13 @@ watch:
 		t.Errorf("server.tls: %+v", cfg.Server.TLS)
 	}
 
-	if len(cfg.Watch) != 1 {
-		t.Fatalf("watches: %d", len(cfg.Watch))
+	if len(cfg.Workspaces) != 1 {
+		t.Fatalf("watches: %d", len(cfg.Workspaces))
 	}
-	if cfg.Watch[0].TTL != 30*time.Minute {
-		t.Errorf("watch.ttl: %v (want 30m)", cfg.Watch[0].TTL)
+	if cfg.Workspaces[0].TTL != 30*time.Minute {
+		t.Errorf("watch.ttl: %v (want 30m)", cfg.Workspaces[0].TTL)
 	}
-	if len(cfg.Watch[0].Jobs) != 1 {
-		t.Errorf("jobs: %d", len(cfg.Watch[0].Jobs))
+	if len(cfg.Workspaces[0].Jobs) != 1 {
+		t.Errorf("jobs: %d", len(cfg.Workspaces[0].Jobs))
 	}
 }

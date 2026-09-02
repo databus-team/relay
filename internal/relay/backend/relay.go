@@ -238,7 +238,7 @@ func (b *RelayBackend) SupportsExec() bool { return true }
 // Exec 缓冲式执行并返回 stdout。
 func (b *RelayBackend) Exec(ctx context.Context, cmd string, cwd string, timeout int) (string, error) {
 	var out strings.Builder
-	exit, err := b.ExecStream(ctx, cmd, cwd, timeout, func(c backend.ExecChunk) { out.WriteString(c.Data) })
+	exit, err := b.ExecStream(ctx, "", cmd, cwd, timeout, func(c backend.ExecChunk) { out.WriteString(c.Data) })
 	if err != nil {
 		return out.String(), err
 	}
@@ -249,12 +249,16 @@ func (b *RelayBackend) Exec(ctx context.Context, cmd string, cwd string, timeout
 }
 
 // ExecStream 流式执行:本地 CLI 作为请求方时,经中转把命令转发给远端 executor 并实时回调输出。
-func (b *RelayBackend) ExecStream(ctx context.Context, cmd string, cwd string, timeout int, onChunk func(backend.ExecChunk)) (int, error) {
+// targetWatch 若非空即目标 executor 的注册 watch_id(workspace 绑定到该 executor 时);空=单根回退。
+func (b *RelayBackend) ExecStream(ctx context.Context, targetWatch, cmd string, cwd string, timeout int, onChunk func(backend.ExecChunk)) (int, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return 0, err
 	}
+	if targetWatch == "" {
+		targetWatch = b.watchID
+	}
 
-	resp, err := b.client.ExecStream(ctx, cmd, cwd, timeout, func(chunk protocol.ExecChunk) {
+	resp, err := b.client.ExecStream(ctx, targetWatch, cmd, cwd, timeout, func(chunk protocol.ExecChunk) {
 		if onChunk != nil {
 			onChunk(backend.ExecChunk{Stdout: chunk.Stdout, Data: chunk.Data})
 		}
@@ -281,12 +285,15 @@ func (b *RelayBackend) Transport(ctx context.Context, targetWatch, dest string, 
 	return nil
 }
 
-// PushJob 将文件直达远端执行方并触发其本地 jobs;输出流式回调。无在线执行方时由中转兜底落地。
-func (b *RelayBackend) PushJob(ctx context.Context, relPath string, content []byte, on func(backend.ExecChunk)) (int, error) {
+// PushJob 将文件直达发到远端执行器并触发其本地 jobs;输出流式回调。无在线执行器时由中转兜底落地。
+func (b *RelayBackend) PushJob(ctx context.Context, targetWatch, relPath string, content []byte, on func(backend.ExecChunk)) (int, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return 0, err
 	}
-	resp, err := b.client.PushJob(ctx, relPath, content, func(ch protocol.ExecChunk) {
+	if targetWatch == "" {
+		targetWatch = b.watchID
+	}
+	resp, err := b.client.PushJob(ctx, targetWatch, relPath, content, func(ch protocol.ExecChunk) {
 		if on != nil {
 			on(backend.ExecChunk{Stdout: ch.Stdout, Data: ch.Data})
 		}
@@ -297,13 +304,17 @@ func (b *RelayBackend) PushJob(ctx context.Context, relPath string, content []by
 	return resp.ExitCode, nil
 }
 
-// PushNoJobs 把内容纯下发到本 watch 执行方的 dest 绝对路径(Jobs=false 的 transport 通道),
+// PushNoJobs 把内容纯下发到执行器的 dest 绝对路径(Jobs=false 的 transport 通道),
 // 不触发任何 workspace job。对应 `relay push --no-jobs --dest <abs>`。
-func (b *RelayBackend) PushNoJobs(ctx context.Context, dest string, content []byte) (int, error) {
+// targetWatch 为空时回退到本 watch(根)执行器。
+func (b *RelayBackend) PushNoJobs(ctx context.Context, targetWatch, dest string, content []byte) (int, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return 0, err
 	}
-	resp, err := b.client.Transport(ctx, b.watchID, dest, content)
+	if targetWatch == "" {
+		targetWatch = b.watchID
+	}
+	resp, err := b.client.Transport(ctx, targetWatch, dest, content)
 	if err != nil {
 		return 0, err
 	}

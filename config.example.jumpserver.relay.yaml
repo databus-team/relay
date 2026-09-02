@@ -10,7 +10,7 @@ backend:
     username: ${JUMPSERVER_USERNAME}
     password: ${JUMPSERVER_PASSWORD}
 
-watch:
+workspaces:
   - id: web-app-patches
     watch_dir: /patches/web-app
     local_dir: /workspace/web-app

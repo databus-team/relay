@@ -13,7 +13,7 @@ import (
 
 func TestResolveWorkspaceID_ExplicitWins(t *testing.T) {
 	cfg := &config.Config{}
-	cfg.Watch = []config.WatchConfig{{ID: "b"}}
+	cfg.Workspaces = []config.WorkspaceConfig{{ID: "b"}}
 	got, err := resolveWorkspaceID(cfg, "b")
 	if err != nil || got != "b" {
 		t.Fatalf("got %q, err %v; want explicit value to win", got, err)
@@ -26,7 +26,7 @@ func TestResolveWorkspaceID_SingleMatchFromCwd(t *testing.T) {
 	name := filepath.Base(dir)
 
 	cfg := &config.Config{}
-	cfg.Watch = []config.WatchConfig{{ID: name, LocalDir: "x"}, {ID: "other", LocalDir: "y"}}
+	cfg.Workspaces = []config.WorkspaceConfig{{ID: name, LocalDir: "x"}, {ID: "other", LocalDir: "y"}}
 
 	got, err := resolveWorkspaceID(cfg, "")
 	if err != nil {
@@ -42,7 +42,7 @@ func TestResolveWorkspaceID_NoMatchListsAvailable(t *testing.T) {
 	t.Chdir(dir)
 
 	cfg := &config.Config{}
-	cfg.Watch = []config.WatchConfig{{ID: "web", LocalDir: "/w"}, {ID: "api", LocalDir: "/a"}}
+	cfg.Workspaces = []config.WorkspaceConfig{{ID: "web", LocalDir: "/w"}, {ID: "api", LocalDir: "/a"}}
 
 	_, err := resolveWorkspaceID(cfg, "")
 	if err == nil {
@@ -59,7 +59,7 @@ func TestResolveWorkspaceID_AmbiguousMatch(t *testing.T) {
 	name := filepath.Base(dir)
 
 	cfg := &config.Config{}
-	cfg.Watch = []config.WatchConfig{{ID: name, LocalDir: "/first"}, {ID: name, LocalDir: "/second"}}
+	cfg.Workspaces = []config.WorkspaceConfig{{ID: name, LocalDir: "/first"}, {ID: name, LocalDir: "/second"}}
 
 	_, err := resolveWorkspaceID(cfg, "")
 	if err == nil {
@@ -86,7 +86,7 @@ func TestPull_DeleteRemovesRemoteFile(t *testing.T) {
 	}
 
 	cfgContent := "name: relay\nversion: 1\nbackend:\n  type: local\n  config:\n    base_dir: " + base + "\n" +
-		"watch:\n  - id: demo\n    watch_dir: " + watchDir + "\n    local_dir: /tmp\n    paths: [\"*.patch\"]\ninterval_seconds: 60\n"
+		"workspaces:\n  - id: demo\n    watch_dir: " + watchDir + "\n    local_dir: /tmp\n    paths: [\"*.patch\"]\ninterval_seconds: 60\n"
 	_, cleanup := withTempConfig(t, cfgContent)
 	defer cleanup()
 
@@ -122,7 +122,7 @@ func TestPull_NoDeleteKeepsRemote(t *testing.T) {
 	}
 
 	cfgContent := "name: relay\nversion: 1\nbackend:\n  type: local\n  config:\n    base_dir: " + base + "\n" +
-		"watch:\n  - id: demo\n    watch_dir: " + watchDir + "\n    local_dir: /tmp\n    paths: [\"*.patch\"]\ninterval_seconds: 60\n"
+		"workspaces:\n  - id: demo\n    watch_dir: " + watchDir + "\n    local_dir: /tmp\n    paths: [\"*.patch\"]\ninterval_seconds: 60\n"
 	_, cleanup := withTempConfig(t, cfgContent)
 	defer cleanup()
 

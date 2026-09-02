@@ -84,9 +84,13 @@ type ExecRequest struct {
 
 // ExecStream 发送执行请求并流式接收输出。onChunk 每次收到增量输出帧时回调(nil 可忽略)。
 // 返回最终 ExecResponse(含聚合 stdout/stderr 与 exit code)。
-func (c *Client) ExecStream(ctx context.Context, cmd, cwd string, timeout int, onChunk func(protocol.ExecChunk)) (*protocol.ExecResponse, error) {
+// targetWatch 若非空则以它作为请求路由键(目标执行器 watch_id);空则回退到本端根 watch。
+func (c *Client) ExecStream(ctx context.Context, targetWatch, cmd, cwd string, timeout int, onChunk func(protocol.ExecChunk)) (*protocol.ExecResponse, error) {
 	if timeout <= 0 {
 		timeout = 30
+	}
+	if targetWatch == "" {
+		targetWatch = c.watchID
 	}
 
 	reqID, ch := c.registerInStream()
@@ -96,7 +100,7 @@ func (c *Client) ExecStream(ctx context.Context, cmd, cwd string, timeout int, o
 		Type: protocol.MsgExec,
 		ID:   reqID,
 		Payload: protocol.ExecRequest{
-			WatchID: c.watchID,
+			WatchID: targetWatch,
 			Cmd:     cmd,
 			Cwd:     cwd,
 			Timeout: timeout,
@@ -157,7 +161,7 @@ func (c *Client) execRoundTrip(ctx context.Context, ch chan *protocol.Message, o
 
 // Exec 缓冲式执行(流式结果聚合后一次性返回),保持向后兼容。
 func (c *Client) Exec(ctx context.Context, cmd string, cwd string, timeout int) (*protocol.ExecResponse, error) {
-	return c.ExecStream(ctx, cmd, cwd, timeout, nil)
+	return c.ExecStream(ctx, "", cmd, cwd, timeout, nil)
 }
 
 // UpgradeServer 把本地构建的 relay 二进制以流式分块 + sha256 摘要交付给中转(请求方视角),
@@ -222,9 +226,13 @@ func (c *Client) ConfigSync(ctx context.Context, payload []byte) (*protocol.Exec
 	return c.execRoundTrip(ctx, ch, nil)
 }
 
-// PushJob 将文件内容以 64KB 分块流式直达远端执行方,在其项目目录落地并触发流式 jobs。
-// 返回最终 ExecResponse(含 job 输出与 exit code);无在线执行方时由中转兜底暂存。
-func (c *Client) PushJob(ctx context.Context, relPath string, content []byte, onChunk func(protocol.ExecChunk)) (*protocol.ExecResponse, error) {
+// PushJob 将文件内容以 64KB 分块流式直达远端执行方并在其项目目录落地触发流式 jobs。
+// 返回最终 ExecResponse(含写入 jobs 输出与 exit code);无在线执行方时由中转兜底暂存。
+// targetWatch 语义同 ExecStream(空=单根回退)。
+func (c *Client) PushJob(ctx context.Context, targetWatch, relPath string, content []byte, onChunk func(protocol.ExecChunk)) (*protocol.ExecResponse, error) {
+	if targetWatch == "" {
+		targetWatch = c.watchID
+	}
 	if len(content) == 0 {
 		content = []byte{}
 	}
@@ -242,7 +250,7 @@ func (c *Client) PushJob(ctx context.Context, relPath string, content []byte, on
 		Type: protocol.MsgPushJob,
 		ID:   reqID,
 		Payload: protocol.PushJobRequest{
-			WatchID:  c.watchID,
+			WatchID:  targetWatch,
 			RelPath:  relPath,
 			Size:     total,
 			Digest:   digest,

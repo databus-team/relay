@@ -10,8 +10,8 @@ import (
 	"github.com/user/relay/internal/config"
 )
 
-func baseWatch() *config.WatchConfig {
-	return &config.WatchConfig{
+func baseWatch() *config.WorkspaceConfig {
+	return &config.WorkspaceConfig{
 		ID: "demo",
 		// No LocalDir by default so exec jobs run in the process cwd; the
 		// LocalDir-default behavior is covered separately in

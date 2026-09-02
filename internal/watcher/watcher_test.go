@@ -40,8 +40,8 @@ func (b *stubBackend) Ping(ctx context.Context, commandDir, watchID string) erro
 func TestLoadFromBytes(t *testing.T) {
 	// Test that LoadFromBytes parses config correctly
 	cfg := &config.Config{
-		Watch:    []config.WatchConfig{},
-		Interval: 60,
+		Workspaces: []config.WorkspaceConfig{},
+		Interval:   60,
 	}
 	_ = cfg
 }
@@ -49,8 +49,8 @@ func TestLoadFromBytes(t *testing.T) {
 func TestWatcherConfigPathStored(t *testing.T) {
 	// Test that configPath is stored in watcher
 	cfg := &config.Config{
-		Watch:    []config.WatchConfig{},
-		Interval: 60,
+		Workspaces: []config.WorkspaceConfig{},
+		Interval:   60,
 	}
 
 	tmpDir := t.TempDir()
@@ -249,7 +249,7 @@ func TestHandleConfigSyncAppliesImmediately(t *testing.T) {
 
 // findWatchForEvent 按事件子路径路由到对应 workspace。
 func TestFindWatchForEventRoutesBySubdir(t *testing.T) {
-	w := &Watcher{cfg: &config.Config{Watch: []config.WatchConfig{
+	w := &Watcher{cfg: &config.Config{Workspaces: []config.WorkspaceConfig{
 		{ID: "backend", WatchDir: "databus_backend", Paths: []string{"*.patch"}},
 		{ID: "web", WatchDir: "databus_web", Paths: []string{"*.patch"}},
 		{ID: "test", WatchDir: "databus_backend", Paths: []string{"*.test"}}, // 与 backend 同目录,靠模式区分

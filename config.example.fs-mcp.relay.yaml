@@ -10,7 +10,7 @@ backend:
     headers:
       Cookie: "${FS_MCP_COOKIE}"
 
-watch:
+workspaces:
   - id: web-app-patches
     watch_dir: /patches/web-app     # 远端 MCP 中转站目录
     local_dir: /workspace/web-app  # 本机工作目录

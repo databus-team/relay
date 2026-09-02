@@ -471,17 +471,17 @@ func runWorkspaces() {
 
 // resolveWatches returns the slice of workspaces to render. When name is
 // non-empty it looks up the single matching workspace; when name is empty it
-// returns the full list. Errors propagate from config.GetWatchByID (e.g. "watch
+// returns the full list. Errors propagate from config.GetWorkspaceByID (e.g. "watch
 // not found: <id>") so callers can surface them with their own exit handling.
-func resolveWatches(cfg *config.Config, name string) ([]config.WatchConfig, error) {
+func resolveWatches(cfg *config.Config, name string) ([]config.WorkspaceConfig, error) {
 	if name == "" {
-		return cfg.Watch, nil
+		return cfg.Workspaces, nil
 	}
-	w, err := cfg.GetWatchByID(name)
+	w, err := cfg.GetWorkspaceByID(name)
 	if err != nil {
 		return nil, err
 	}
-	return []config.WatchConfig{*w}, nil
+	return []config.WorkspaceConfig{*w}, nil
 }
 
 // resolveWorkspaceID returns the watch ID a command should target. An explicit
@@ -501,24 +501,24 @@ func resolveWorkspaceID(cfg *config.Config, provided string) (string, error) {
 	base := filepath.Base(cwd)
 
 	var matches []string
-	for _, w := range cfg.Watch {
+	for _, w := range cfg.Workspaces {
 		if w.ID == base {
 			matches = append(matches, w.ID)
 		}
 	}
 
 	if len(matches) > 1 {
-		return "", fmt.Errorf("current directory %q matches multiple workspaces (%s); specify -w. Available: %s", base, strings.Join(matches, ", "), joinAvailable(cfg.Watch))
+		return "", fmt.Errorf("current directory %q matches multiple workspaces (%s); specify -w. Available: %s", base, strings.Join(matches, ", "), joinAvailable(cfg.Workspaces))
 	}
 	if len(matches) == 0 {
-		return "", fmt.Errorf("no workspace matches current directory %q; specify -w. Available: %s", base, joinAvailable(cfg.Watch))
+		return "", fmt.Errorf("no workspace matches current directory %q; specify -w. Available: %s", base, joinAvailable(cfg.Workspaces))
 	}
 	return matches[0], nil
 }
 
 // joinAvailable renders the configured workspaces as "id (local_dir)" for
 // error messages. It is only invoked on the error paths.
-func joinAvailable(watches []config.WatchConfig) string {
+func joinAvailable(watches []config.WorkspaceConfig) string {
 	parts := make([]string, 0, len(watches))
 	for _, w := range watches {
 		parts = append(parts, w.ID+" ("+w.LocalDir+")")
@@ -527,18 +527,18 @@ func joinAvailable(watches []config.WatchConfig) string {
 }
 
 // lookupWatch resolves an optional -w value (or the cwd-inferred workspace) to
-// its WatchConfig. It separates workspace resolution from the commands that
+// its WorkspaceConfig. It separates workspace resolution from the commands that
 // just need the config.
-func lookupWatch(cfg *config.Config, provided string) (*config.WatchConfig, error) {
+func lookupWatch(cfg *config.Config, provided string) (*config.WorkspaceConfig, error) {
 	watchID, err := resolveWorkspaceID(cfg, provided)
 	if err != nil {
 		return nil, err
 	}
-	return cfg.GetWatchByID(watchID)
+	return cfg.GetWorkspaceByID(watchID)
 }
 
 // workspaceJSON is the on-the-wire shape for `relay ws --json`. It mirrors
-// config.WatchConfig but uses lower-case JSON keys so consumers can pipe into
+// config.WorkspaceConfig but uses lower-case JSON keys so consumers can pipe into
 // jq / scripts without depending on Go's default field capitalization.
 type workspaceJSON struct {
 	ID       string          `json:"id"`
@@ -546,6 +546,7 @@ type workspaceJSON struct {
 	LocalDir string          `json:"local_dir"`
 	Paths    []string        `json:"paths"`
 	Jobs     []jobConfigJSON `json:"jobs"`
+	Executor string          `json:"executor,omitempty"`
 }
 
 type jobConfigJSON struct {
@@ -559,7 +560,7 @@ type jobConfigJSON struct {
 	Timeout  int    `json:"timeout,omitempty"`
 }
 
-func toWorkspaceJSON(w config.WatchConfig) workspaceJSON {
+func toWorkspaceJSON(w config.WorkspaceConfig) workspaceJSON {
 	jobs := make([]jobConfigJSON, len(w.Jobs))
 	for i, j := range w.Jobs {
 		jobs[i] = jobConfigJSON{
@@ -578,6 +579,7 @@ func toWorkspaceJSON(w config.WatchConfig) workspaceJSON {
 		LocalDir: w.LocalDir,
 		Paths:    w.Paths,
 		Jobs:     jobs,
+		Executor: w.Executor,
 	}
 }
 
@@ -585,7 +587,7 @@ func toWorkspaceJSON(w config.WatchConfig) workspaceJSON {
 // with column widths sized to the longest cell in each column (subject to a
 // min width equal to the column header). A row that exceeds its column width
 // is truncated by fmt's %-*s.
-func printWorkspacesTable(watches []config.WatchConfig) {
+func printWorkspacesTable(watches []config.WorkspaceConfig) {
 	idW := len("ID")
 	remoteW := len("REMOTE_DIR")
 	localW := len("LOCAL_DIR")
@@ -680,9 +682,11 @@ func runPush() {
 	}
 
 	// 纯下发(不跑 workspace job): 走 Jobs=false 通道,落到 dest(绝对)或 watch_dir 目录。
+	// 路由到 workspace 绑定的 executor(executor: <id>),空则单根回退。
+	targetWatch := watchCfg.Executor
 	if *pushNoJobs {
 		if tn, ok := b.(backend.PushNoJobsSender); ok {
-			exit, perr := tn.PushNoJobs(ctx, dest, readContent())
+			exit, perr := tn.PushNoJobs(ctx, targetWatch, dest, readContent())
 			if perr != nil {
 				fmt.Fprintf(os.Stderr, "Push error: %v\n", perr)
 				os.Exit(1)
@@ -697,9 +701,9 @@ func runPush() {
 		os.Exit(1)
 	}
 
-	// 直达后端(relay):把文件直达远端执行方并触发其本地 jobs;输出流式显示。
+	// 直达后端(relay):把文件直接送到目标 executor 并触发其本地 jobs;输出流式显示。
 	if pj, ok := b.(backend.PushJobSender); ok {
-		exit, perr := pj.PushJob(ctx, dest, readContent(), func(c backend.ExecChunk) {
+		exit, perr := pj.PushJob(ctx, targetWatch, dest, readContent(), func(c backend.ExecChunk) {
 			if c.Stdout {
 				os.Stdout.WriteString(c.Data)
 			} else {
@@ -768,16 +772,42 @@ func runLocalJobsForPush(watchID, absPath string, out func(backend.ExecChunk)) i
 }
 
 // resolvePushWorkspace 决定 push 落地后该跑哪个 workspace 的 jobs。
-// 单根模型下执行方的 sess.WatchID 是根 watch_id(如 "storage"),并非 workspace id;
-// 故先按 watchID 精确匹配,失败则从落盘路径 absPath 推导:取路径中与某 workspace
-// 的 watch_dir 或 id 相等的段(路径形如 <executor_root>/<workspace>/<file>)。
-func resolvePushWorkspace(cfg *config.Config, watchID, absPath string) *config.WatchConfig {
-	if wc, err := cfg.GetWatchByID(watchID); err == nil {
+// 优先级:
+//  1. sess.WatchID 恰是一个 workspace id → 精确命中。
+//  2. 执行方(以 watchID 标识)显式绑定的 workspaces(Executor == watchID)→ 若唯一直接返回,
+//     多个则由落盘路径 absPath 其中做路径消歧。
+//  3. 回退:在全部 workspaces 中用 absPath(形如 <executor_root>/<workspace>/<file>,
+//     匹配 watch_dir 字符串或 id 路径段)推导。
+func resolvePushWorkspace(cfg *config.Config, watchID, absPath string) *config.WorkspaceConfig {
+	if wc, err := cfg.GetWorkspaceByID(watchID); err == nil {
 		return wc
 	}
+	if owned := cfg.GetWorkspacesByExecutor(watchID); len(owned) > 0 {
+		if len(owned) == 1 {
+			return owned[0]
+		}
+		if wc := disambiguateWorkspacesByPath(owned, absPath); wc != nil {
+			return wc
+		}
+		return owned[0]
+	}
+	return disambiguateWorkspacesByPath(workspacePointers(cfg.Workspaces), absPath)
+}
+
+// workspacePointers 把值切片转成指针切片,便于统一按 *WorkspaceConfig 做路径消歧。
+func workspacePointers(ws []config.WorkspaceConfig) []*config.WorkspaceConfig {
+	out := make([]*config.WorkspaceConfig, len(ws))
+	for i := range ws {
+		out[i] = &ws[i]
+	}
+	return out
+}
+
+// disambiguateWorkspacesByPath 在候选 workspaces 里用落盘路径 absPath 挑选一个:
+// 优先取 watch_dir 是 absPath 子串的;否则取路径段等于该 workspace id。
+func disambiguateWorkspacesByPath(candidates []*config.WorkspaceConfig, absPath string) *config.WorkspaceConfig {
 	segs := strings.Split(strings.ReplaceAll(absPath, "\\", "/"), "/")
-	for i := range cfg.Watch {
-		wc := &cfg.Watch[i]
+	for _, wc := range candidates {
 		// watch_dir 可能是相对子目录(如 "databus_backend")或绝对路径;两者都会以字符串形式出现在 absPath。
 		if wc.WatchDir != "" && strings.Contains(absPath, wc.WatchDir) {
 			return wc
@@ -808,14 +838,15 @@ func runExec() {
 		}
 	}
 
-	var execCwd string
+	var execCwd, targetWatch string
 	if w != "" {
-		watchCfg, err := cfg.GetWatchByID(w)
+		watchCfg, err := cfg.GetWorkspaceByID(w)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 			os.Exit(1)
 		}
 		execCwd = watchCfg.LocalDir
+		targetWatch = watchCfg.Executor // 绑定 executor 时按其注册 watch_id 路由;空则单根回退
 	}
 
 	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
@@ -839,7 +870,7 @@ func runExec() {
 
 	// 健康检查:失败才打印,成功静默(不再每次输出 "Checking remote watcher... OK")。
 	if w != "" {
-		watchCfg, err := cfg.GetWatchByID(w)
+		watchCfg, err := cfg.GetWorkspaceByID(w)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 			os.Exit(1)
@@ -854,7 +885,7 @@ func runExec() {
 
 	// 支持流式的后端(relay)逐帧实时转发输出,并以 exit code 收尾
 	if eb, ok := b.(backend.ExecStreamBackend); ok {
-		exit, err := eb.ExecStream(ctx, cmd, execCwd, 0, func(chunk backend.ExecChunk) {
+		exit, err := eb.ExecStream(ctx, targetWatch, cmd, execCwd, 0, func(chunk backend.ExecChunk) {
 			if chunk.Stdout {
 				os.Stdout.WriteString(chunk.Data)
 			} else {
@@ -900,10 +931,10 @@ func runStatus() {
 		}
 	}
 	if w == "" {
-		fmt.Fprintf(os.Stderr, "Specify -w. Available: %s\n", joinAvailable(cfg.Watch))
+		fmt.Fprintf(os.Stderr, "Specify -w. Available: %s\n", joinAvailable(cfg.Workspaces))
 		os.Exit(1)
 	}
-	watchCfg, err := cfg.GetWatchByID(w)
+	watchCfg, err := cfg.GetWorkspaceByID(w)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 		os.Exit(1)
@@ -1158,7 +1189,7 @@ func runJobRun() {
 
 // jobTypeOf 返回给定 workspace 内 jobID 的类型,便于 job run 回显 step 标记;
 // 找不到时返回空串(不影响正常执行输出)。
-func jobTypeOf(watchCfg *config.WatchConfig, jobID string) string {
+func jobTypeOf(watchCfg *config.WorkspaceConfig, jobID string) string {
 	for i := range watchCfg.Jobs {
 		if watchCfg.Jobs[i].ID == jobID {
 			return watchCfg.Jobs[i].Type
@@ -1225,7 +1256,7 @@ func runCleanup() {
 		os.Exit(1)
 	}
 
-	_, err = cfg.GetWatchByID(*cleanupWatch)
+	_, err = cfg.GetWorkspaceByID(*cleanupWatch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
 		os.Exit(1)

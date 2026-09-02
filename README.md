@@ -47,7 +47,7 @@ backend:
   config:
     base_dir: /path/to/remote/storage
 
-watch:
+workspaces:
   - id: web-app-patches
     watch_dir: projects/web-app/patches
     local_dir: /path/to/local/repo
@@ -199,12 +199,12 @@ relay server --addr :8080 --watch tcp:/data/web-app --token secret
 relay server -c config.yaml --addr :9000
 ```
 
-**One config, three ends.** The unified `config.yaml` carries a `server:` block (addr / watch_root / auth.tokens / tls) plus the `watch` list with per-watch `ttl`. Each end keeps the whole file and reads only its relevant section. Note that the relay server applies config to how it listens/stores — a change there takes effect on **restart**.
+**One config, three ends.** The unified `config.yaml` carries a `server:` block (addr / watch_root / auth.tokens / tls) plus the `workspaces` list (each entry is a job-config, able to bind to a specific executor via `executor:`). Each end keeps the whole file and reads only its relevant section. Note that the relay server applies config to how it listens/stores — a change there takes effect on **restart**.
 
 ```yaml
 server:
   addr: ":8443"
-  watch_root: /data/relay          # watch.watch_dir entries are relative to this
+  watch_root: /data/relay          # each workspace.watch_dir is relative to this
   auth:
     tokens: ["${RELAY_TOKEN}"]
   tls:
@@ -212,10 +212,11 @@ server:
     cert_file: ""
     key_file: ""
 
-watch:
+workspaces:
   - id: web-app-patches
     watch_dir: web-app/patches
     ttl: 30m
+    # executor: site-a            # 绑定到这台 executor(值=其 backend.config.watch_id);留空=单根
 ```
 
 The legacy standalone `server.yaml` (top-level `addr`/`watch`/`auth`/`tls`) is still accepted via `--server-config` for backward compatibility. Environment variables (`$VAR`, `${VAR}`) are expanded in all string values.
@@ -398,13 +399,14 @@ The relay server configuration (addr / watch_root / auth / tls) lives in the `se
 | `name` | Config name |
 | `version` | Schema version (currently 1) |
 | `backend` | Backend type + config |
-| `watch` | List of watch configurations |
-| `watch[].id` | Unique watch identifier |
-| `watch[].watch_dir` | Remote directory to monitor |
-| `watch[].local_dir` | Local working directory for job execution |
-| `watch[].paths` | Array of glob patterns to match files |
-| `watch[].jobs` | Actions to execute when file matches |
-| `watch[].auto_cleanup` | Delete remote file after all jobs succeed (default: false) |
+| `workspaces` | List of workspace (job-config) entries |
+| `workspaces[].id` | Unique workspace identifier |
+| `workspaces[].watch_dir` | Remote directory to monitor |
+| `workspaces[].local_dir` | Local working directory for job execution |
+| `workspaces[].paths` | Array of glob patterns to match files |
+| `workspaces[].jobs` | Actions to execute when file matches |
+| `workspaces[].auto_cleanup` | Delete remote file after all jobs succeed (default: false) |
+| `workspaces[].executor` | Bind this workspace to an executor's `backend.config.watch_id` (empty = single-root fallback) |
 | `interval_seconds` | Watch poll interval (default: 60, ignored in event-driven mode) |
 
 ## File Cleanup

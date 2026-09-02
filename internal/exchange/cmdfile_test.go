@@ -66,7 +66,7 @@ func TestLegacyCmdFileBackwardCompat(t *testing.T) {
 }
 
 func TestBuildConfigSyncCmd(t *testing.T) {
-	configContent := []byte("name: test\nversion: 1\nwatch: []\ninterval_seconds: 60")
+	configContent := []byte("name: test\nversion: 1\nworkspaces: []\ninterval_seconds: 60")
 	cmd := BuildConfigSyncCmd(configContent)
 
 	if cmd.ID == "" {

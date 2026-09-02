@@ -23,7 +23,7 @@ backend:
   config:
     watch_id: storage
 
-watch:
+workspaces:
   - id: rel
     watch_dir: app/patches
     ttl: 10m
@@ -58,7 +58,7 @@ server:
   auth:
     tokens: ["tok-a"]
 
-watch:
+workspaces:
   - id: rel
     watch_dir: /data/relay/app/patches
     ttl: 10m
@@ -95,7 +95,7 @@ server:
   addr: ":9443"
   tunnel_enabled: true
   max_tunnels: 32
-watch:
+workspaces:
   - id: rel
     watch_dir: /data/relay
 `)
@@ -177,7 +177,7 @@ func TestHasServerSection(t *testing.T) {
 // 未提供 server 段时 addr 默认 :8443,watch_root 为空则不拼接。
 func TestUnifiedServerBaseDefaults(t *testing.T) {
 	data := []byte(`
-watch:
+workspaces:
   - id: only
     watch_dir: just/this
 `)

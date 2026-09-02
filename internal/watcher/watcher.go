@@ -46,7 +46,7 @@ func New(cfg *config.Config, configPath string) (*Watcher, error) {
 	}, nil
 }
 
-func (w *Watcher) createBackend(watchCfg config.WatchConfig) (backend.FileTransferBackend, error) {
+func (w *Watcher) createBackend(watchCfg config.WorkspaceConfig) (backend.FileTransferBackend, error) {
 	b, err := backend.NewBackend(w.cfg.Backend.Type, w.cfg.Backend.Config)
 	if err == nil && w.pushJobHandler != nil {
 		// 每个新建 backend 可能的同名 executor 会覆盖入站 handler,故每次都要补注入 jobs 回调
@@ -203,13 +203,13 @@ func (w *Watcher) runEventDriven(ctx context.Context, eb backend.EventBackend) e
 //   - 未携带子路径(兼容旧后端)回退到首个文件名匹配的 workspace。
 //
 // 无匹配返回 nil(事件被丢弃)。
-func (w *Watcher) findWatchForEvent(fi backend.FileInfo) *config.WatchConfig {
+func (w *Watcher) findWatchForEvent(fi backend.FileInfo) *config.WorkspaceConfig {
 	rel := normalizeRelPath(fi.Path)
 	dir := path.Dir(rel)
 
-	var fallback *config.WatchConfig
-	for i := range w.cfg.Watch {
-		wc := &w.cfg.Watch[i]
+	var fallback *config.WorkspaceConfig
+	for i := range w.cfg.Workspaces {
+		wc := &w.cfg.Workspaces[i]
 		if !w.matchAnyPattern(fi.Name, wc.Paths) {
 			continue
 		}
@@ -313,8 +313,8 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 	g := &errgroup.Group{}
 
 	// Process watch directories (user files)
-	for i := range w.cfg.Watch {
-		watchCfg := w.cfg.Watch[i]
+	for i := range w.cfg.Workspaces {
+		watchCfg := w.cfg.Workspaces[i]
 		g.Go(func() error {
 			return w.processWatch(ctx, watchCfg)
 		})
@@ -586,7 +586,7 @@ func RunLocalCommandCapture(cmdStr, cwd string, timeout int) (string, string, in
 	return stdoutBuf.String(), stderrBuf.String(), 0
 }
 
-func (w *Watcher) processWatch(ctx context.Context, watchCfg config.WatchConfig) error {
+func (w *Watcher) processWatch(ctx context.Context, watchCfg config.WorkspaceConfig) error {
 	b, err := w.createBackend(watchCfg)
 	if err != nil {
 		return fmt.Errorf("failed to create backend: %w", err)

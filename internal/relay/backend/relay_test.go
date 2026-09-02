@@ -67,7 +67,7 @@ func TestEndToEnd_ExecStream(t *testing.T) {
 
 	// 逐行 echo,验证增量流式输出
 	var live []string
-	exit, err := rb.ExecStream(ctx, "printf 'one\\ntwo\\nthree\\n'", "", 10, func(c bk.ExecChunk) {
+	exit, err := rb.ExecStream(ctx, "", "printf 'one\\ntwo\\nthree\\n'", "", 10, func(c bk.ExecChunk) {
 		live = append(live, c.Data)
 	})
 	if err != nil {
@@ -175,7 +175,7 @@ func TestEndToEnd_PushJob(t *testing.T) {
 	}
 
 	var streamed []string
-	exit, err := pj.PushJob(ctx, "sub/f.txt", []byte("hello from push\n"), func(c bk.ExecChunk) {
+	exit, err := pj.PushJob(ctx, "", "sub/f.txt", []byte("hello from push\n"), func(c bk.ExecChunk) {
 		streamed = append(streamed, c.Data)
 	})
 	if err != nil {
@@ -230,7 +230,7 @@ func TestEndToEnd_PushNoJobs(t *testing.T) {
 	}
 
 	dest := filepath.Join(execRoot, "sub", "relay.new")
-	exit, err := tn.PushNoJobs(ctx, dest, []byte("deploy blob\n"))
+	exit, err := tn.PushNoJobs(ctx, "", dest, []byte("deploy blob\n"))
 	if err != nil {
 		t.Fatalf("push no-jobs: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestEndEndPushJobLarge(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	rng.Read(blob)
 
-	exit, err := pj.PushJob(ctx, "big.bin", blob, func(bk.ExecChunk) {})
+	exit, err := pj.PushJob(ctx, "", "big.bin", blob, func(bk.ExecChunk) {})
 	if err != nil {
 		t.Fatalf("push job: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestEndToEnd_PushJobNoExecutorFallback(t *testing.T) {
 	pj := reqBackend.(bk.PushJobSender)
 
 	var streamed []string
-	exit, err := pj.PushJob(ctx, "fallback.txt", []byte("staged\n"), func(c bk.ExecChunk) {
+	exit, err := pj.PushJob(ctx, "", "fallback.txt", []byte("staged\n"), func(c bk.ExecChunk) {
 		streamed = append(streamed, c.Data)
 	})
 	if err != nil {
@@ -354,7 +354,7 @@ func TestEndToEnd_ExecNoExecutor(t *testing.T) {
 	}
 
 	rb := reqBackend.(bk.ExecStreamBackend)
-	if _, err := rb.ExecStream(context.Background(), "echo x", "", 3, nil); err == nil {
+	if _, err := rb.ExecStream(context.Background(), "", "echo x", "", 3, nil); err == nil {
 		t.Error("expected error when no executor, got nil")
 	} else if !strings.Contains(err.Error(), "no executor") {
 		t.Errorf("unexpected error: %v", err)

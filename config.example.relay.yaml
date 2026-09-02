@@ -54,10 +54,13 @@ backend:
     #   - "api.internal.com@443"
     #   - "192.168.0.5@22"
 
-watch:
+workspaces:
   - id: web-app-patches
     watch_dir: .                       # relative to server's watch_root (server) and remote dir (client)
     local_dir: /path/to/local/repo
+    # 绑定执行器:该 workspace 的 jobs 由这台 executor 执行,值 = executor 侧 backend.config.watch_id
+    # (即 `relay status` 里 `executor watch=...`)。留空 = 单根回退(支持单执行器/默认场景)。
+    # executor: site-a
     paths: ["*.patch"]
     ttl: 30m                           # transit auto-deletes files older than 30m (server-side only)
     # manually on the local machine with:

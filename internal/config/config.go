@@ -13,13 +13,13 @@ import (
 )
 
 type Config struct {
-	Name     string        `yaml:"name"`
-	Version  int           `yaml:"version"`
-	Backend  BackendConfig `yaml:"backend"`
-	Auth     *AuthConfig   `yaml:"auth,omitempty"`
-	Watch    []WatchConfig `yaml:"watch"`
-	Server   *ServerConfig `yaml:"server,omitempty"` // 仅 relay server 读取;其它端忽略
-	Interval int           `yaml:"interval_seconds"`
+	Name       string            `yaml:"name"`
+	Version    int               `yaml:"version"`
+	Backend    BackendConfig     `yaml:"backend"`
+	Auth       *AuthConfig       `yaml:"auth,omitempty"`
+	Workspaces []WorkspaceConfig `yaml:"workspaces"`
+	Server     *ServerConfig     `yaml:"server,omitempty"` // 仅 relay server 读取;其它端忽略
+	Interval   int               `yaml:"interval_seconds"`
 }
 
 // ServerConfig relay server(中转)段。仅在最终实现 relay server 读取的一份统一 config 里使用。
@@ -43,14 +43,18 @@ type ServerTLSConfig struct {
 	KeyFile  string `yaml:"key_file"`
 }
 
-type WatchConfig struct {
+// WorkspaceConfig 一份「作业配置」:定义在什么目录上、对哪些文件、跑哪些 job。
+// 它只描述“做什么”与“在哪听”,并不等于某台执行器。Executor 字段把这份配置绑定到
+// 一台具体的执行器(其值即执行器侧 backend.config.watch_id / 注册身份);留空 = 单根回退。
+type WorkspaceConfig struct {
 	ID          string        `yaml:"id"`
 	WatchDir    string        `yaml:"watch_dir"`
 	LocalDir    string        `yaml:"local_dir"`
 	Paths       []string      `yaml:"paths"`
 	Jobs        []JobConfig   `yaml:"jobs"`
 	AutoCleanup bool          `yaml:"auto_cleanup"`
-	TTL         time.Duration `yaml:"ttl"` // 仅 server 端使用(中转自动清理)
+	TTL         time.Duration `yaml:"ttl"`                // 仅 server 端使用(中转自动清理)
+	Executor    string        `yaml:"executor,omitempty"` // 绑定到哪个执行器(其自身 watch_id);空=单根
 }
 
 type BackendConfig struct {
@@ -126,11 +130,11 @@ func loadFromBytes(data []byte) (*Config, error) {
 	}
 
 	// Normalize MSYS-style paths (e.g. /d/...) when running on Windows
-	for i := range cfg.Watch {
-		cfg.Watch[i].LocalDir = NormalizeWindowsPath(cfg.Watch[i].LocalDir)
-		for j := range cfg.Watch[i].Jobs {
-			if cfg.Watch[i].Jobs[j].Cwd != "" {
-				cfg.Watch[i].Jobs[j].Cwd = NormalizeWindowsPath(cfg.Watch[i].Jobs[j].Cwd)
+	for i := range cfg.Workspaces {
+		cfg.Workspaces[i].LocalDir = NormalizeWindowsPath(cfg.Workspaces[i].LocalDir)
+		for j := range cfg.Workspaces[i].Jobs {
+			if cfg.Workspaces[i].Jobs[j].Cwd != "" {
+				cfg.Workspaces[i].Jobs[j].Cwd = NormalizeWindowsPath(cfg.Workspaces[i].Jobs[j].Cwd)
 			}
 		}
 	}
@@ -168,13 +172,25 @@ func (c *Config) GetBackendType() string {
 	return c.Backend.Type
 }
 
-func (c *Config) GetWatchByID(id string) (*WatchConfig, error) {
-	for i := range c.Watch {
-		if c.Watch[i].ID == id {
-			return &c.Watch[i], nil
+func (c *Config) GetWorkspaceByID(id string) (*WorkspaceConfig, error) {
+	for i := range c.Workspaces {
+		if c.Workspaces[i].ID == id {
+			return &c.Workspaces[i], nil
 		}
 	}
-	return nil, fmt.Errorf("watch not found: %s", id)
+	return nil, fmt.Errorf("workspace not found: %s", id)
+}
+
+// GetWorkspacesByExecutor 返回所有显式绑定到给定执行器(其值即后端 watch_id)的 workspace。
+// 执行器侧用它判断“这份 workspace 的 jobs 该由我执行”;无匹配返回 nil。
+func (c *Config) GetWorkspacesByExecutor(watchID string) []*WorkspaceConfig {
+	var out []*WorkspaceConfig
+	for i := range c.Workspaces {
+		if c.Workspaces[i].Executor == watchID {
+			out = append(out, &c.Workspaces[i])
+		}
+	}
+	return out
 }
 
 func NormalizeWindowsPath(p string) string {
