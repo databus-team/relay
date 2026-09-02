@@ -105,7 +105,7 @@ var (
 	// Tunnel command - 本地 SOCKS5 出网隧道,经所选 executor 出口访问内网白名单目标。
 	tunnelCmd    = kingpin.Command("tunnel", "本地 SOCKS5 出网隧道:经所选 executor 访问其内网白名单目标")
 	tunnelListen = tunnelCmd.Flag("listen", "Local SOCKS5 listen address").Default("127.0.0.1:1080").String()
-	tunnelWatch  = tunnelCmd.Flag("watch", "Target watch ID for egress executor (defaults to current directory name)").Short('w').String()
+	tunnelWatch  = tunnelCmd.Flag("watch", "Egress executor's server watch id (see `relay status` -> executor watch=...); required").Short('w').Required().String()
 )
 
 func main() {

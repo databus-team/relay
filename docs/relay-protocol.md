@@ -463,10 +463,11 @@ type TunnelEnd  struct { StreamID string `json:"stream_id"`; Reason string `json
 ### 4.10 多 executor 与工作区隧道选择
 
 一台中转可同时挂载**多台**远端 executor(每台各自的 watch/工作区)。`relay status` / 版本台账按 watch
-逐条展示每台在线执行方及其构建版本,用户据此得知有哪些出口可选。`relay tunnel --watch` 与
-`exec`/`push`/`status` 共用同一套工作区寻址(`resolveWorkspaceID`):显式 `--watch` 优先,缺省按当前目录名
-推断。多台 executor 同时在线时,本地可并起多条 `relay tunnel`(不同 `--listen` 端口、各自 `--watch`),
-分别经各自 executor 访问各自内网白名单目标,互不干扰(关闭一条不影响其它)。
+逐条展示每台在线执行方及其构建版本,用户据此得知有哪些出口可选。`relay tunnel --watch` 的取值是
+**执行方注册所在的服务端 watch_id**(见 `relay status` 的 `executor watch=...`),**不是**本地工作区名——
+与 `exec`/`push`/`status` 的 `-w`(工作区,client 端再映射到连接的 watch_id)语义不同、也不做 cwd 推断,
+`--watch` 必填。多台 executor 同时在线时,本地可并起多条 `relay tunnel`(不同 `--listen` 端口、各自
+`--watch`),分别经各自 executor 访问各自内网白名单目标,互不干扰(关闭一条不影响其它)。
 
 ---
 

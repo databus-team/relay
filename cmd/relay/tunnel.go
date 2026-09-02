@@ -44,19 +44,13 @@ func runTunnel() {
 		os.Exit(1)
 	}
 
-	// 出口 watch:显式 -w 优先;否则按当前目录推断(与其他命令一致)。缺省失败即报错退出。
+	// 出口 executor 选择:`-w` 是「执行方注册所在的服务端 watch_id」(见 `relay status` 的
+	// `executor watch=...`),不是本地工作区名。因此不走 resolveWorkspaceID 的 cwd 推断、也
+	// 不要求命中本地 cfg.Watch(那些是 workspace,与执行方 watch 是两个命名空间)。中转按该
+	// watch 解析已注册 exec 的 executor;无在线执行方 → 建连即失败。
 	w := *tunnelWatch
 	if w == "" {
-		if inferred, err := resolveWorkspaceID(cfg, ""); err == nil {
-			w = inferred
-		}
-	}
-	if w == "" {
-		fmt.Fprintf(os.Stderr, "Specify -w. Available: %s\n", joinAvailable(cfg.Watch))
-		os.Exit(1)
-	}
-	if _, err := cfg.GetWatchByID(w); err != nil {
-		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Specify -w with the egress executor's server watch id (see `relay status` -> `executor watch=...`).\n")
 		os.Exit(1)
 	}
 

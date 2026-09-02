@@ -310,8 +310,9 @@ relay tunnel --listen 127.0.0.1:1080 --watch site-a   # egress via executor site
 curl --socks5-hostname 127.0.0.1:1080 http://intra.a.internal/ping
 ```
 
-- `--watch` selects the egress executor (same workspace addressing as `exec`/`push`/`status`;
-  defaults to the current directory name).
+- `--watch` selects the egress executor by the **executor's server watch id** (the `executor watch=...`
+  shown by `relay status`) — required. Unlike `exec`/`push`/`status` whose `-w` is a local workspace that
+  gets mapped to the connection's watch id, the tunnel selector is passed straight through to the transit.
 - Default bind is loopback `127.0.0.1`; binding a non-loopback address prints a loud warning (no auth).
 - Server must enable the tunnel channel (`tunnel_enabled: true` in the `server:` section); otherwise
   tunnel requests are rejected.
