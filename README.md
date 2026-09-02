@@ -226,7 +226,7 @@ Deploy a freshly built relay binary to the transit server over a **controlled se
 channel (no SSH, no manual code-server upload). The client streams the binary to the transit,
 which verifies the sha256 digest, self-checks that the binary can start, sends a success ACK,
 backups the running binary to `.prev`, atomically swaps, and restarts — then the client
-reconnects and polls `relay version -r` to confirm the transit now runs the new build.
+reconnects and polls the transit version ledger to confirm the transit now runs the new build.
 
 ```bash
 # One-click: build a linux relay and deploy it to the transit server
@@ -262,27 +262,40 @@ relay ws --json       # output as JSON
 relay ws -w web-app   # details for a specific workspace
 ```
 
-### version — Build Version & Cross-Machine Check
+### status — Link Health & Version in One Shot
 
-Show the local binary's build info, and with `-r` query the transit server + online executors to catch version drift across the fleet.
+One-shot check: `本地→中转→远程执行方` 三段时延(local→transit, transit→executor, 本地累计)+ 各端点版本台账,吸收原 `ping` 与 `version -r` 的职责于单一命令。
 
-```bash
-relay version           # local build info only
-relay version -r        # compare against transit server + registered executors
-relay version -r --json # same, machine-readable
+```sh
+relay status -w web-app          # three-segment latency + version ledger
+relay status --json -w web-app   # machine-readable, same fields as text
 ```
 
-Output marks each remote node `== local ok` or `!! MISMATCH` so the transit / executor / local caller mismatch is visible in one glance:
+Only the `relay` backend measures all three segments. Other backends (local/fs-mcp/jumpserver) give the single reachable hop and mark the rest `N/A (not supported on <type> backend)`, keeping the same columns / JSON shape. When an executor is offline the `transit→executor` segment shows `N/A (executor offline)` and the command still succeeds — "transit up, executor down".
+
+Example for the `relay` backend with an online executor:
 
 ```
-relay 4e6f926+4e6f926 (2026-09-01T06:37:33Z)
-  local  linux/amd64  commit=4e6f926  built=2026-09-01T06:37:33Z  go=go1.27.0
-  remote:
-    transit                 linux/amd64        4e6f926+4e6f926      == local ok
-    executor  watch=storage  windows/amd64      3f1c9aa+3f1c9aa      !! MISMATCH
+status "web-app-patches" (relay backend)
+  local→transit      12 ms
+  transit→executor   45 ms
+  local total        57 ms
+  endpoints:
+    transit       v1.2.3        (linux/amd64)
+    executor      watch=web-app-patches  v1.2.3
 ```
 
-The version string is stamped at build time (`make build-release` / `build-linux` / `build-windows`) from `git describe`, so every binary built from the same source carries the same identifier — making drift obvious. Run `make install` to rebuild with the stamp. Executors report their version when they register (they re-register on (re)connect), so an executor that has *not* yet been swapped still shows its old build.
+### version — Local Build Info
+
+Show the local binary's build info. Cross-machine version drift is now covered by `relay status`;
+the remote ledger was removed from `version` (no more `-r`), and `--json` still works.
+
+```sh
+relay version        # local build info only
+relay version --json # machine-readable
+```
+
+The version string is stamped at build time (`make build-release` / `build-linux` / `build-windows`) from `git describe`, so every binary built from the same source carries the same identifier. Run `make install` to rebuild with the stamp. Executors report their version when they register (they re-register on (re)connect), so an executor that has *not* yet been swapped still shows its old build.
 
 ## Relay Backend Configuration
 
