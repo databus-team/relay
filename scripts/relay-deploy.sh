@@ -25,7 +25,7 @@ CONFIG="${RELAY_CONFIG:-$HOME/.relay/config.yaml}"
 WATCH="${RELAY_WATCH:-}"
 RESTART="${RESTART:-0}"
 
-# 版本 stamp:与 Makefile 一致,保证产出的远端/中转二进制带同一标识,relay version 才能正确对比。
+# 版本 stamp:与 Makefile 一致,保证产出的远端/中转二进制带同一标识,relay status 才能正确对比。
 GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || true)"
 GIT_VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
 STAMP="$(printf '%s%s%s' \
@@ -124,7 +124,7 @@ restart_binary() {
   #   mv dest -> dest.prev / st -> dest(旧换出、新的就位)
   #   watch start  以守护进程重启新 daemon(detach + 写 pid,无黑窗)
   # 注意:该 exec 由旧 daemon 服务,watch stop 停掉它后回包会断,链仍随 exec
-  # 解耦继续完成(detached),结果由 verify(relay version -r) 兜底核对。
+  # 解耦继续完成(detached),结果由 verify(relay status) 兜底核对。
   local swap
   # $dest/$st 在本地展开成路径值;$HOME 留给远端展开,故写成 \$HOME。
   swap="\"$dest\" watch stop -c \"\$HOME/.relay/config.yaml\" ; "
@@ -135,13 +135,14 @@ restart_binary() {
   # 若在前台跑,`watch stop` 会先杀掉服务本 exec 的旧 daemon,导致本地 relay
   # exec 永等其回包而卡死;换装本身并不依赖该连接,由 verify 兜底核对即可。
   relay exec -c "$CONFIG" -w "$w" "nohup sh -c '$swap' >/dev/null 2>&1 &" \
-    || warn "换装已在远端后台触发;结果以 verify (relay version -r) 为准"
+    || warn "换装已在远端后台触发;结果以 verify (relay status) 为准"
   log "换装已后台触发;远端日志: ~/.relay/watch.log"
 }
 
 # ---- 6) 中转一键部署(受控自升级) ----
 # 构建 relay-linux 并经 `relay server-remote` 经受控自升级通道流式交付中转,由中转本地
-# 自检 → 回执 → 换装(.prev 备份 + 重启),本地断连后重连轮询 relay version 核验。
+# 自检 → 回执 → 换装(.prev 备份 + 重启)。核验随 `relay server-remote` 内部完成
+# (断线重连后轮询中转版本台账确认新构建),故中转段无需在此再核验。
 transit() {
   log "构建中转二进制 relay-linux ..."
   env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w $STAMP" -o relay-linux ./cmd/relay
@@ -157,25 +158,36 @@ transit() {
   log "中转已运行新版本 ✔"
 }
 
-# ---- 7) 部署后核验:三端版本台账 ----
+# ---- 7) 部署后核验:执行方是否已切换为新提交(relay status) ----
+# 旧 `relay version -r` 已并入 `relay status`;此处用其 --json 台账,校验执行方(远端)的
+# commit 已切到本次构建的 $GIT_COMMIT。仅 RESTART=1 时调用(未换装则远端仍是旧构建,会超时,
+# 属预期)。中转段由 `relay server-remote` 内部自检核验,不需在此重复。
 verify() {
-  # RESTART=1 换装后 daemon 约 3s 后被杀重启,给足时间并容忍瞬时不可达。
-  sleep 4
-  log "核验版本台账 (relay version -r, 重试至多 ~30s) ..."
+  local w="${1:?需要 -w 以指认被核验的执行方}" want="${2:-$GIT_COMMIT}" i js
+  # RESTART=1 换装后执行方 daemon 约 3s 后被杀重启,给足时间并容忍瞬时不可达。
+  sleep 3
+  log "核验执行方版本 (relay status --json, 等待新提交 $want, 至多 ~60s) ..."
   for i in $(seq 1 15); do
-    if relay version -r -c "$CONFIG" 2>&1; then
-      return 0  # version 查询成功即打印并返回
+    js="$(relay status --json -c "$CONFIG" -w "$w" 2>/dev/null)" || { log "  重试 $i/15 status 查询 ..."; sleep 2; continue; }
+    # status --json 的 nodes[] 里,执行方节点的 commit 上报为 `"commit": "<GIT_COMMIT>"`。
+    if grep -q "\"commit\": \"$want\"" <<<"$js"; then
+      log "执行方已返回新提交 $want ✔"
+      return 0
     fi
-    log "  重试 $i/15 账本查询 ..."
+    log "  重试 $i/15 等待执行方切到新提交 ..."
     sleep 2
   done
+  log "核验超时:执行方未切到新提交 $want(RESTART=0 未换装时属预期)。"
+  return 1
 }
 
 cmd="${1:-all}"
 case "$cmd" in
-  remote) W="$(pick_watch)"; detect_remote; build_binary; push_binary "$W"; restart_binary "$W"; verify ;;
+  remote) W="$(pick_watch)"; detect_remote; build_binary; push_binary "$W"; restart_binary "$W"
+          [[ "$RESTART" == "1" ]] && verify "$W" ;;
   transit) transit ;;
-  all) W="$(pick_watch)"; detect_remote; build_binary; push_binary "$W"; restart_binary "$W"; warn "=== 中转段 ==="; transit; verify ;;
+  all) W="$(pick_watch)"; detect_remote; build_binary; push_binary "$W"; restart_binary "$W"; warn "=== 中转段 ==="; transit
+          [[ "$RESTART" == "1" ]] && verify "$W" ;;
   *) die "用法: $0 {remote|transit|all}" ;;
 esac
 log "完成。"

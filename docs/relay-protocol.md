@@ -372,7 +372,7 @@ type ServerUpgradeRequest struct {
   │◀────────│─ 回执 ACK(先回执,再换装)
   │         │ daemon.Stop → 备份 .prev → ReplaceBinary → Start
   │         │ 原地重启
-  ‖  断线重连,轮询 `relay version -r` 核验新构建
+  ‖  断线重连,`relay server-remote` 轮询中转版本台账核验新构建
 ```
 
 **安全信任边界**
