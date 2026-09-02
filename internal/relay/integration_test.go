@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -947,4 +949,266 @@ func TestIntegration_ClientUpgradeServer_NoToken(t *testing.T) {
 	if !strings.Contains(err.Error(), "disabled") {
 		t.Errorf("unexpected error: %v", err)
 	}
+}
+
+// ---- 隧道(SOOKS5 出网)集成 ----
+
+// setupTunnelServer 建一个开启隧道通道的中转。
+func setupTunnelServer(t *testing.T, watchDir string) (*httptest.Server, string) {
+	t.Helper()
+	cfg := server.Config{
+		Addr:          ":0",
+		WatchDirs:     []server.WatchDirConfig{{ID: "test-watch", Dir: watchDir}},
+		Auth:          server.AuthConfig{Type: "token", Tokens: []string{"test-token"}},
+		TunnelEnabled: true,
+	}
+	srv, err := server.New(cfg)
+	if err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/relay"
+	return ts, wsURL
+}
+
+// newEchoServer 起一个回显 TCP 服务(模拟 executor 内网可达的目标),并统计连接数。
+type echoServer struct {
+	ln      net.Listener
+	mu      sync.Mutex
+	conns   int
+	closed  chan struct{}
+}
+
+func newEchoServer(t *testing.T) (*echoServer, string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen echo: %v", err)
+	}
+	es := &echoServer{ln: ln, closed: make(chan struct{})}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			es.mu.Lock()
+			es.conns++
+			es.mu.Unlock()
+			go func() {
+				defer c.Close()
+				_, _ = io.Copy(c, c) // 回显
+			}()
+		}
+	}()
+	return es, ln.Addr().String()
+}
+
+func (es *echoServer) addrs() (string, uint16) {
+	h, p, _ := net.SplitHostPort(es.ln.Addr().String())
+	var port uint16
+	fmt.Sscanf(p, "%d", &port)
+	return h, port
+}
+
+func (es *echoServer) connCount() int {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	return es.conns
+}
+
+// registerTunnelExecutor 注册一个执行方,其隧道建连 handler 会尝试拨到目标并回显。
+// allow=false 时直接拒绝(模拟 network_allow 未命中)。
+func registerTunnelExecutor(t *testing.T, wsURL, watchID string, allow bool) *client.Client {
+	t.Helper()
+	ctx := context.Background()
+	exec := connectTestClient(t, wsURL)
+	exec.SetTunnelHandler(func(sess *client.TunnelSession) {
+		go func() {
+			if !allow {
+				sess.Reject("target not allowed by network_allow")
+				return
+			}
+			addr := fmt.Sprintf("%s:%d", sess.Target(), sess.Port())
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				sess.Reject("dial " + addr + ": " + err.Error())
+				return
+			}
+			sess.Accept(conn)
+		}()
+	})
+	if err := exec.RegisterExecutor(ctx, watchID, "add", "tun-ver"); err != nil {
+		t.Fatalf("register executor %s: %v", watchID, err)
+	}
+	return exec
+}
+
+// TestTunnel_EndToEnd_Allowed:白名单命中 → 建连成功、双向字节流各自就绪(AE1 正向)。
+func TestTunnel_EndToEnd_Allowed(t *testing.T) {
+	watchDir := t.TempDir()
+	ts, wsURL := setupTunnelServer(t, watchDir)
+	defer ts.Close()
+
+	exec := registerTunnelExecutor(t, wsURL, "test-watch", true)
+	defer exec.Disconnect()
+
+	es, target := newEchoServer(t)
+	defer es.ln.Close()
+	host, port := func() (string, uint16) {
+		h, p, _ := net.SplitHostPort(target)
+		var pu uint16
+		fmt.Sscanf(p, "%d", &pu)
+		return h, pu
+	}()
+
+	ctx := context.Background()
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	stream, err := c.TunnelOpen(ctx, "test-watch", host, port)
+	if err != nil {
+		t.Fatalf("tunnel open: %v", err)
+	}
+	defer stream.Close()
+
+	if err := stream.Send([]byte("ping-echo")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	got, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("recv: %v", err)
+	}
+	if string(got) != "ping-echo" {
+		t.Errorf("echo mismatch: got %q, want %q", got, "ping-echo")
+	}
+}
+
+// TestTunnel_EndToEnd_Denied:未命中白名单 → 建连确认即失败,不建立内网连接(AE2)。
+func TestTunnel_EndToEnd_Denied(t *testing.T) {
+	watchDir := t.TempDir()
+	ts, wsURL := setupTunnelServer(t, watchDir)
+	defer ts.Close()
+
+	exec := registerTunnelExecutor(t, wsURL, "test-watch", false)
+	defer exec.Disconnect()
+
+	ctx := context.Background()
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	if _, err := c.TunnelOpen(ctx, "test-watch", "10.0.0.20", 22); err == nil {
+		t.Fatal("expected tunnel open to fail (not allowed), got nil")
+	}
+}
+
+// TestTunnel_NoExecutor:目标 watch 无在线执行方 → 建连失败、不建内网连接(R4/AE3)。
+func TestTunnel_NoExecutor(t *testing.T) {
+	watchDir := t.TempDir()
+	ts, wsURL := setupTunnelServer(t, watchDir)
+	defer ts.Close()
+
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	_, err := c.TunnelOpen(context.Background(), "test-watch", "10.0.0.5", 80)
+	if err == nil {
+		t.Fatal("expected error when no executor, got nil")
+	}
+	if !strings.Contains(err.Error(), "no online executor") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestTunnel_Disabled:隧道通道未开启的服务器拒绝 MsgTunnel*(AE5/KTD4)。
+func TestTunnel_Disabled(t *testing.T) {
+	watchDir := t.TempDir()
+	// 复用默认 helper(TunnelEnabled=false)。
+	ts, wsURL := setupTestServer(t, watchDir)
+	defer ts.Close()
+
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	if _, err := c.TunnelOpen(context.Background(), "test-watch", "10.0.0.3", 80); err == nil {
+		t.Fatal("expected tunnel to be disabled, got nil")
+	}
+}
+
+// TestTunnel_CloseDoesNotAffectOthers:两条隧道独立并行;关一条,另一条仍存活(AE1 关闭隔离)。
+func TestTunnel_MultiExecutor_Independent(t *testing.T) {
+	watchDir := t.TempDir()
+	cfg := server.Config{
+		Addr:          ":0",
+		WatchDirs: []server.WatchDirConfig{
+			{ID: "site-a", Dir: watchDir},
+			{ID: "site-b", Dir: watchDir},
+		},
+		Auth:          server.AuthConfig{Type: "token", Tokens: []string{"test-token"}},
+		TunnelEnabled: true,
+	}
+	srv, err := server.New(cfg)
+	if err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/relay"
+
+	execA := registerTunnelExecutor(t, wsURL, "site-a", true)
+	defer execA.Disconnect()
+	execB := registerTunnelExecutor(t, wsURL, "site-b", true)
+	defer execB.Disconnect()
+
+	// 两个独立目标(echo)
+	ea, ta := newEchoServer(t)
+	defer ea.ln.Close()
+	eb, tb := newEchoServer(t)
+	defer eb.ln.Close()
+	hostA, portA := echoAddr(ta)
+	hostB, portB := echoAddr(tb)
+
+	ctx := context.Background()
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	sa, err := c.TunnelOpen(ctx, "site-a", hostA, portA)
+	if err != nil {
+		t.Fatalf("tunnel a: %v", err)
+	}
+	defer sa.Close()
+	sb, err := c.TunnelOpen(ctx, "site-b", hostB, portB)
+	if err != nil {
+		t.Fatalf("tunnel b: %v", err)
+	}
+	defer sb.Close()
+
+	// 双向独立:每条隧道回显各自目标写入的内容。
+	if err := sa.Send([]byte("A-data")); err != nil {
+		t.Fatalf("send a: %v", err)
+	}
+	if err := sb.Send([]byte("B-data")); err != nil {
+		t.Fatalf("send b: %v", err)
+	}
+	gotA, _ := sa.Recv()
+	gotB, _ := sb.Recv()
+	if string(gotA) != "A-data" || string(gotB) != "B-data" {
+		t.Fatalf("mismatch: gotA=%q gotB=%q", gotA, gotB)
+	}
+
+	// 关掉 A,B 仍存活。
+	sa.Close()
+	if err := sb.Send([]byte("still-alive")); err != nil {
+		t.Fatalf("b send after a closed: %v", err)
+	}
+	if got, _ := sb.Recv(); string(got) != "still-alive" {
+		t.Errorf("b should still work after a closed; got %q", got)
+	}
+}
+
+func echoAddr(addr string) (string, uint16) {
+	h, p, _ := net.SplitHostPort(addr)
+	var pu uint16
+	fmt.Sscanf(p, "%d", &pu)
+	return h, pu
 }
