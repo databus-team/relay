@@ -74,9 +74,11 @@ var (
 	// 含以 - 开头参数的命令(如 git log --oneline)仍须整体加引号,避免被当 flag。
 	execCmdStr = execCmd.Arg("command", "Command to execute (multiple words are joined)").Required().Strings()
 
-	// Ping command - check remote watcher liveness
-	pingCmd   = kingpin.Command("ping", "Ping the remote watcher to check if it is alive")
-	pingWatch = pingCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
+	// Status command - 一站式连通性体检:本地→中转→执行方 三段时延 + 各端点版本台账。
+	// 继承原 `ping` 的探活职责并把 `version -r` 的远端台账职责一并归一到此命令。
+	statusCmd     = kingpin.Command("status", "一站式连通性体检:本地→中转→执行方 三段时延与各端点版本")
+	statusWatch   = statusCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
+	statusJSONOut = statusCmd.Flag("json", "Output as JSON").Bool()
 
 	// Cleanup command - remove stale command files
 	cleanupCmd   = kingpin.Command("cleanup", "Remove stale command and result files from remote")
@@ -92,10 +94,8 @@ var (
 	wsJSON    = wsCmd.Flag("json", "Output as JSON").Bool()
 	wsVerbose = wsCmd.Flag("verbose", "Show detailed table output").Short('v').Bool()
 
-	// Version command - 版本查看与跨机对比入口
-	versionCmd     = kingpin.Command("version", "查看/对比版本信息(本地 + -r 远端台账)")
-	versionRemote  = versionCmd.Flag("remote", "Also query the transit server (+ executors) and report version match/mismatch vs local").Short('r').Bool()
-	versionWatch   = versionCmd.Flag("watch", "Limit remote comparison to a specific watch ID").Short('w').String()
+	// Version command - 版本查看(纯本地构建信息)。远端台账职责已归一到 `status`。
+	versionCmd     = kingpin.Command("version", "显示本机构建信息")
 	versionJSONOut = versionCmd.Flag("json", "Output as JSON").Bool()
 
 	// server-remote command - 一键部署中转(受控自升级):上传新二进制 → 中转自检 → 换装 → 核验。
@@ -168,8 +168,8 @@ func main() {
 		runPush()
 	case execCmd.FullCommand():
 		runExec()
-	case pingCmd.FullCommand():
-		runPing()
+	case statusCmd.FullCommand():
+		runStatus()
 	case listCmd.FullCommand():
 		runList()
 	case cleanupCmd.FullCommand():
@@ -875,14 +875,20 @@ func runExec() {
 
 // runPing 探活远端 watcher。workspace 解析:显式 -w 优先,否则按 cwd 推断,
 // 推断失败则报可用清单退出(与 exec 的折叠逻辑一致)。
-func runPing() {
+// statusTimeout 是 `relay status` 单条命令的上限(含对中转 status 请求的等待)。
+const statusTimeout = 15 * time.Second
+
+// runStatus 一站式连通性体检:按 watch 输出 本地→中转 / 中转→执行方 / 本地累计 三段时延,
+// 并附各端点版本台账。relay 后端给出完整三段;其余后端(local/fs-mcp/jumpserver)尽力而为,
+// 只有单跳段可达,段2/累计标「不可用」,保持相同列结构与 --json 字段。
+func runStatus() {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 
-	w := *pingWatch
+	w := *statusWatch
 	if w == "" {
 		if inferred, err := resolveWorkspaceID(cfg, ""); err == nil {
 			w = inferred
@@ -904,24 +910,96 @@ func runPing() {
 		os.Exit(1)
 	}
 
+	// relay 后端专属:完整三段 + 版本台账。
+	if rb, ok := b.(*relaybackend.RelayBackend); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), statusTimeout)
+		defer cancel()
+		st, err := rb.Status(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		printStatus(watchCfg.ID, cfg.Backend.Type, st, *statusJSONOut)
+		return
+	}
+
+	// 非 relay 端点:单跳可达(沿用 runPing 的 b.Ping),段2/累计明确标不可用。
 	commandDir := "/tmp/relay-commands"
 	if dir, ok := cfg.Backend.Config["command_dir"].(string); ok && dir != "" {
 		commandDir = dir
 	}
-
 	start := time.Now()
 	if err := b.Ping(context.Background(), commandDir, watchCfg.ID); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	// 探活成功。relay 后端 Ping 忽略 watchID,输出上仍标注目标 workspace 便于区分。
-	fmt.Printf("OK — remote watcher %q reachable via %s (%s)\n", watchCfg.ID, cfg.Backend.Type, time.Since(start).Round(time.Millisecond))
+	ms := time.Since(start).Milliseconds()
+	reason := "not supported on " + cfg.Backend.Type + " backend"
+	st := protocol.StatusResponse{
+		OK:    true,
+		Seg1:  protocol.StatusSegment{LatencyMS: &ms},
+		Seg2:  protocol.StatusSegment{Unavailable: reason},
+		Total: protocol.StatusSegment{Unavailable: reason},
+	}
+	printStatus(watchCfg.ID, cfg.Backend.Type, st, *statusJSONOut)
 }
 
-// runVersion 打印本机构建信息;--remote 时向中转查询远程台账(中转 + 各执行方)并对比版本。
-func runVersion() {
-	local := version.String()
+// printStatus 渲染 `relay status` 结果:--json 输出与文本一致的相同字段,段不可用时 latency_ms
+// 留空并给出 unavailable 原因。
+func printStatus(watchID, backendName string, st protocol.StatusResponse, jsonOut bool) {
+	if jsonOut {
+		rep := map[string]interface{}{
+			"watch":   watchID,
+			"backend": backendName,
+			"seg1":    st.Seg1,
+			"seg2":    st.Seg2,
+			"total":   st.Total,
+			"nodes":   st.Nodes,
+		}
+		enc, _ := json.MarshalIndent(rep, "", "  ")
+		fmt.Println(string(enc))
+		return
+	}
 
+	fmt.Printf("status %q (%s backend)\n", watchID, backendName)
+	fmt.Printf("  local→transit     %s\n", segmentText(st.Seg1))
+	fmt.Printf("  transit→executor  %s\n", segmentText(st.Seg2))
+	fmt.Printf("  local total       %s\n", segmentText(st.Total))
+	if len(st.Nodes) == 0 {
+		fmt.Println("  endpoints: (none reported)")
+		return
+	}
+	fmt.Println("  endpoints:")
+	for _, n := range st.Nodes {
+		if n.Role == "transit" {
+			fmt.Printf("    transit   %s  (%s/%s)\n", ident(n), n.GOOS, n.GOARCH)
+		} else {
+			fmt.Printf("    executor  watch=%s  %s\n", n.WatchID, ident(n))
+		}
+	}
+}
+
+// ident 把 VersionInfo 渲染成可用于对比的标识符(带 commit 时版+commit)。
+func ident(n protocol.VersionInfo) string {
+	if n.Commit != "" {
+		return n.Version + "+" + n.Commit
+	}
+	return n.Version
+}
+
+// segmentText 渲染一段时延;可用的给毫秒,不可用的给括号原因。
+func segmentText(s protocol.StatusSegment) string {
+	if s.LatencyMS != nil {
+		return fmt.Sprintf("%d ms", *s.LatencyMS)
+	}
+	if s.Unavailable != "" {
+		return "N/A (" + s.Unavailable + ")"
+	}
+	return "N/A"
+}
+
+// runVersion 打印纯本机构建信息。跨机版本台账职责已归一到 `relay status`;`--json` 仍保留。
+func runVersion() {
 	if *versionJSONOut {
 		rep := map[string]interface{}{
 			"local": map[string]interface{}{
@@ -933,11 +1011,6 @@ func runVersion() {
 				"go":      runtime.Version(),
 			},
 		}
-		if *versionRemote {
-			if vr, err := queryRemoteVersions(); err == nil {
-				rep["remote"] = vr.Nodes
-			}
-		}
 		enc, _ := json.MarshalIndent(rep, "", "  ")
 		fmt.Println(string(enc))
 		return
@@ -946,73 +1019,7 @@ func runVersion() {
 	fmt.Printf("relay %s\n", version.Full())
 	fmt.Printf("  local  %s/%s  commit=%s  built=%s  go=%s\n",
 		runtime.GOOS, runtime.GOARCH, orDash(version.Commit), orDash(version.Date), runtime.Version())
-
-	if !*versionRemote {
-		fmt.Println("  (add -r to query the transit server and executors for comparison)")
-		return
-	}
-
-	vr, err := queryRemoteVersions()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: query remote versions: %v\n", err)
-		os.Exit(1)
-	}
-	if !vr.OK {
-		fmt.Fprintf(os.Stderr, "Error: %s\n", vr.Error)
-		os.Exit(1)
-	}
-
-	fmt.Println("  remote:")
-
-	found := false
-	for _, n := range vr.Nodes {
-		if *versionWatch != "" && n.Role == "executor" && n.WatchID != *versionWatch {
-			continue
-		}
-		found = true
-		ident := n.Version
-		if n.Commit != "" {
-			ident = n.Version + "+" + n.Commit
-		}
-		status := "== local ok"
-		if ident != local {
-			status = "!! MISMATCH"
-		}
-		who := n.Role
-		detail := ""
-		if n.Role == "executor" {
-			detail = "watch=" + n.WatchID
-		} else {
-			detail = n.GOOS + "/" + n.GOARCH
-		}
-		fmt.Printf("    %-8s %-24s %-24s %s\n", who, detail, ident, status)
-	}
-	if !found {
-		fmt.Println("    (no nodes reported; is the transit server reachable?)")
-	}
-}
-
-// queryRemoteVersions 建立 relay 后端连接,向中转查询版本台账(中转 + 各执行方)。
-func queryRemoteVersions() (protocol.VersionResponse, error) {
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		return protocol.VersionResponse{}, fmt.Errorf("load config: %w", err)
-	}
-	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
-	if err != nil {
-		return protocol.VersionResponse{}, fmt.Errorf("create backend: %w", err)
-	}
-	rb, ok := b.(*relaybackend.RelayBackend)
-	if !ok {
-		return protocol.VersionResponse{}, fmt.Errorf("backend %q has no version query (relay backend only)", cfg.Backend.Type)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	vr, err := rb.Version(ctx)
-	if err != nil {
-		return vr, err
-	}
-	return vr, nil
+	fmt.Println("  (远端台账见 `relay status`)")
 }
 
 // runServerRemote 一键部署中转:读取本地 relay 二进制,经 `server-remote` 受控自升级
