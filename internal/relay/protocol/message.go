@@ -9,7 +9,6 @@ const (
 	MsgPing             MessageType = "ping"
 	MsgPong             MessageType = "pong"
 	MsgFileEvent        MessageType = "file_event"
-	MsgEventAck         MessageType = "event_ack"
 	MsgPush             MessageType = "push"
 	MsgPull             MessageType = "pull"
 	MsgList             MessageType = "list"
@@ -21,7 +20,6 @@ const (
 	MsgStreamData       MessageType = "stream_data"
 	MsgStreamEnd        MessageType = "stream_end"
 	MsgError            MessageType = "error"
-	MsgSubscribed       MessageType = "subscribed"
 	MsgExecOutput       MessageType = "exec_output"
 	MsgRegisterExecutor MessageType = "register_executor"
 	MsgPushJob          MessageType = "push_job"
@@ -321,12 +319,6 @@ type StreamEnd struct {
 	Received int64  `json:"received"`
 	Digest   string `json:"digest,omitempty"`
 	Error    string `json:"error,omitempty"`
-}
-
-// EventAck 事件确认
-type EventAck struct {
-	EventID string `json:"event_id"`
-	OK      bool   `json:"ok"`
 }
 
 // Heartbeat 心跳

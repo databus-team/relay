@@ -74,14 +74,6 @@ func (c *Client) streamChunkedContent(ctx context.Context, streamID string, tota
 	return nil
 }
 
-// ExecRequest 是一次远程执行请求(请求方发出或被执行方收到)。
-type ExecRequest struct {
-	WatchID string
-	Cmd     string
-	Cwd     string
-	Timeout int
-}
-
 // ExecStream 发送执行请求并流式接收输出。onChunk 每次收到增量输出帧时回调(nil 可忽略)。
 // 返回最终 ExecResponse(含聚合 stdout/stderr 与 exit code)。
 // targetWatch 若非空则以它作为请求路由键(目标执行器 watch_id);空则回退到本端根 watch。
@@ -490,7 +482,7 @@ func (c *Client) handleInboundPushEnd(pr *inboundPushReceive, msg *protocol.Mess
 type ExecSession struct {
 	client    *Client
 	requestID string
-	req       ExecRequest
+	req       protocol.ExecRequest
 	seq       atomic.Int64
 }
 
@@ -510,7 +502,7 @@ func (c *Client) SetExecHandler(fn func(*ExecSession)) {
 // handleInboundExec 处理从中转转发来的 exec 请求(执行方视角)。
 func (c *Client) handleInboundExec(msg protocol.Message) {
 	payload, _ := msg.Payload.(map[string]interface{})
-	req := ExecRequest{
+	req := protocol.ExecRequest{
 		WatchID: toString(payload["watch_id"]),
 		Cmd:     toString(payload["cmd"]),
 		Cwd:     toString(payload["cwd"]),

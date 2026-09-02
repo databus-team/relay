@@ -675,10 +675,6 @@ func (s *Server) BroadcastToSubscribers(event protocol.FileEvent) {
 	}
 }
 
-func (s *Server) BroadcastFileEvent(event protocol.FileEvent) {
-	s.BroadcastToSubscribers(event)
-}
-
 func toString(v interface{}) string {
 	if s, ok := v.(string); ok {
 		return s

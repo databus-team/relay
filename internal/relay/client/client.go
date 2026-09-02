@@ -31,6 +31,7 @@ type Client struct {
 	closeCh      chan struct{}
 	reconnectCfg ReconnectConfig
 	lastPong     atomic.Int64
+	heartbeatGen atomic.Int64 // 每次重连成功后递增,使旧心跳 goroutine 失效(superseded)后自行退出
 
 	streamMu   sync.RWMutex
 	streams    map[string]*receiveStream
