@@ -51,6 +51,13 @@ type Server struct {
 	pushRelay   map[string]pushRelayInfo
 	pushRelayMu sync.RWMutex
 
+	// tunnels 记录在转的隧道流(streamID → 两端):请求方(本地 client)与执行方(client)。
+	// 每个隧道独立、互不串扰,天然支持多 executor 多隧道并行(多 watch 一对一)。
+	tunnels       map[string]*tunnelEntry
+	tunnelMu      sync.RWMutex
+	tunnelEnabled bool // 隧道通道:KTD4 默认关闭,显式开启才放行 MsgTunnel*
+	maxTunnels    int  // 并发隧道上限(0/缺省=默认 256),防 token 持有者无界开隧道(DoS)
+
 	// upgradeSwap 由接线方(如 cmd/relay)注入的「自升级换装」闭包:入参为已通过 sha256
 	// 校验与自检、落盘好的新二进制路径;闭包内做停旧/.prev 备份/替换/重启。仅为 nil 时
 	// (如测试)升级通道只回执 ACK 并清理暂存,不真实换装。
@@ -67,11 +74,23 @@ type pushRelayInfo struct {
 	requesterID string // 发起 push 的请求方
 }
 
+// tunnelEntry 一条在转隧道的两端 client ID。字节流按 streamID 在中转两侧原样透传,不落盘。
+type tunnelEntry struct {
+	requesterID string // 隧道本地请求方(经本地 SOCKS5 的 CLI)
+	executorID  string // 隧道出口执行方(白名单校验 + 真实连接)
+}
+
+// defaultMaxTunnels 是并发隧道上限的缺省值(Config.MaxTunnels<=0 时取用)。
+// 限制 token 持有者可同时维持的隧道数,防止未授权的内网扫描/资源耗尽(镜像 KTD7)。
+const defaultMaxTunnels = 256
+
 type Config struct {
-	Addr      string
-	TLS       TLSConfig
-	Auth      AuthConfig
-	WatchDirs []WatchDirConfig
+	Addr          string
+	TLS           TLSConfig
+	Auth          AuthConfig
+	WatchDirs     []WatchDirConfig
+	TunnelEnabled bool // KTD4:隧道通道默认关闭,显式开启才放行 MsgTunnel*
+	MaxTunnels    int  // 并发隧道上限(<=0 时用 defaultMaxTunnels)
 }
 
 type TLSConfig struct {
@@ -92,20 +111,27 @@ type WatchDirConfig struct {
 }
 
 func New(cfg Config) (*Server, error) {
+	maxTunnels := cfg.MaxTunnels
+	if maxTunnels <= 0 {
+		maxTunnels = defaultMaxTunnels
+	}
 	s := &Server{
-		addr:         cfg.Addr,
-		watchDirs:    make(map[string]string),
-		watchCfgs:    cfg.WatchDirs,
-		clients:      make(map[string]*Client),
-		serverID:     "relay-" + uuid.New().String()[:8],
-		auth:         cfg.Auth,
-		tls:          cfg.TLS,
-		subs:         make(map[string]map[string]bool),
-		executors:    make(map[string]string),
-		executorVers: make(map[string]string),
-		reqOwner:     make(map[string]string),
-		pending:      make(map[string]chan protocol.Message),
-		pushRelay:    make(map[string]pushRelayInfo),
+		addr:          cfg.Addr,
+		watchDirs:     make(map[string]string),
+		watchCfgs:     cfg.WatchDirs,
+		clients:       make(map[string]*Client),
+		serverID:      "relay-" + uuid.New().String()[:8],
+		auth:          cfg.Auth,
+		tls:           cfg.TLS,
+		subs:          make(map[string]map[string]bool),
+		executors:     make(map[string]string),
+		executorVers:  make(map[string]string),
+		reqOwner:      make(map[string]string),
+		pending:       make(map[string]chan protocol.Message),
+		pushRelay:     make(map[string]pushRelayInfo),
+		tunnels:       make(map[string]*tunnelEntry),
+		tunnelEnabled: cfg.TunnelEnabled,
+		maxTunnels:    maxTunnels,
 	}
 
 	for _, wd := range cfg.WatchDirs {
@@ -288,6 +314,7 @@ func (s *Server) handleConnection(conn *websocket.Conn) {
 	client.cleanupStreams() // 清理断连时未完成流的临时文件(如自升级 .incoming)
 	s.UnsubscribeAll(clientID)
 	s.cleanupClientState(clientID)
+	s.removeClientTunnels(clientID) // 拆除该客户端所在隧道,向对端发 MsgTunnelEnd
 
 	s.clientMu.Lock()
 	delete(s.clients, clientID)
@@ -463,6 +490,76 @@ func (s *Server) DeletePushRelay(streamID string) {
 	s.pushRelayMu.Lock()
 	defer s.pushRelayMu.Unlock()
 	delete(s.pushRelay, streamID)
+}
+
+// TunnelEnabled 返回隧道通道是否开启(KTD4)。
+func (s *Server) TunnelEnabled() bool {
+	s.tunnelMu.RLock()
+	defer s.tunnelMu.RUnlock()
+	return s.tunnelEnabled
+}
+
+// registerTunnel 登记一条在转隧道(streamID → 请求方/执行方)。超过并发上限返回 false。
+// 隧道路由天然按 streamID 独立,多 executor 多隧道互不干扰。
+func (s *Server) registerTunnel(streamID, requesterID, executorID string) bool {
+	s.tunnelMu.Lock()
+	defer s.tunnelMu.Unlock()
+	if len(s.tunnels) >= s.maxTunnels {
+		return false
+	}
+	s.tunnels[streamID] = &tunnelEntry{requesterID: requesterID, executorID: executorID}
+	return true
+}
+
+// getTunnel 查询一条隧道的两端。
+func (s *Server) getTunnel(streamID string) (tunnelEntry, bool) {
+	s.tunnelMu.RLock()
+	defer s.tunnelMu.RUnlock()
+	e, ok := s.tunnels[streamID]
+	if !ok {
+		return tunnelEntry{}, false
+	}
+	return *e, true
+}
+
+// deleteTunnel 移除一条隧道(结束/任一端断连)。
+func (s *Server) deleteTunnel(streamID string) {
+	s.tunnelMu.Lock()
+	defer s.tunnelMu.Unlock()
+	delete(s.tunnels, streamID)
+}
+
+// removeClientTunnels 断连时拆除该客户端所在(作为请求方或作为执行方)的全部隧道,并向对端
+// 发 MsgTunnelEnd 关停;确保多隧道清理不泄漏、不乱绕(SOCKS5 方案的「任一端断开关隧道」语义)。
+func (s *Server) removeClientTunnels(clientID string) {
+	s.tunnelMu.Lock()
+	var notify []tunnelEndNotify
+	for streamID, e := range s.tunnels {
+		if e.requesterID == clientID || e.executorID == clientID {
+			other := e.executorID
+			if e.executorID == clientID {
+				other = e.requesterID
+			}
+			delete(s.tunnels, streamID)
+			notify = append(notify, tunnelEndNotify{streamID: streamID, clientID: other})
+		}
+	}
+	s.tunnelMu.Unlock()
+
+	for _, n := range notify {
+		_ = s.SendTo(n.clientID, protocol.Message{
+			Type:     protocol.MsgTunnelEnd,
+			ID:       uuid.New().String(),
+			StreamID: n.streamID,
+			Payload:  protocol.TunnelEnd{StreamID: n.streamID, Reason: "peer disconnected"},
+		})
+	}
+}
+
+// tunnelEndNotify 拆除一条隧道时向对端告知关闭的内部消息。
+type tunnelEndNotify struct {
+	streamID string
+	clientID string
 }
 
 // sendProbe 向某执行方发送一条带写超时的探针(中转测 transit→executor 段)。

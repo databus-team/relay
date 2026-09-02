@@ -160,6 +160,15 @@ func (c *Client) handleMessage(msg protocol.Message) {
 
 	case protocol.MsgStreamEnd:
 		c.handleStreamEnd(msg)
+
+	case protocol.MsgTunnelConnect:
+		c.handleTunnelConnect(msg)
+
+	case protocol.MsgTunnelData:
+		c.handleTunnelData(msg)
+
+	case protocol.MsgTunnelEnd:
+		c.handleTunnelEnd(msg)
 	}
 }
 
@@ -396,7 +405,93 @@ func (c *Client) handleRegisterExecutor(msg protocol.Message) {
 	c.SendResponse(msg.ID, map[string]interface{}{"ok": true, "watch_id": watchID, "executor": c.id})
 }
 
-// versionLedger 组装端点版本台账:中转自身 + 各 watch 在线执行方,执行方按 watch 排序以便对比。
+// handleTunnelConnect 处理隧道建连请求:校验隧道通道、按出口 watch 解析执行方,登记隧道
+// 注册表并原样转发给执行方。无在线执行方或通道关闭时 fail-fast(不建立任何内网连接)。
+// 建连确认由执行方经 MsgResponse(Msg.ID 作的 RequestID)回流——复用 reqOwner 回执路径。
+func (c *Client) handleTunnelConnect(msg protocol.Message) {
+	if !c.server.TunnelEnabled() {
+		c.SendError(msg.ID, "tunnel channel not enabled")
+		return
+	}
+
+	payload, _ := msg.Payload.(map[string]interface{})
+	data, _ := json.Marshal(payload)
+	var req protocol.TunnelConnectRequest
+	_ = json.Unmarshal(data, &req)
+
+	if req.StreamID == "" {
+		c.SendError(msg.ID, "tunnel: missing stream_id")
+		return
+	}
+	if req.WatchID == "" {
+		c.SendError(msg.ID, "tunnel: missing watch_id")
+		return
+	}
+
+	executorID, ok := c.server.GetExecutor(req.WatchID)
+	if !ok {
+		c.SendError(msg.ID, fmt.Sprintf("no online executor for watch %q", req.WatchID))
+		return
+	}
+
+	if !c.server.registerTunnel(req.StreamID, c.id, executorID) {
+		c.SendError(msg.ID, "tunnel: too many concurrent tunnels")
+		return
+	}
+
+	// 记录请求方归属,供执行方回流(建连确认)原路返回。
+	c.server.SetReqOwner(msg.ID, c.id)
+	if err := c.server.SendTo(executorID, msg); err != nil {
+		c.server.ClearReqOwner(msg.ID)
+		c.server.deleteTunnel(req.StreamID)
+		c.SendError(msg.ID, "executor unavailable: "+err.Error())
+	}
+}
+
+// handleTunnelData 双向字节流帧:按 streamID 在中转两侧原样透传(不落盘/不解释/不聚合 R3)。
+// 请求方(本地 SOCKS5)→ 执行方;执行方 → 请求方。不再是本隧道任何一端时丢弃。
+func (c *Client) handleTunnelData(msg protocol.Message) {
+	streamID := msg.StreamID
+	if streamID == "" {
+		return
+	}
+	entry, ok := c.server.getTunnel(streamID)
+	if !ok {
+		return
+	}
+	var target string
+	switch c.id {
+	case entry.requesterID:
+		target = entry.executorID
+	case entry.executorID:
+		target = entry.requesterID
+	default:
+		return
+	}
+	_ = c.server.SendTo(target, msg)
+}
+
+// handleTunnelEnd 隧道关闭:任一端发来即拆除注册表并向另一端转发关闭以关停本地连接。
+func (c *Client) handleTunnelEnd(msg protocol.Message) {
+	streamID := msg.StreamID
+	entry, ok := c.server.getTunnel(streamID)
+	if !ok {
+		return
+	}
+	var target string
+	switch c.id {
+	case entry.requesterID:
+		target = entry.executorID
+	case entry.executorID:
+		target = entry.requesterID
+	default:
+		return
+	}
+	c.server.deleteTunnel(streamID)
+	_ = c.server.SendTo(target, msg)
+}
+
+// versionLedger 组装端点版本台账:中转端 + 各 endpoint 在线执行方,每端按 watch 排序便于对比。
 func (c *Client) versionLedger() []protocol.VersionInfo {
 	nodes := []protocol.VersionInfo{{
 		Role:      "transit",
