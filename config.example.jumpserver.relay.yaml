@@ -16,9 +16,8 @@ workspaces:
     local_dir: /workspace/web-app
     paths: ["*.patch"]
     jobs:
-      # JumpServer only supports file_delete, not exec
       - id: backup
-        type: file_delete
-        path: "{file_remote_path}"
+        type: exec
+        cmd: rm -f {file_remote_path}
 
 interval_seconds: 60

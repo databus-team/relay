@@ -16,7 +16,6 @@ type Config struct {
 	Name       string            `yaml:"name"`
 	Version    int               `yaml:"version"`
 	Backend    BackendConfig     `yaml:"backend"`
-	Auth       *AuthConfig       `yaml:"auth,omitempty"`
 	Workspaces []WorkspaceConfig `yaml:"workspaces"`
 	Server     *ServerConfig     `yaml:"server,omitempty"` // 仅 relay server 读取;其它端忽略
 	Interval   int               `yaml:"interval_seconds"`
@@ -60,14 +59,6 @@ type WorkspaceConfig struct {
 type BackendConfig struct {
 	Type   string                 `yaml:"type"`
 	Config map[string]interface{} `yaml:"config"`
-}
-
-type AuthConfig struct {
-	Method          string `yaml:"method"`
-	LoginURL        string `yaml:"login_url"`
-	TokenCookieName string `yaml:"token_cookie_name"`
-	ProxyPort       int    `yaml:"proxy_port"`
-	TokenCacheFile  string `yaml:"token_cache_file"`
 }
 
 type JobConfig struct {
