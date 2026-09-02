@@ -361,6 +361,96 @@ func TestEndToEnd_ExecNoExecutor(t *testing.T) {
 	}
 }
 
+// 端到端:执行方在线时,relay 后端 status 返回 三段 + 台账(中转+执行方)。
+func TestEndToEnd_Status(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
+	watchDir := t.TempDir()
+	ts, wsURL := newTestHub(t, watchDir)
+	defer ts.Close()
+	defer client.CloseAll()
+
+	ctx := context.Background()
+
+	// 执行方:watch 上注册为 executor。
+	if _, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-exe", "watch_id": "test", "watch_dir": ".", "executor": true,
+	}); err != nil {
+		t.Fatalf("executor backend: %v", err)
+	}
+
+	reqRaw, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+	rb := reqRaw.(*RelayBackend)
+
+	st, err := rb.Status(ctx)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if st.Seg1.LatencyMS == nil || *st.Seg1.LatencyMS < 0 {
+		t.Errorf("seg1.latency_ms missing: %+v", st.Seg1)
+	}
+	if st.Seg2.LatencyMS == nil || *st.Seg2.LatencyMS < 0 {
+		t.Errorf("seg2 missing (executor should be online): %+v", st.Seg2)
+	}
+	if st.Total.LatencyMS == nil || *st.Total.LatencyMS != *st.Seg1.LatencyMS+*st.Seg2.LatencyMS {
+		t.Errorf("total should equal seg1+seg2: %+v", st.Total)
+	}
+
+	var hasTransit, hasExecutor bool
+	for _, n := range st.Nodes {
+		switch n.Role {
+		case "transit":
+			hasTransit = true
+		case "executor":
+			if n.WatchID == "test" {
+				hasExecutor = true
+			}
+		}
+	}
+	if !hasTransit || !hasExecutor {
+		t.Errorf("ledger should include transit and executor: %+v", st.Nodes)
+	}
+}
+
+// 端到端:执行方离线时 status 段1 给出、段2 标不可用,仍成功(中转在线、远端掉线)。
+func TestEndToEnd_Status_ExecutorOffline(t *testing.T) {
+	watchDir := t.TempDir()
+	ts, wsURL := newTestHub(t, watchDir)
+	defer ts.Close()
+	defer client.CloseAll()
+
+	ctx := context.Background()
+	reqRaw, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+	rb := reqRaw.(*RelayBackend)
+
+	st, err := rb.Status(ctx)
+	if err != nil {
+		t.Fatalf("status should succeed with executor offline: %v", err)
+	}
+	if st.Seg1.LatencyMS == nil {
+		t.Errorf("seg1 should be present (transit online): %+v", st.Seg1)
+	}
+	if st.Seg2.LatencyMS != nil {
+		t.Errorf("seg2.latency_ms should be nil when executor offline, got %d", *st.Seg2.LatencyMS)
+	}
+	if st.Seg2.Unavailable == "" {
+		t.Error("seg2 should mark executor offline")
+	}
+	if st.Total.LatencyMS != nil {
+		t.Errorf("total should be unavailable when seg2 unavailable, got %d", *st.Total.LatencyMS)
+	}
+}
+
 func TestMsysToWindowsPath(t *testing.T) {
 	cases := []struct {
 		in, want string

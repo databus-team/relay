@@ -438,6 +438,24 @@ func (c *Client) Version(ctx context.Context) (protocol.VersionResponse, error) 
 	return vr, nil
 }
 
+// Status 向中转查询指定 watch 的连通性状态:中转→执行方 段与各端点版本台账。段1(本地→中转
+// 单程)由请求方本地 Ping 计时、累计由请求方累加,故此方法只返回中转侧组装的结果。
+func (c *Client) Status(ctx context.Context, watchID string) (protocol.StatusResponse, error) {
+	var st protocol.StatusResponse
+	resp, err := c.Request(ctx, protocol.MsgStatus, protocol.StatusRequest{WatchID: watchID})
+	if err != nil {
+		return st, err
+	}
+	if !resp.OK {
+		return st, fmt.Errorf("transit status failed: %s", resp.Error)
+	}
+	data, _ := json.Marshal(resp.Payload)
+	if err := json.Unmarshal(data, &st); err != nil {
+		return st, fmt.Errorf("decode status response: %w", err)
+	}
+	return st, nil
+}
+
 func (c *Client) Subscribe(ctx context.Context, watchID string) error {
 	resp, err := c.Request(ctx, protocol.MsgSubscribe, protocol.SubscribeRequest{
 		WatchID: watchID,
