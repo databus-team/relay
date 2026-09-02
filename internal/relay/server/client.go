@@ -396,8 +396,8 @@ func (c *Client) handleRegisterExecutor(msg protocol.Message) {
 	c.SendResponse(msg.ID, map[string]interface{}{"ok": true, "watch_id": watchID, "executor": c.id})
 }
 
-// handleVersion 回答版本查询:返回中转自身的构建信息 + 各 watch 在线执行方的构建版本。
-func (c *Client) handleVersion(msg protocol.Message) {
+// versionLedger 组装端点版本台账:中转自身 + 各 watch 在线执行方,执行方按 watch 排序以便对比。
+func (c *Client) versionLedger() []protocol.VersionInfo {
 	nodes := []protocol.VersionInfo{{
 		Role:      "transit",
 		Version:   version.Version,
@@ -407,7 +407,6 @@ func (c *Client) handleVersion(msg protocol.Message) {
 		GOARCH:    runtime.GOARCH,
 		Go:        runtime.Version(),
 	}}
-
 	for watchID, ver := range c.server.ExecutorVersions() {
 		nodes = append(nodes, protocol.VersionInfo{
 			Role:    "executor",
@@ -415,10 +414,13 @@ func (c *Client) handleVersion(msg protocol.Message) {
 			Version: ver,
 		})
 	}
-	// executor 按 watch 排序,便于对比。
 	sort.SliceStable(nodes[1:], func(i, j int) bool { return nodes[i+1].WatchID < nodes[j+1].WatchID })
+	return nodes
+}
 
-	c.SendResponse(msg.ID, protocol.VersionResponse{OK: true, Nodes: nodes})
+// handleVersion 回答版本查询:返回中转自身构建信息 + 各 watch 在线执行方的构建版本。
+func (c *Client) handleVersion(msg protocol.Message) {
+	c.SendResponse(msg.ID, protocol.VersionResponse{OK: true, Nodes: c.versionLedger()})
 }
 
 // handleStatus 处理 `relay status` 的连通性体检:对指定 watch 的执行方发探针并带回包超时,
@@ -433,26 +435,7 @@ func (c *Client) handleStatus(msg protocol.Message) {
 		return
 	}
 
-	nodes := []protocol.VersionInfo{{
-		Role:      "transit",
-		Version:   version.Version,
-		Commit:    version.Commit,
-		BuildTime: version.Date,
-		GOOS:      runtime.GOOS,
-		GOARCH:    runtime.GOARCH,
-		Go:        runtime.Version(),
-	}}
-	for w, ver := range c.server.ExecutorVersions() {
-		nodes = append(nodes, protocol.VersionInfo{
-			Role:    "executor",
-			WatchID: w,
-			Version: ver,
-		})
-	}
-	// executor 按 watch 排序,便于对比。
-	sort.SliceStable(nodes[1:], func(i, j int) bool { return nodes[i+1].WatchID < nodes[j+1].WatchID })
-
-	resp := protocol.StatusResponse{OK: true, Nodes: nodes}
+	resp := protocol.StatusResponse{OK: true, Nodes: c.versionLedger()}
 
 	executorID, ok := c.server.GetExecutor(watchID)
 	if !ok {
