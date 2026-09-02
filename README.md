@@ -413,7 +413,7 @@ The relay server configuration (addr / watch_root / auth / tls) lives in the `se
 | Field | Description |
 |-------|-------------|
 | `name` | Config name |
-| `version` | Schema version (currently 1) |
+| `version` | Config schema version (currently 2) |
 | `backend` | Backend type + config |
 | `workspaces` | List of workspace (job-config) entries |
 | `workspaces[].id` | Unique workspace identifier |

@@ -1,5 +1,5 @@
 name: relay
-version: 1
+version: 2
 
 # Example: jumpserver backend
 # JumpServer REST API (file operations only, no exec support)

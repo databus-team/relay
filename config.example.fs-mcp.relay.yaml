@@ -1,5 +1,5 @@
 name: relay
-version: 1
+version: 2
 
 # Example: fs-mcp backend
 # MCP (Model Context Protocol) filesystem server

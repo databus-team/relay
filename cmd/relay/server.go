@@ -89,13 +89,9 @@ func unifiedServerBase(data []byte) (serverBaseConfig, error) {
 
 	watchDirs := make([]server.WatchDirConfig, 0, len(cfg.Workspaces))
 	if sc != nil && sc.WatchRoot != "" {
-		// 单根模式:一个 watch_id 覆盖整个 watch_root,workspace 目录只是到时 root 下相对
-		// 子路径(供客户端),不再各自建服务器 watch。优先级:server.watch_id > backend.config.watch_id
-		// > 首个 workspace id > "relay"。
-		id := sc.WatchID
-		if id == "" {
-			id, _ = cfg.Backend.Config["watch_id"].(string)
-		}
+		// 单根模式:executor 自注册 watch_id(不再由 server 指定),watch_root 段只用一个存储
+		// id 覆盖整个 root;优先级:backend.config.watch_id > 首个 workspace id > "relay"。
+		id, _ := cfg.Backend.Config["watch_id"].(string)
 		if id == "" && len(cfg.Workspaces) > 0 {
 			id = cfg.Workspaces[0].ID
 		}

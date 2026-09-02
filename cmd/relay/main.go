@@ -735,7 +735,7 @@ func runLocalJobsForPush(watchID, absPath string, out func(backend.ExecChunk)) i
 	}
 	watchCfg := resolvePushWorkspace(cfg, watchID, absPath)
 	if watchCfg == nil {
-		out(backend.ExecChunk{Stdout: false, Data: fmt.Sprintf("push-job: unknown watch %q\n", watchID)})
+		out(backend.ExecChunk{Stdout: false, Data: pushWorkspaceErrHints(cfg, watchID, absPath)})
 		return 1
 	}
 
@@ -792,6 +792,31 @@ func resolvePushWorkspace(cfg *config.Config, watchID, absPath string) *config.W
 		return owned[0]
 	}
 	return disambiguateWorkspacesByPath(workspacePointers(cfg.Workspaces), absPath)
+}
+
+// pushWorkspaceErrHints 在执行方无法把收 push 的路由 id 映射回 workspace 时,给出可诊断
+// 的报错:列出该配置下的 workspaces 及其 executor 绑定,便于核对「执行方配置是否已同步带
+// 绑定」。最常见的成因是执行方 `relay watch` 读的还是旧配置(没有 `executor:` 绑定)——用
+// `relay sync` 把共享配置推给执行方可解决。
+func pushWorkspaceErrHints(cfg *config.Config, watchID, absPath string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "push-job: no workspace for push target=%q file=%q\n", watchID, absPath)
+	if len(cfg.Workspaces) == 0 {
+		b.WriteString("  (this config has no workspaces; run `relay sync` to write a shared config to this executor)\n")
+		return b.String()
+	}
+	b.WriteString("  configured workspaces:\n")
+	for _, w := range cfg.Workspaces {
+		ex := w.Executor
+		if ex == "" {
+			ex = "(single-root)"
+		}
+		fmt.Fprintf(&b, "    - %s -> executor=%s\n", w.ID, ex)
+	}
+	fmt.Fprintf(&b, "  hint: the push target %q is an executor id; ensure at least one workspace behaves\n", watchID)
+	b.WriteString("        bound to it (executor: <that id>) in the config THIS executor is running,\n")
+	b.WriteString("        or use `relay sync -e <id>` to deliver the shared config then restart `relay watch`.\n")
+	return b.String()
 }
 
 // workspacePointers 把值切片转成指针切片,便于统一按 *WorkspaceConfig 做路径消歧。

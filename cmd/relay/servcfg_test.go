@@ -193,13 +193,13 @@ workspaces:
 	}
 }
 
-// server 段独立配置时靠显式 watch_id 注册单根(与 client 的 backend.watch_id 对齐)。
+// 单一存储根不再由 server 显式指定 watch_id —— 改为 executor 自注册,watch_root 段的
+// 存储 id 优先级为 backend.config.watch_id > 首个 workspace id > "relay"。
 func TestUnifiedServerSingleRootWatchID(t *testing.T) {
 	data := []byte(`
 server:
   addr: ":8443"
   watch_root: /home/devpod/storage
-  watch_id: storage
   auth:
     tokens: ["tok-a"]
 `)
@@ -210,10 +210,31 @@ server:
 	if len(base.watchDirs) != 1 {
 		t.Fatalf("want 1 root watch, got %d", len(base.watchDirs))
 	}
-	if base.watchDirs[0].ID != "storage" || base.watchDirs[0].Dir != "/home/devpod/storage" {
+	// 无 backend.config.watch_id、无 workspace → 回退到 "relay"。
+	if base.watchDirs[0].ID != "relay" || base.watchDirs[0].Dir != "/home/devpod/storage" {
 		t.Errorf("root watch: %+v", base.watchDirs[0])
 	}
 	if !reflect.DeepEqual(base.tokens, []string{"tok-a"}) {
 		t.Errorf("tokens: %v", base.tokens)
+	}
+}
+
+// 单根模式下 backend.config.watch_id 参与存储 id 的优先级(优先于 workspace/relay)。
+func TestUnifiedServerSingleRootBackendWatchID(t *testing.T) {
+	data := []byte(`
+server:
+  addr: ":8443"
+  watch_root: /home/devpod/storage
+backend:
+  type: relay
+  config:
+    watch_id: storage
+`)
+	base, err := unifiedServerBase(data)
+	if err != nil {
+		t.Fatalf("unifiedServerBase: %v", err)
+	}
+	if len(base.watchDirs) != 1 || base.watchDirs[0].ID != "storage" {
+		t.Errorf("root watch: %+v", base.watchDirs)
 	}
 }
