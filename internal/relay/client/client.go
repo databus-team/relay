@@ -174,6 +174,8 @@ func (c *Client) readLoop() {
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
 			c.connected.Store(false)
+			// 传输断开:先拆空隧道(出站流中止/入站连接关闭),避免重连后本地仍以为隧道黑盒仍开着。
+			c.closeAllTunnels("transport lost")
 			go c.reconnectLoop(context.Background())
 			return
 		}

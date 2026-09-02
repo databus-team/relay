@@ -32,6 +32,7 @@ var (
 	serverToken      = serverCmd.Flag("token", "Authentication token").Strings()
 	serverTLSCert    = serverCmd.Flag("tls-cert", "TLS certificate file").String()
 	serverTLSKey     = serverCmd.Flag("tls-key", "TLS key file").String()
+	serverMaxTunnels = serverCmd.Flag("max-tunnels", "Max concurrent tunnels (<=0 uses default 256)").Int()
 )
 
 type serverYAMLConfig struct {
@@ -50,6 +51,7 @@ type serverYAMLConfig struct {
 		KeyFile  string `yaml:"key_file"`
 	} `yaml:"tls"`
 	TunnelEnabled bool `yaml:"tunnel_enabled"`
+	MaxTunnels    int  `yaml:"max_tunnels"`
 }
 
 // serverBaseConfig 统一保存映射后的中转基础配置(文件来源),再叠加 CLI overrides。
@@ -59,6 +61,7 @@ type serverBaseConfig struct {
 	tokens        []string
 	tls           server.TLSConfig
 	tunnelEnabled bool
+	maxTunnels    int
 }
 
 // hasServerSection 判断文件是否含顶层 `server:` 段(统一 config.yaml)。
@@ -116,13 +119,15 @@ func unifiedServerBase(data []byte) (serverBaseConfig, error) {
 	tokens := []string(nil)
 	tls := server.TLSConfig{}
 	tunnelEnabled := false
+	maxTunnels := 0
 	if sc != nil {
 		tokens = sc.Auth.Tokens
 		tls = server.TLSConfig{Enabled: sc.TLS.Enabled, CertFile: sc.TLS.CertFile, KeyFile: sc.TLS.KeyFile}
 		tunnelEnabled = sc.TunnelEnabled
+		maxTunnels = sc.MaxTunnels
 	}
 
-	return serverBaseConfig{addr: addr, watchDirs: watchDirs, tokens: tokens, tls: tls, tunnelEnabled: tunnelEnabled}, nil
+	return serverBaseConfig{addr: addr, watchDirs: watchDirs, tokens: tokens, tls: tls, tunnelEnabled: tunnelEnabled, maxTunnels: maxTunnels}, nil
 }
 
 // legacyServerBase 从旧式 server.yaml(顶层 addr/watch/auth/tls)构建 server 配置。
@@ -146,6 +151,7 @@ func legacyServerBase(data []byte) (serverBaseConfig, error) {
 		tokens:        fileCfg.Auth.Tokens,
 		tls:           server.TLSConfig{Enabled: fileCfg.TLS.Enabled, CertFile: fileCfg.TLS.CertFile, KeyFile: fileCfg.TLS.KeyFile},
 		tunnelEnabled: fileCfg.TunnelEnabled,
+		maxTunnels:    fileCfg.MaxTunnels,
 	}, nil
 }
 
@@ -213,12 +219,18 @@ func runServer() error {
 		tlsKey = *serverTLSKey
 	}
 
+	maxTunnels := base.maxTunnels
+	if *serverMaxTunnels > 0 {
+		maxTunnels = *serverMaxTunnels
+	}
+
 	cfg := server.Config{
 		Addr:          addr,
 		WatchDirs:     watchDirs,
 		Auth:          server.AuthConfig{Type: "token", Tokens: tokens},
 		TLS:           server.TLSConfig{Enabled: tlsEnabled, CertFile: tlsCert, KeyFile: tlsKey},
 		TunnelEnabled: base.tunnelEnabled,
+		MaxTunnels:    maxTunnels,
 	}
 
 	srv, err := server.New(cfg)

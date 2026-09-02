@@ -315,6 +315,7 @@ curl --socks5-hostname 127.0.0.1:1080 http://intra.a.internal/ping
 - Default bind is loopback `127.0.0.1`; binding a non-loopback address prints a loud warning (no auth).
 - Server must enable the tunnel channel (`tunnel_enabled: true` in the `server:` section); otherwise
   tunnel requests are rejected.
+- Optionally bound the concurrent-tunnel cap with `server.max_tunnels` (CLI `--max-tunnels`; default 256).
 
 **Dual-executor / concurrent tunnels (multi-executor):** one transit can host **two (or more)** remote
 executors at once, each on its own watch/workspace. Run two `relay tunnel`s in parallel, each binding its

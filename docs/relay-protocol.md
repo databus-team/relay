@@ -449,6 +449,12 @@ type TunnelEnd  struct { StreamID string `json:"stream_id"`; Reason string `json
   多隧道并行互不串扰;任一端断连/发 `MsgTunnelEnd` 只拆除自身条目。
 - **通道开关**:隧道默认关闭;仅当服务器显式开启(`tunnel_enabled: true`)才放行 `MsgTunnel*`(与升级通道
   同姿态)。
+- **并发上限**:服务器 `max_tunnels`(config `server.max_tunnels` / CLI `--max-tunnels`,缺省 256)限制可同时
+  维持的隧道数,防 token 持有者无界开隧道 / 内网扫描(DoS)。
+- **数据完整性(fail-closed)**:executor 每入站隧道一个专属写者队列,慢 / 停读目标只阻塞该隧道自身的写者,
+  不再阻塞 readLoop 其它消息(head-of-line);队列满或写失败整条拆、绝不丢字节。
+- **断连拆除**:传输断开/重连前,本地拆空全部隧道——出站本流中止(本地 SOCKS 端感知关闭)、入站连接关闭,
+  避免重连后本地仍以为隧道开着而静默黑盒。
 - **白名单(`network_allow`,executor 侧强制)**:条目为 `host|ip|CIDR` 可选端口(如 `10.0.0.0/8@80,443`、
   `api.internal.com@443`、`192.168.0.5@22`);无 `@` 为任意端口。hostname 只作解析提示,建连一律用
   **已校验的 IP 字面量**(防 DNS 重绑 TOCTOU)。未命中/空列表 → 拒绝。
@@ -844,6 +850,8 @@ relay_server:
   
   # 隧道通道:默认关闭;显式开启才放行 MsgTunnel*(否则隧道请求一律拒绝)。
   tunnel_enabled: true
+  # 并发隧道上限(<=0 用默认 256),防 token 持有者无界开隧道(DoS)。
+  max_tunnels: 256
   
   transfer:
     chunk_size: 65536

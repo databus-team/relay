@@ -30,6 +30,7 @@ type ServerConfig struct {
 	Auth          ServerAuth      `yaml:"auth"`
 	TLS           ServerTLSConfig `yaml:"tls"`
 	TunnelEnabled bool            `yaml:"tunnel_enabled"` // 隧道通道:默认 false,显式开启才放行 MsgTunnel*
+	MaxTunnels    int             `yaml:"max_tunnels"`    // 并发隧道上限(<=0 用默认 256),防 token 持有者无界开隧道
 }
 
 type ServerAuth struct {

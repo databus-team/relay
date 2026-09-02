@@ -87,7 +87,57 @@ watch:
 	}
 }
 
-// 无 server 段的旧式 server.yaml → legacy serverBaseConfig。
+// max_tunnels 在统一与旧式两条解析路径都被接进来(默认 0;server 端再用 defaultMaxTunnels)。
+func TestServerBaseMaxTunnels(t *testing.T) {
+	// 统一 config.yaml:server.max_tunnels
+	uni := []byte(`
+server:
+  addr: ":9443"
+  tunnel_enabled: true
+  max_tunnels: 32
+watch:
+  - id: rel
+    watch_dir: /data/relay
+`)
+	base, err := unifiedServerBase(uni)
+	if err != nil {
+		t.Fatalf("unifiedServerBase: %v", err)
+	}
+	if !base.tunnelEnabled {
+		t.Errorf("tunnel_enabled should be true")
+	}
+	if base.maxTunnels != 32 {
+		t.Errorf("maxTunnels: %d, want 32", base.maxTunnels)
+	}
+
+	// 旧式 server.yaml:顶层 max_tunnels。
+	leg := []byte(`
+addr: ":9000"
+watch:
+  - id: old
+    dir: /var/relay/old
+max_tunnels: 8
+`)
+	lb, err := legacyServerBase(leg)
+	if err != nil {
+		t.Fatalf("legacyServerBase: %v", err)
+	}
+	if lb.maxTunnels != 8 {
+		t.Errorf("legacy maxTunnels: %d, want 8", lb.maxTunnels)
+	}
+
+	// 缺省(未配置)→ 0,交给 server.New 退到 defaultMaxTunnels。
+	def := []byte("watch:\n  - id: only\n    watch_dir: just/this\n")
+	db, err := unifiedServerBase(def)
+	if err != nil {
+		t.Fatalf("unifiedServerBase(default): %v", err)
+	}
+	if db.maxTunnels != 0 {
+		t.Errorf("default maxTunnels: %d, want 0", db.maxTunnels)
+	}
+}
+
+// 无 server 段时旧式 server.yaml → legacy serverBaseConfig。
 func TestLegacyServerBase(t *testing.T) {
 	data := []byte(`
 addr: ":9000"

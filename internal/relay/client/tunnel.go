@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -28,20 +29,90 @@ const tunnelWriteTimeout = 60 * time.Second
 //     SOCKS 连接通道)承载双向字节泵。
 // 两表互斥(同一条隧道只会是一个端点),但按 streamID 独立、天然支持多隧道并行。
 
-// tunnelConn 一条入站隧道落到 executor 的真实 TCP 连接;写用互斥锁串行化。
+// tunnelWriteQueue 每条入站隧道出站写队列深度。队列是每个隧道独立的,单个慢目标不会挤占别的隧道。
+const tunnelWriteQueue = 64
+
+// errTunnelBacklog 入站隧道出站队列满(目标消费太慢)时中止整条隧道的错误。fail-closed:
+// 不丢字节、不无限积压,而是拆除并通知,避免在 readLoop 里同步写造成 head-of-line 阻塞。
+var errTunnelBacklog = errors.New("tunnel: egress write backlog full, stream aborted")
+
+// tunnelConn 一条入站隧道落到 executor 的真实 TCP 连接。远端发来的字节不经 readLoop 同步写,
+// 而是进入该隧道**专职 writer goroutine** 的有界队列:带慢/停读目标的最多阻塞这条隧道自身的
+// writer,而不再阻塞 readLoop 处理其它消息(消除 head-of-line)。队列满或写失败都 fail-closed
+// 拆除整条隧道。产出自己持有 done/conn,通过 teardown 统一关停(幂等)。
 type tunnelConn struct {
-	conn net.Conn
-	mu   sync.Mutex
+	conn     net.Conn
+	client   *Client
+	streamID string
+	wch      chan []byte
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
-func (tc *tunnelConn) Write(p []byte) (int, error) {
-	tc.mu.Lock()
-	defer tc.mu.Unlock()
-	// 写加上限:慢/停读目标最多阻塞一个写周期,避免把处理方 readLoop 无限卡死(把无限阻塞转成有界错误)。
-	_ = tc.conn.SetWriteDeadline(time.Now().Add(tunnelWriteTimeout))
-	n, err := tc.conn.Write(p)
-	_ = tc.conn.SetWriteDeadline(time.Time{})
-	return n, err
+// newTunnelConn 建通道并起 write loop。reader(目标→本地)侧由调用方另行 pump。
+func newTunnelConn(c *Client, streamID string, conn net.Conn) *tunnelConn {
+	tc := &tunnelConn{
+		conn:     conn,
+		client:   c,
+		streamID: streamID,
+		wch:      make(chan []byte, tunnelWriteQueue),
+		done:     make(chan struct{}),
+	}
+	go tc.writer()
+	return tc
+}
+
+// enqueue 把远端字节投入写队列(非阻塞)。队列满 → fail-closed:中止隧道而非丢字节。
+func (tc *tunnelConn) enqueue(p []byte) bool {
+	select {
+	case tc.wch <- p:
+		return true
+	case <-tc.done:
+		return false
+	default:
+		tc.fail(errTunnelBacklog)
+		return false
+	}
+}
+
+// writer 专属写 goroutine:循环写出出站字节,带单次写上限,写失败即拆除。
+func (tc *tunnelConn) writer() {
+	for {
+		select {
+		case p := <-tc.wch:
+			_ = tc.conn.SetWriteDeadline(time.Now().Add(tunnelWriteTimeout))
+			_, err := tc.conn.Write(p)
+			_ = tc.conn.SetWriteDeadline(time.Time{})
+			if err != nil {
+				tc.fail(fmt.Errorf("target write: %w", err))
+				return
+			}
+		case <-tc.done:
+			return
+		}
+	}
+}
+
+// fail 写路径出错:拆除该隧道并通知对端关停,回调 readLoop 不再需要处理该流。
+func (tc *tunnelConn) fail(err error) {
+	tc.stopOnce.Do(func() {
+		close(tc.done)
+		tc.client.takeInboundTunnel(tc.streamID) // 关闭 conn,顺带让 reader pump 结束
+		_ = tc.client.sendMessage(&protocol.Message{
+			Type:     protocol.MsgTunnelEnd,
+			ID:       uuid.New().String(),
+			StreamID: tc.streamID,
+			Payload:  protocol.TunnelEnd{StreamID: tc.streamID, Reason: err.Error()},
+		})
+	})
+}
+
+// teardown 幂等拆除:停止 writer 并关闭底层连接(由取出该隧道条目的调用方在移出 map 后调用)。
+func (tc *tunnelConn) teardown() {
+	tc.stopOnce.Do(func() {
+		close(tc.done)
+		tc.conn.Close()
+	})
 }
 
 // SetTunnelHandler 设置入站隧道建连回调(执行方角色)。设置了它,该客户端才会处理 MsgTunnelConnect。
@@ -71,7 +142,7 @@ func (s *TunnelSession) Port() uint16     { return s.port }
 func (s *TunnelSession) Accept(conn net.Conn) {
 	c := s.client
 	c.tunnelMu.Lock()
-	c.tunnelConns[s.streamID] = &tunnelConn{conn: conn}
+	c.tunnelConns[s.streamID] = newTunnelConn(c, s.streamID, conn) // 内含起专职 writer
 	c.tunnelMu.Unlock()
 
 	_ = c.sendMessage(&protocol.Message{
@@ -122,14 +193,14 @@ func (s *TunnelSession) pumpConnToRelay(conn net.Conn) {
 	s.client.takeInboundTunnel(s.streamID)
 }
 
-// takeInboundTunnel 移除并关闭一条入站隧道连接。
+// takeInboundTunnel 移除并关闭一条入站隧道连接(幂等;经 tunnelConn.teardown 停止其 writer)。
 func (c *Client) takeInboundTunnel(streamID string) {
 	c.tunnelMu.Lock()
 	tc := c.tunnelConns[streamID]
 	delete(c.tunnelConns, streamID)
 	c.tunnelMu.Unlock()
 	if tc != nil {
-		tc.conn.Close()
+		tc.teardown()
 	}
 }
 
@@ -175,16 +246,8 @@ func (c *Client) handleInboundTunnelData(msg protocol.Message) {
 		raw, _ := json.Marshal(msg.Payload)
 		_ = json.Unmarshal(raw, &td)
 		if len(td.Data) > 0 {
-			if _, err := tc.Write(td.Data); err != nil {
-				// 目标写失败(停读/超时/对端关闭):拆除该隧道并把关闭通知给远端,防止读循环持续阻塞。
-				c.takeInboundTunnel(streamID)
-				_ = c.sendMessage(&protocol.Message{
-					Type:     protocol.MsgTunnelEnd,
-					ID:       uuid.New().String(),
-					StreamID: streamID,
-					Payload:  protocol.TunnelEnd{StreamID: streamID, Reason: "target write failed: " + err.Error()},
-				})
-			}
+			// 只入队到专属 writer;队列满/写失败由 enqueue/winner 幂等 fail-closed 拆隧道并告知远端。
+			tc.enqueue(td.Data)
 		}
 		return
 	}
@@ -210,12 +273,19 @@ func (c *Client) handleInboundTunnelEnd(msg protocol.Message) {
 
 // ---- 出站(requester)侧 ----
 
-// tunnelStream 供本地 relay tunnel 使用的一条出站隧道:远端 → 本地的字节走 ch;
-// 本地 → 远端的字节经 Send 发出。
+// errTunnelBufferOverrun 请求方本地 SOCKS 消费端跟不上远端字节流时中止整条隧道的错误。
+// 不再静默丢字节(那会破坏字节流完整性),而是 fail-closed 关闭并让调用方断开连接。
+var errTunnelBufferOverrun = errors.New("tunnel: requester buffer overrun, stream aborted")
+
+// tunnelStream 供本地 relay tunnel 使用的一条出站隧道:远端 → 本地的字节走 dataCh;
+// 本地 → 远端的字节经 Send 发出。dataCh 是**有界**的:消费端(本地 SOCKS 泵)太慢、
+// 队列满时不再丢弃字节,而是 fail-closed 中止整条隧道(errTunnelBufferOverrun),避免
+// 字节流静默损坏(开发中继中最隐蔽的一类数据完整性缺陷)。
 type TunnelStream struct {
 	client  *Client
 	ID      string
 	dataCh  chan []byte
+	errCh   chan error
 	closeCh chan struct{}
 	once    sync.Once
 	closed  atomic.Bool
@@ -256,6 +326,7 @@ func (c *Client) TunnelOpen(ctx context.Context, watchID, target string, port ui
 		client:  c,
 		ID:      id,
 		dataCh:  make(chan []byte, 64),
+		errCh:   make(chan error, 1),
 		closeCh: make(chan struct{}),
 	}
 	c.tunnelMu.Lock()
@@ -291,7 +362,7 @@ func (ts *TunnelStream) Send(p []byte) error {
 	})
 }
 
-// Recv 阻塞读取远端字节;隧道关闭时返回 io.EOF。
+// Recv 阻塞读取远端字节;隧道被中止置错误返回具体错误,正常/半关闭返回 io.EOF。
 func (ts *TunnelStream) Recv() ([]byte, error) {
 	select {
 	case d := <-ts.dataCh:
@@ -299,12 +370,15 @@ func (ts *TunnelStream) Recv() ([]byte, error) {
 			return nil, io.EOF
 		}
 		return d, nil
+	case err := <-ts.errCh:
+		return nil, err
 	case <-ts.closeCh:
 		return nil, io.EOF
 	}
 }
 
-// deliver 投递一条远端字节(非阻塞,消费慢则丢弃)。
+// deliver 投递一条远端字节(非阻塞)。消费端太慢、有界队列满时不再静默丢字节:
+// fail-closed 中止整条隧道(fail-open 丢字节会破坏 TCP 字节流语义)。
 func (ts *TunnelStream) deliver(data []byte) {
 	if ts.closed.Load() {
 		return
@@ -312,7 +386,30 @@ func (ts *TunnelStream) deliver(data []byte) {
 	select {
 	case ts.dataCh <- data:
 	default:
+		ts.abort(errTunnelBufferOverrun)
 	}
+}
+
+// abort 以指定错误强行中止隧道:置错误唤醒 Recv、置关闭、通知对端拆除。与 close
+// 互斥(首次触发者生效),保证调用方收到失败而不是黑盒或无界等待。
+func (ts *TunnelStream) abort(err error) {
+	if ts.closed.Swap(true) {
+		return
+	}
+	// 只经 errCh 暴露错误于 Rect;不留 closeCh(乃至 Recv 随机跳 EOF,掩盖根因)。
+	ts.once.Do(func() {
+		select {
+		case ts.errCh <- err:
+		default:
+		}
+	})
+	_ = ts.client.sendMessage(&protocol.Message{
+		Type:     protocol.MsgTunnelEnd,
+		ID:       uuid.New().String(),
+		StreamID: ts.ID,
+		Payload:  protocol.TunnelEnd{StreamID: ts.ID, Reason: err.Error()},
+	})
+	ts.client.takeTunnelStream(ts.ID)
 }
 
 // close 置已关闭,唤醒 Recv。(由远端 MsgTunnelEnd 或本地主动 Close 触发,不重复关闭通道)
@@ -335,8 +432,31 @@ func (ts *TunnelStream) Close() {
 	})
 }
 
+// closeAllTunnels 传输断开/重连时拆空全部隧道。服务端断连已清理它那边的隧道注册表,本地若不
+// 拆,出站 requester 流会以为隧道仍开着而静默黑盒(exist,-requester-block)、入站 executor 连接会
+// 泄漏。这里统一中止出站流(使 Recv 唤醒)并关闭入站连接(fail-closed,杜绝黑盒)。幂等可重复调用。
+func (c *Client) closeAllTunnels(reason string) {
+	c.tunnelMu.RLock()
+	streams := make([]*TunnelStream, 0, len(c.tunnelStreams))
+	for _, ts := range c.tunnelStreams {
+		streams = append(streams, ts)
+	}
+	connStreamIDs := make([]string, 0, len(c.tunnelConns))
+	for id := range c.tunnelConns {
+		connStreamIDs = append(connStreamIDs, id)
+	}
+	c.tunnelMu.RUnlock()
+
+	for _, ts := range streams {
+		ts.abort(fmt.Errorf("%s", reason))
+	}
+	for _, id := range connStreamIDs {
+		c.takeInboundTunnel(id)
+	}
+}
+
 // sendAbortTunnel 在建连失败/放弃时对该 stream 发 MsgTunnelEnd,让中转拆除注册表条目,
-// 并把关闭通知给(可能已经 accept 的)执行方。对从未注册的 stream 发是无害的空操作。
+// 并把关闭通知给(可能已经 accept 的)执行方。对从未注册的 stream 是无害的空操作。
 func (c *Client) sendAbortTunnel(streamID, reason string) {
 	_ = c.sendMessage(&protocol.Message{
 		Type:     protocol.MsgTunnelEnd,
