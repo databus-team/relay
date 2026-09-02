@@ -24,11 +24,12 @@ type Config struct {
 
 // ServerConfig relay server(中转)段。仅在最终实现 relay server 读取的一份统一 config 里使用。
 type ServerConfig struct {
-	Addr      string          `yaml:"addr"`
-	WatchRoot string          `yaml:"watch_root"` // 中转存储根;各 watch 的 watch_dir 相对它
-	WatchID   string          `yaml:"watch_id"`   // 单根模式下此 watch id(= client 的 backend.config.watch_id)
-	Auth      ServerAuth      `yaml:"auth"`
-	TLS       ServerTLSConfig `yaml:"tls"`
+	Addr          string          `yaml:"addr"`
+	WatchRoot     string          `yaml:"watch_root"` // 中转存储根;各 watch 的 watch_dir 相对它
+	WatchID       string          `yaml:"watch_id"`   // 单根模式下此 watch id(= client 的 backend.config.watch_id)
+	Auth          ServerAuth      `yaml:"auth"`
+	TLS           ServerTLSConfig `yaml:"tls"`
+	TunnelEnabled bool            `yaml:"tunnel_enabled"` // 隧道通道:默认 false,显式开启才放行 MsgTunnel*
 }
 
 type ServerAuth struct {

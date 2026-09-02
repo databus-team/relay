@@ -423,6 +423,45 @@ type StatusResponse struct {
 - 执行方离线/未注册时,`seg2.latency_ms` 为空、`seg2.unavailable` 注明断点原因,整条命令仍成功——语义是"中转在线、远端掉线"。
 - 旧 `ping` 的"本机→中转"心跳职责并入 `status`;`version` 收窄为纯本地构建信息,跨机版本台账由 `status` 承接。
 
+### 4.9 出网隧道 (本地 SOCKS5 → executor)
+
+`relay tunnel --listen 127.0.0.1:<port> --watch <work>` 本地起一条 SOCKS5 端点,把每个客户端对
+CONNECT 目标的访问经中转转发到所选 executor 的网络出口。**出口(真实 TCP 连接)只在 executor**:它校验
+自己的 `network_allow` 白名单后向目标建连;中转只做字节流透明转发(不落盘、不解析、不执行)。目标白名单在
+executor 侧强制,**默认拒绝**;空/缺省 `network_allow` 拒绝一切建连(fail-closed)。
+
+```go
+// 建连请求(携带出口 watch 与目标)。成功/失败经 MsgResponse/MsgError(以建连消息 ID 作 RequestID)回执。
+type TunnelConnectRequest struct {
+    WatchID  string `json:"watch_id,omitempty"` // 出口 executor 拥有的 watch;多 executor 按此路由
+    Target   string `json:"target"`             // 目标主机(域名/IP 字面量)
+    Port     uint16 `json:"port"`               // 目标端口
+    StreamID string `json:"stream_id"`          // 隧道 ID(全局唯一)
+}
+
+type TunnelData struct { StreamID string `json:"stream_id"`; Data []byte `json:"data,omitempty"` }
+type TunnelEnd  struct { StreamID string `json:"stream_id"`; Reason string `json:"reason,omitempty"` }
+```
+
+- 消息型别:`MsgTunnelConnect`/`MsgTunnelData`/`MsgTunnelEnd`。
+- **中转路由**:按 `TunnelConnectRequest.WatchID` 取该 watch 的在线执行方;无可执行方 → 建连确认即
+  fail(报「无在线执行方」),不立隧道注册表、不开内网连接。隧道注册表按 `StreamID` 独立,多 executor、
+  多隧道并行互不串扰;任一端断连/发 `MsgTunnelEnd` 只拆除自身条目。
+- **通道开关**:隧道默认关闭;仅当服务器显式开启(`tunnel_enabled: true`)才放行 `MsgTunnel*`(与升级通道
+  同姿态)。
+- **白名单(`network_allow`,executor 侧强制)**:条目为 `host|ip|CIDR` 可选端口(如 `10.0.0.0/8@80,443`、
+  `api.internal.com@443`、`192.168.0.5@22`);无 `@` 为任意端口。hostname 只作解析提示,建连一律用
+  **已校验的 IP 字面量**(防 DNS 重绑 TOCTOU)。未命中/空列表 → 拒绝。
+- 本地端点默认且建议回环(`127.0.0.1`);绑定非 loopback 地址时 CLI 打印醒目警告。
+
+### 4.10 多 executor 与工作区隧道选择
+
+一台中转可同时挂载**多台**远端 executor(每台各自的 watch/工作区)。`relay status` / 版本台账按 watch
+逐条展示每台在线执行方及其构建版本,用户据此得知有哪些出口可选。`relay tunnel --watch` 与
+`exec`/`push`/`status` 共用同一套工作区寻址(`resolveWorkspaceID`):显式 `--watch` 优先,缺省按当前目录名
+推断。多台 executor 同时在线时,本地可并起多条 `relay tunnel`(不同 `--listen` 端口、各自 `--watch`),
+分别经各自 executor 访问各自内网白名单目标,互不干扰(关闭一条不影响其它)。
+
 ---
 
 ## 5. 心跳与健康检测
@@ -746,7 +785,14 @@ backend:
     watch_id: "web-app"               # 关联的 watch ID
     # 或 auto 模式: 订阅所有事件，客户端过滤
     auto_subscribe: false
-    
+
+    # 出的网白名单(隧道):executor 侧强制,默认拒绝;空/缺省拒绝一切隧道建连。
+    # 条目支持 host/IP/CIDR + 端口(可列表/范围);无端类型@ 后为空 = 任意端口。
+    network_allow:
+      - "10.0.0.0/8@80,443"
+      - "api.internal.com@443"
+      - "192.168.0.5@22"
+
     # TLS 配置
     tls:
       enabled: true
@@ -796,9 +842,8 @@ relay_server:
     cert_file: ""
     key_file: ""
   
-  heartbeat:
-    interval: 30s
-    timeout: 90s
+  # 隧道通道:默认关闭;显式开启才放行 MsgTunnel*(否则隧道请求一律拒绝)。
+  tunnel_enabled: true
   
   transfer:
     chunk_size: 65536

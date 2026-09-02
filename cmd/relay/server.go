@@ -49,14 +49,16 @@ type serverYAMLConfig struct {
 		CertFile string `yaml:"cert_file"`
 		KeyFile  string `yaml:"key_file"`
 	} `yaml:"tls"`
+	TunnelEnabled bool `yaml:"tunnel_enabled"`
 }
 
 // serverBaseConfig 统一保存映射后的中转基础配置(文件来源),再叠加 CLI overrides。
 type serverBaseConfig struct {
-	addr      string
-	watchDirs []server.WatchDirConfig
-	tokens    []string
-	tls       server.TLSConfig
+	addr          string
+	watchDirs     []server.WatchDirConfig
+	tokens        []string
+	tls           server.TLSConfig
+	tunnelEnabled bool
 }
 
 // hasServerSection 判断文件是否含顶层 `server:` 段(统一 config.yaml)。
@@ -113,12 +115,14 @@ func unifiedServerBase(data []byte) (serverBaseConfig, error) {
 
 	tokens := []string(nil)
 	tls := server.TLSConfig{}
+	tunnelEnabled := false
 	if sc != nil {
 		tokens = sc.Auth.Tokens
 		tls = server.TLSConfig{Enabled: sc.TLS.Enabled, CertFile: sc.TLS.CertFile, KeyFile: sc.TLS.KeyFile}
+		tunnelEnabled = sc.TunnelEnabled
 	}
 
-	return serverBaseConfig{addr: addr, watchDirs: watchDirs, tokens: tokens, tls: tls}, nil
+	return serverBaseConfig{addr: addr, watchDirs: watchDirs, tokens: tokens, tls: tls, tunnelEnabled: tunnelEnabled}, nil
 }
 
 // legacyServerBase 从旧式 server.yaml(顶层 addr/watch/auth/tls)构建 server 配置。
@@ -137,10 +141,11 @@ func legacyServerBase(data []byte) (serverBaseConfig, error) {
 		watchDirs = append(watchDirs, server.WatchDirConfig{ID: w.ID, Dir: w.Dir, TTL: w.TTL})
 	}
 	return serverBaseConfig{
-		addr:      addr,
-		watchDirs: watchDirs,
-		tokens:    fileCfg.Auth.Tokens,
-		tls:       server.TLSConfig{Enabled: fileCfg.TLS.Enabled, CertFile: fileCfg.TLS.CertFile, KeyFile: fileCfg.TLS.KeyFile},
+		addr:          addr,
+		watchDirs:     watchDirs,
+		tokens:        fileCfg.Auth.Tokens,
+		tls:           server.TLSConfig{Enabled: fileCfg.TLS.Enabled, CertFile: fileCfg.TLS.CertFile, KeyFile: fileCfg.TLS.KeyFile},
+		tunnelEnabled: fileCfg.TunnelEnabled,
 	}, nil
 }
 
@@ -209,10 +214,11 @@ func runServer() error {
 	}
 
 	cfg := server.Config{
-		Addr:      addr,
-		WatchDirs: watchDirs,
-		Auth:      server.AuthConfig{Type: "token", Tokens: tokens},
-		TLS:       server.TLSConfig{Enabled: tlsEnabled, CertFile: tlsCert, KeyFile: tlsKey},
+		Addr:          addr,
+		WatchDirs:     watchDirs,
+		Auth:          server.AuthConfig{Type: "token", Tokens: tokens},
+		TLS:           server.TLSConfig{Enabled: tlsEnabled, CertFile: tlsCert, KeyFile: tlsKey},
+		TunnelEnabled: base.tunnelEnabled,
 	}
 
 	srv, err := server.New(cfg)

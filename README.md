@@ -297,6 +297,49 @@ relay version --json # machine-readable
 
 The version string is stamped at build time (`make build-release` / `build-linux` / `build-windows`) from `git describe`, so every binary built from the same source carries the same identifier. Run `make install` to rebuild with the stamp. Executors report their version when they register (they re-register on (re)connect), so an executor that has *not* yet been swapped still shows its old build.
 
+### tunnel — Local SOCKS5 Egress Tunnel
+
+Run a local SOCKS5 endpoint that reaches intranet targets through a chosen executor's network egress.
+The real TCP connection happens **on the executor** — it validates its own `network_allow` whitelist and
+connects to the target; the transit only forwards bytes (never lands, never parses, never executes).
+Whitelist is enforced **executor-side** and **deny by default**; an empty/missing `network_allow` rejects
+every tunnel connect.
+
+```sh
+relay tunnel --listen 127.0.0.1:1080 --watch site-a   # egress via executor site-a
+curl --socks5-hostname 127.0.0.1:1080 http://intra.a.internal/ping
+```
+
+- `--watch` selects the egress executor (same workspace addressing as `exec`/`push`/`status`;
+  defaults to the current directory name).
+- Default bind is loopback `127.0.0.1`; binding a non-loopback address prints a loud warning (no auth).
+- Server must enable the tunnel channel (`tunnel_enabled: true` in the `server:` section); otherwise
+  tunnel requests are rejected.
+
+**Dual-executor / concurrent tunnels (multi-executor):** one transit can host **two (or more)** remote
+executors at once, each on its own watch/workspace. Run two `relay tunnel`s in parallel, each binding its
+own local port and selecting its own egress — access each executor's intranet targets independently
+without interference. Closing one tunnel never affects the others; `relay status` / the version ledger
+list every online executor per watch so you can see which egresses are available:
+
+```sh
+# executor M1 (watch site-a) and M2 (watch site-b) both online on the same transit
+relay tunnel --listen 127.0.0.1:1080 --watch site-a   # egress M1
+relay tunnel --listen 127.0.0.1:1081 --watch site-b   # egress M2, independent
+
+curl --socks5-hostname 127.0.0.1:1080 http://a-intra.pvt/00
+curl --socks5-hostname 127.0.0.1:1081 https://b-intra.pvt/api
+```
+
+`network_allow` whitelist example (executor's `backend.config`):
+
+```yaml
+network_allow:
+  - "10.0.0.0/8@80,443"
+  - "api.internal.com@443"
+  - "192.168.0.5@22"
+```
+
 ## Relay Backend Configuration
 
 When using the `relay` backend, configure the WebSocket connection to the relay server:
