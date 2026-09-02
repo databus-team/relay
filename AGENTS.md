@@ -158,7 +158,7 @@ make test            # go test -v -race ./...
 make test-coverage   # coverage.out + html
 make clean / fmt / vet / deps / run
 make install         # build-release → ~/.local/bin/relay
-make deploy-remote   # scripts/relay-deploy.sh remote   (RESTART=1 to swap+restart)
+make deploy-remote   # scripts/relay-deploy.sh remote: all online executors (RESTART=1 to swap+restart; RELAY_EXECUTORS to narrow)
 make deploy-transit  # scripts/relay-deploy.sh transit  (controlled self-upgrade)
 make deploy          # all (remote + transit)
 make help
@@ -176,7 +176,7 @@ relay sync  [-e <executor-watch-id>]
 relay ws [-v] [--json] [--name <id>]                   # alias: relay workspaces
 relay status [--json]                                  # whole deployment health + versions
 relay version [--json]                                 # local build (remote ledger via `status`)
-relay server-remote [--binary <path>]                  # one-command transit self-upgrade
+relay server-remote [--binary <path>] [--expect <ver+commit>]  # one-command transit self-upgrade
 relay tunnel [--listen 127.0.0.1:1080] -w <egress-executor-watch>  # SOCKS5
 relay pull [<filename>] [-d]    relay push ...   relay list [-w]   relay cleanup -w <id>
 ```

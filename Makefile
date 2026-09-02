@@ -95,7 +95,7 @@ push:
 exec:
 	./$(BINARY_NAME) exec -w <watch_id> <command>
 
-## deploy-remote: Auto-deliver new binary to remote executor via relay (RESTART=1 to swap+restart)
+## deploy-remote: Deliver new binary to all online executors (RESTART=1 to swap+restart; RELAY_EXECUTORS to narrow)
 deploy-remote:
 	./scripts/relay-deploy.sh remote
 
@@ -122,7 +122,7 @@ help:
 	@echo "  make fmt            Format code"
 	@echo "  make vet            Run go vet"
 	@echo "  make run            Run in daemon mode"
-	@echo "  make deploy-remote    Auto-deliver to remote executor (RESTART=1 to swap+restart)"
+	@echo "  make deploy-remote    Deliver to all online executors (RESTART=1 to swap+restart; RELAY_EXECUTORS to narrow)"
 	@echo "  make deploy-transit   One-click deploy the transit server (controlled self-upgrade)"
 	@echo "  make deploy           Both above"
 	@echo "  make help           Show this help"

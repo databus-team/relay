@@ -228,6 +228,27 @@ workspaces:
 
 The legacy standalone `server.yaml` (top-level `addr`/`watch`/`auth`/`tls`) is still accepted via `--server-config` for backward compatibility. Environment variables (`$VAR`, `${VAR}`) are expanded in all string values.
 
+### deploy — Push New Binaries to Executors & Transit
+
+`scripts/relay-deploy.sh` (wired to `make deploy-remote` / `deploy-transit` / `deploy`) rebuilds and
+pushes the relay binary to your deployment.
+
+- **`make deploy-remote`** delivers the binary to **every executor that is online** (from
+  `relay status`), probing each one's OS/arch, cross-compiling, and pushing via
+  `relay push --no-jobs --dest`. Offline executors are skipped (they can't receive a push anyway).
+  With `RESTART=1` it then detached-swaps and restarts each executor and verifies **each** one has
+  switched to the new commit (per-`watch_id` check in `relay status --json`).
+- Narrow the target set with `RELAY_EXECUTORS`, a comma/space-separated list of executor
+  `watch_id`s (only ones that are online are deployed):
+  ```bash
+  RESTART=1 RELAY_EXECUTORS="site-a,site-b" make deploy-remote
+  ```
+- **`make deploy-transit`** / **`make deploy`** additionally deploys the transit via the
+  `server-remote` self-upgrade channel (see below).
+
+`make deploy-remote` locates each executor through a config workspace bound to it
+(`workspaces[].executor == <watch_id>`); executors with no bound workspace are skipped.
+
 ### server-remote — One-Click Transit Upgrade
 
 Deploy a freshly built relay binary to the transit server over a **controlled self-upgrade**
@@ -241,8 +262,16 @@ reconnects and polls the transit version ledger to confirm the transit now runs 
 make deploy-transit
 
 # Or invoke the channel directly against a local binary
-relay server-remote --binary relay-linux -c ~/.relay/config.yaml
+relay server-remote --binary relay-linux -c ~/.relay/config.yaml \
+  --expect "<Version>+<Commit>"   # optional: exact build identity the transit must report after swap
 ```
+
+After the swap the client reconnects and polls the transit version ledger until it matches the
+deployed build. By default the poll compares against **this local binary's** `version.String()`
+— which is wrong when the deployed `relay-linux` is a fresh/`-dirty` build different from the
+installed `relay`. `make deploy-transit` always passes `--expect "<version>+<commit>"` stamped
+into the binary it sends, so the ledger matches exactly; pass it manually when invoking the
+channel directly against a binary whose build identity differs from the local relay.
 
 **Trust & availability:**
 

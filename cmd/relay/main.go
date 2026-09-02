@@ -101,6 +101,10 @@ var (
 	// server-remote command - 一键部署中转(受控自升级):上传新二进制 → 中转自检 → 换装 → 核验。
 	serverRemoteCmd = kingpin.Command("server-remote", "一键部署中转:上传新 relay 二进制并经中转受控自升级,断线重连后核验版本")
 	serverRemoteBin = serverRemoteCmd.Flag("binary", "Path to the new relay binary to send (default: current executable)").String()
+	// 期望换装后中转的构建标识(形如 "<Version>+<Commit>")。缺省用本进程 version.String(),但在
+	// 部署远程构建(如 cross-compile 的 relay-linux,或带 -dirty 的全新 build)时会与本地进程版本
+	// 不一致导致核验恒超时——部署脚本会显式传入它写入该二进制的 stamp 以保证对账正确。
+	serverRemoteExpect = serverRemoteCmd.Flag("expect", "Expected transit version after swap (default: this relay's version.String())").String()
 
 	// Tunnel command - 本地 SOCKS5 出网隧道,经所选 executor 出口访问内网白名单目标。
 	tunnelCmd    = kingpin.Command("tunnel", "本地 SOCKS5 出网隧道:经所选 executor 访问其内网白名单目标")
@@ -1115,8 +1119,15 @@ func runServerRemote() {
 		os.Exit(1)
 	}
 
-	fmt.Println("[server-remote] 中转已回 ACK(自检通过); 正在轮询账户版本核验 ...")
-	if err := pollTransitVersion(rb, version.String()); err != nil {
+	// 期望版本:显式 --expect 优先;否则回退本进程 version.String()。换装后中转跑的应是
+	// --binary 那份二进制的构建标识——若它与本地进程版本不一致(交叉编译 / 树带 -dirty),
+	// 必须显式传入,否则对账永远无法达成而超时。
+	want := *serverRemoteExpect
+	if want == "" {
+		want = version.String()
+	}
+	fmt.Println("[server-remote] 中转已回 ACK(自检通过); 正在轮询版本核验 ...")
+	if err := pollTransitVersion(rb, want); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: 版本核验失败: %v\n", err)
 		os.Exit(1)
 	}

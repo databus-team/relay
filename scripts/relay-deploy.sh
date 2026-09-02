@@ -3,27 +3,34 @@
 # relay 一键部署助手
 #
 # 两条腿:
-#   远端(exec)  —— 自动:经中转 `relay push`/`relay exec` 把新二进制下发到远端执行器;
-#                    自动探测执行器 OS/arch 并交叉编译对应版本。
-#                    RESTART=1 时自动 detached 换装并重启(先停->换->起,且不能砍
-#                    掉正在服务本连接的 relay,故延迟后分离执行)。
+#   远端(executors) —— 默认把新二进制下发到 `relay status` 中**在线**的全部执行器
+#                     (多执行器各自 watch_id,逐一探测 OS/arch、交叉编译、下发)。
+#                     离线执行器主动跳过(反正推不上),避免误推。可用 RELAY_EXECUTORS
+#                     收窄到其中几台(逗号/空格分隔的 watch_id;只保留指定且在线者)。
+#                     RESTART=1 时自动 detached 换装并重启(先停->换->起,且不能重启到
+#                     正在服务本条的 relay,故走则分离执行),并逐台核验已切到新提交。
 #   中转(transit) —— 一键:经 `relay server-remote` 受控自升级通道把新构建的 relay-linux
 #                  流式交付中转(中转本地自检 → 回执 → 换装 .prev备份/重启),本地断连
-#                  重连轮询版本核验。仅放开「自我升级」一条窄径,中转不获得任意执行能力。
+#                  重连轮询版本核验。仅放开「自我升级」一条窄径,中转不会自注册为执行器。
 #                  首跳依赖:在跑旧构建的中转需一次手工 seed(relay server upgrade)。
 #
 # 用法:
-#   RESTART=1 make deploy-remote    # 部署远端 + 自动替换重启
-#   make deploy-remote              # 只下发,不重启(安全)
-#   make deploy-transit             # 一键部署中转(受控自升级 + 版本核验)
-#   make deploy                     # 全跑
+#   RESTART=1 make deploy-remote     # 部署全部在线执行器 + 自动替换重启
+#   make deploy-remote               # 只下发,不替换重启(安全)
+#   RESTART=1 RELAY_EXECUTORS=site-a make deploy-remote   # 只部署 site-a
+#   make deploy-transit              # 一键部署中转(受控自升级 + 版本核验)
+#   make deploy                      # 先执行器后中转,全跑
 #
-# 依赖:`relay` CLI 在 PATH;配置为共享 config;远端用同一 config 以 executor 跑 relay watch。
+# 依赖:`relay` CLI 在 PATH;配置为共享 relay 配置;执行器用同一 config 以 `relay watch` 跑。
+# 定位某台执行器时,CLI 按 `-w <workspace>` 路由到该 workspace 绑定的执行器
+# (workspace.executor == 执行器 watch_id;空 = 单根回退)。
 set -euo pipefail
 
 CONFIG="${RELAY_CONFIG:-$HOME/.relay/config.yaml}"
 WATCH="${RELAY_WATCH:-}"
 RESTART="${RESTART:-0}"
+# 可选:只部署其中几台执行器(逗号/空格分隔的 watch_id;仅保留指定且在线者)。
+EXECS="${RELAY_EXECUTORS:-}"
 
 # 版本 stamp:与 Makefile 一致,保证产出的远端/中转二进制带同一标识,relay status 才能正确对比。
 GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || true)"
@@ -58,21 +65,54 @@ pick_watch() {
   [[ -n "$first" ]] && echo "$first" || die "无可用 workspace,请设 RELAY_WATCH=<id>"
 }
 
-# 远端执行一次命令(不带 -w,避开 exec 健康检查的 "Checking..." 输出)
-remote_cmd() { relay exec -c "$CONFIG" "$1" 2>&1 | sed -E 's/^Checking remote watcher\.\.\. OK//'; }
+# 在指定执行器的 workspace 上执行一次命令。必须带 -w 才能路由到「这一台」执行器
+# (exec 按 workspace.executor 路由;空 = 单根回退)。健康检查成功是静默的,过滤掉旧格式残留。
+remote_cmd() { relay exec -c "$CONFIG" -w "$1" "${@:2}" 2>&1 | sed -E 's/^Checking remote watcher\.\.\. OK//'; }
+
+# 解析 workspace->executor 绑定:每行打印 "<workspace_id>\t<executor_id>",仅显式绑定了
+# executor: 的 workspace。精确两空格/四空格缩进匹配,并跳过 jobs: 下嵌套的 `- id:`。
+cfg_bindings() {
+  awk '
+    /^[[:space:]]*workspaces:/{inws=1; next}
+    inws && /^[A-Za-z_][A-Za-z0-9_]*:[[:space:]]*$/{inws=0}
+    inws && /^  - id:/{s=$0; sub(/^  - id:[[:space:]]*/,"",s); gsub(/[[:space:]]*#.*$/,"",s); wid=s}
+    inws && /^    executor:/{s=$0; sub(/^    executor:[[:space:]]*/,"",s); gsub(/[[:space:]]*#.*$/,"",s); gsub(/^ +| +$/,"",s); if(s!="") print wid "\t" s}
+  ' "$CONFIG"
+}
+
+# 枚举在线执行器:`relay status --json` 的 executors[] 里每台的 watch_id。
+list_online_executors() {
+  relay status --json -c "$CONFIG" 2>/dev/null \
+    | awk 'match($0,/"watch_id": *"[^"]*"/){s=substr($0,RSTART,RLENGTH); split(s,a,"\""); print a[4]}'
+}
+
+# 为某台执行器(watch_id)找一个可作为 `-w` 的 workspace:
+#   1) 显式绑定 executor==<id> 的 workspace(多执行器);
+#   2) 否则若 <id> 就是本配置 backend.watch_id -> 单根回退用 pick_watch;
+#   3) 否则视为无绑定,返回空(调用方跳过)。
+executor_workspace() {
+  local e="$1"
+  [[ -n "$e" ]] || return 1
+  local w
+  w="$(cfg_bindings | awk -v e="$e" -F'\t' '$2==e{print $1; exit}')"
+  [[ -n "$w" ]] && { echo "$w"; return 0; }
+  if [[ "$e" == "$(cfg_bc watch_id)" ]]; then pick_watch; return 0; fi
+  return 1
+}
 
 # ---- 1) 探测远端 OS/arch ----
 detect_remote() {
+  local w="$1"
   log "探测远端系统 ..."
-  local name; name=$(remote_cmd "uname -s"  | tail -1 | tr -d '\r')
-  local arch; arch=$(remote_cmd "uname -m"  | tail -1 | tr -d '\r' || true)
+  local name; name=$(remote_cmd "$w" "uname -s"  | tail -1 | tr -d '\r')
+  local arch; arch=$(remote_cmd "$w" "uname -m"  | tail -1 | tr -d '\r' || true)
   case "$name" in
     *MINGW*|*MSYS*|*CYGWIN*) REMOTE_OS=windows; REMOTE_BIN=relay.exe ;;
     Linux)                   REMOTE_OS=linux;   REMOTE_BIN=relay ;;
     *) warn "未识别系统(uname='$name'),默认 linux/amd64"; REMOTE_OS=linux; REMOTE_BIN=relay; arch=amd64 ;;
   esac
-  # 自动探测远端正在运行的 relay 二进制路径(换装目标),不猜安装目录。
-  REMOTE_BIN_PATH="$(remote_cmd "command -v relay" | tail -1 | tr -d '\r')"
+  # 自动探测该平台的运行中 relay 二进制路径(换装目标),不猜安装目录。
+  REMOTE_BIN_PATH="$(remote_cmd "$w" "command -v relay" | tail -1 | tr -d '\r')"
   # Windows:git-bash 的 `command -v relay` 常回显不带扩展名的 "…/relay",
   # 但真正能起 daemon 的必须是 relay.exe。缺 .exe 时补上,否则换装后
   # `watch start` 起不来(executable file not found in $PATH)。
@@ -97,13 +137,14 @@ build_binary() {
   cp -f "$REMOTE_BIN" "$REMOTE_STAGED"
 }
 
-# ---- 3) 经中转 relay push --no-jobs --dest 纯下发到执行端二进制旁(绝对路径,不跑 workspace job) ----
+# ---- 3) 经中转 relay push --no-jobs --dest 下发到执行端二进制旁(绝对路径,不跑 workspace job) ----
 push_binary() {
+  local w="$1"
   # 目标:自动探测到的运行二进制旁的新文件(独立名,避免覆盖运行中的同名 exe)
   local dest="${REMOTE_BIN_PATH}.new"
   log "经中转 push --no-jobs 下发 $REMOTE_STAGED -> 执行端 $dest ..."
-  # push --no-jobs 不走 workspace job;--dest 为绝对落盘路径。-w 用当前工作区即可。
-  relay push --no-jobs -c "$CONFIG" -w "$W" --dest "$dest" "$REMOTE_STAGED"
+  # push --no-jobs 不走 workspace job;--dest 为绝对落盘路径。-w 路由到对应执行器。
+  relay push --no-jobs -c "$CONFIG" -w "$w" --dest "$dest" "$REMOTE_STAGED"
   REMOTE_NEW="$dest"
 }
 
@@ -149,8 +190,13 @@ transit() {
   [[ -f relay-linux ]] || die "构建中转二进制失败: relay-linux"
 
   log "经受控自升级把 relay-linux 一键部署到中转(自检→换装→核验)..."
-  # server-remote 内含:上传 → 中转自检/回执 → 换装重启 → 断线重连 → 轮询版本核验。
-  if ! relay server-remote -c "$CONFIG" --binary relay-linux; then
+  # 期望版本 = 写入这份 relay-linux 的 stamp(与上面 build 的 ldflags 完全一致)。
+  # 不能拿本地进程 version.String() 当期望:本地装的 relay 可能是干净构建,而现场 cross-compile
+  # 的 relay-linux 因工作区改动会带 -dirty 后缀(或本地版本更旧),导致核验对账恒等不上而超时。
+  local expect="${GIT_VERSION}"
+  [[ -n "$GIT_COMMIT" ]] && expect="${GIT_VERSION}+${GIT_COMMIT}"
+  # server-remote 内含:上传 → 中转自检/回执 → 换装重启 → 断线重连 → 轮询版本核验(按 expect)。
+  if ! relay server-remote -c "$CONFIG" --binary relay-linux --expect "$expect"; then
     warn "中转一键部署失败(运行中实例不受影响、.prev 备件已保留)。请人工回退后重试:"
     warn "  兜底:经 code-server 上传 relay-linux,再执行 relay server upgrade $HOME/.local/bin/relay -c $CONFIG"
     return 1
@@ -158,37 +204,64 @@ transit() {
   log "中转已运行新版本 ✔"
 }
 
-# ---- 7) 部署后核验:执行方是否已切换为新提交(relay status) ----
-# 旧 `relay version -r` 已并入 `relay status`;此处用其 --json 台账,校验执行方(远端)的
-# commit 已切到本次构建的 $GIT_COMMIT。仅 RESTART=1 时调用(未换装则远端仍是旧构建,会超时,
-# 属预期)。中转段由 `relay server-remote` 内部自检核验,不需在此重复。
-verify() {
-  local w="${1:?需要 -w 以指认被核验的执行方}" want="${2:-$GIT_COMMIT}" i js
-  # RESTART=1 换装后执行方 daemon 约 3s 后被杀重启,给足时间并容忍瞬时不可达。
+# ---- 7) 部署后核验:某台执行器是否已切换为新 commit ----
+# 从 `relay status --json` 里定位 watch_id==<exec> 的那台执行器,校验其 version
+# 已带本次构建的 $GIT_COMMIT。仅 RESTART=1 时调用(未换装则仍是旧构建,会超时,属预期)。
+verify_executor() {
+  local id="${1:?需要 <executor watch_id>}" want="${2:-$GIT_COMMIT}" i ver
+  # RESTART=1 换装后执行器 daemon 约 3s 后被杀重启,给足时间并容忍瞬时不可达。
   sleep 3
-  log "核验执行方版本 (relay status --json, 等待新提交 $want, 至多 ~60s) ..."
+  log "核验执行器 $id 版本 (status --json, 等待新提交 $want, 至多 ~30s) ..."
   for i in $(seq 1 15); do
-    js="$(relay status --json -c "$CONFIG" 2>/dev/null)" || { log "  重试 $i/15 status 查询 ..."; sleep 2; continue; }
-    # status --json 的各节点版本上报为 `"version": "<VERSION>+<COMMIT>"`(中转与执行方同源)。
-    # 整座部署(中转 + 各执行方)任一节点切到新提交即视为换装成功。
-    if grep -q "\"version\": \"[^\"]*+${want}\"" <<<"$js"; then
-      log "节点已返回新提交 $want ✔"
+    ver="$(relay status --json -c "$CONFIG" 2>/dev/null \
+      | awk -v id="$id" '
+          /"watch_id":/{c=""; if(match($0,/"watch_id": *"[^"]*"/)){s=substr($0,RSTART,RLENGTH); split(s,a,"\""); c=a[4]}}
+          /"version":/ && c==id && match($0,/"version": *"[^"]*"/){s=substr($0,RSTART,RLENGTH); split(s,a,"\""); print a[4]; exit}
+        ')"
+    if grep -q "+${want}" <<<"$ver"; then
+      log "执行器 $id 已切到新提交 $want ✔"
       return 0
     fi
-    log "  重试 $i/15 等待节点切到新提交 ..."
+    log "  重试 $i/15 等待 $id 切到新提交 ..."
     sleep 2
   done
-  log "核验超时:执行方未切到新提交 $want(RESTART=0 未换装时属预期)。"
+  log "核验超时:执行器 $id 未切到新提交 $want(RESTART=0 未换装时属预期)。"
   return 1
+}
+
+# ---- 远端段:枚举在线执行器并逐一部署 ----
+remote_all() {
+  local E W rc=0 i
+  local -a EXEC_IDS wanted exec_online
+  mapfile -t EXEC_IDS < <(list_online_executors)
+  if [[ -n "${EXECS:-}" ]]; then
+    # 用户点名(逗号/空格分隔的 watch_id)且在线的那部分;点名的离线也跳过。
+    mapfile -t wanted < <(printf '%s\n' ${EXECS//[,]/ })
+    exec_online="$(printf '%s\n' "${EXEC_IDS[@]}")"
+    EXEC_IDS=()
+    for E in "${wanted[@]}"; do grep -qx "$E" <<<"$exec_online" && EXEC_IDS+=("$E"); done
+  fi
+  [[ "${#EXEC_IDS[@]}" -eq 0 ]] && { warn "无在线执行器(或 RELAY_EXECUTORS 已指明但全部离线),跳过远端段。"; return 0; }
+  log "本次部署执行器: ${EXEC_IDS[*]}"
+  for E in "${EXEC_IDS[@]}"; do
+    W="$(executor_workspace "$E")" || { warn "无 workspace 绑定到执行器 $E(未配 executor:),跳过"; continue; }
+    log "=== 部署执行器 $E (workspace: $W) ==="
+    if ! detect_remote "$W"; then warn "探测 $E 失败,跳过"; rc=1; continue; fi
+    if ! build_binary;   then warn "交叉编译失败($E),跳过";         rc=1; continue; fi
+    if ! push_binary "$W"; then warn "下发 $E 失败,跳过";            rc=1; continue; fi
+    if [[ "$RESTART" == "1" ]]; then
+      restart_binary "$W"
+      verify_executor "$E" "$GIT_COMMIT" || rc=1
+    fi
+  done
+  [[ "$rc" -eq 0 ]] || die "部分执行器部署失败。"
 }
 
 cmd="${1:-all}"
 case "$cmd" in
-  remote) W="$(pick_watch)"; detect_remote; build_binary; push_binary "$W"; restart_binary "$W"
-          [[ "$RESTART" == "1" ]] && verify "$W" ;;
+  remote) remote_all ;;
   transit) transit ;;
-  all) W="$(pick_watch)"; detect_remote; build_binary; push_binary "$W"; restart_binary "$W"; warn "=== 中转段 ==="; transit
-          [[ "$RESTART" == "1" ]] && verify "$W" ;;
+  all) remote_all; warn "=== 中转段 ==="; transit ;;
   *) die "用法: $0 {remote|transit|all}" ;;
 esac
 log "完成。"
