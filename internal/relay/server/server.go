@@ -15,6 +15,10 @@ import (
 	"github.com/user/relay/internal/relay/protocol"
 )
 
+// statusProbeTimeout 中转等待执行方探针回包的上限。单次 `relay status` 内对执行方测 RTT,
+// 超时即把「中转→执行方」段标为不可用(整条命令仍成功),不无限阻塞请求方连接。
+const statusProbeTimeout = 5 * time.Second
+
 type Server struct {
 	addr      string
 	watchDirs map[string]string
@@ -37,6 +41,11 @@ type Server struct {
 	// reqOwner 记录被转发的 exec 请求(reqID)归属的请求方客户端,用于把执行方回流帧转回去。
 	reqOwner map[string]string
 	reqMu    sync.RWMutex
+
+	// pending 记录中转发起的「待回包」探针(probeID → 回包通道):中转向执行方发探针后在此
+	// 带超时等 MsgPong 回包,从而测得 transit→executor 段时延(镜像客户端的 pending 用法)。
+	pending   map[string]chan protocol.Message
+	pendingMu sync.RWMutex
 
 	// pushRelay 记录被转发给执行方的流式 push(streamID → 执行方/请求方),用于把内容帧原样透传。
 	pushRelay   map[string]pushRelayInfo
@@ -95,6 +104,7 @@ func New(cfg Config) (*Server, error) {
 		executors:    make(map[string]string),
 		executorVers: make(map[string]string),
 		reqOwner:     make(map[string]string),
+		pending:      make(map[string]chan protocol.Message),
 		pushRelay:    make(map[string]pushRelayInfo),
 	}
 
@@ -384,6 +394,31 @@ func (s *Server) GetExecutor(watchID string) (string, bool) {
 	defer s.executorMu.RUnlock()
 	e, ok := s.executors[watchID]
 	return e, ok
+}
+
+// registerPending 登记一个中转探针的「待回包」通道(probeID → chan)。执行方回 MsgPong
+// 时按 RequestID 命中并投递,配合超时实现对 execution 段的 RTT 测量。
+func (s *Server) registerPending(probeID string) chan protocol.Message {
+	ch := make(chan protocol.Message, 1)
+	s.pendingMu.Lock()
+	s.pending[probeID] = ch
+	s.pendingMu.Unlock()
+	return ch
+}
+
+// resolvePending 查 probeID 对应的待回包通道;存在则返回 true。
+func (s *Server) resolvePending(probeID string) (chan protocol.Message, bool) {
+	s.pendingMu.RLock()
+	defer s.pendingMu.RUnlock()
+	ch, ok := s.pending[probeID]
+	return ch, ok
+}
+
+// deletePending 移除探针的待回包登记(超时/失败/正常返回后严格清理,不残留到关闭)。
+func (s *Server) deletePending(probeID string) {
+	s.pendingMu.Lock()
+	delete(s.pending, probeID)
+	s.pendingMu.Unlock()
 }
 
 // SetReqOwner 记录被转发 exec 请求的归属请求方。

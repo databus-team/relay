@@ -158,6 +158,11 @@ type StatusSegment struct {
 	Unavailable string `json:"unavailable,omitempty"`
 }
 
+// StatusRequest 请求对某个 watch 做连通性体检(本地→中转→执行方)。
+type StatusRequest struct {
+	WatchID string `json:"watch_id"`
+}
+
 // StatusResponse 中转对 MsgStatus 的应答,承接 `relay status` 的一站式连通性+版本台账。
 //   - Seg1:  本地→中转 单程时延(由请求方本地 `Ping` 计时,中转不填)
 //   - Seg2:  中转→执行方 单程时延(由中转探针测得;执行方离线/未注册时标不可用)

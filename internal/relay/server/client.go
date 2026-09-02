@@ -134,6 +134,9 @@ func (c *Client) handleMessage(msg protocol.Message) {
 	case protocol.MsgVersion:
 		c.handleVersion(msg)
 
+	case protocol.MsgStatus:
+		c.handleStatus(msg)
+
 	case protocol.MsgPushJob:
 		c.handlePushJob(msg)
 
@@ -145,6 +148,12 @@ func (c *Client) handleMessage(msg protocol.Message) {
 
 	case protocol.MsgSubscribe:
 		c.handleSubscribe(msg)
+
+	case protocol.MsgPong:
+		// 执行方的探针回包到达其自身连接;按 RequestID 交给 `pending` 中等待的 status 探活方。
+		if c.maybeResolvePending(msg) {
+			return
+		}
 
 	case protocol.MsgStreamData:
 		c.handleStreamData(msg)
@@ -410,6 +419,88 @@ func (c *Client) handleVersion(msg protocol.Message) {
 	sort.SliceStable(nodes[1:], func(i, j int) bool { return nodes[i+1].WatchID < nodes[j+1].WatchID })
 
 	c.SendResponse(msg.ID, protocol.VersionResponse{OK: true, Nodes: nodes})
+}
+
+// handleStatus 处理 `relay status` 的连通性体检:对指定 watch 的执行方发探针并带回包超时,
+// 测「中转→执行方」段时延,连同版本台账(futures)组装成 StatusResponse 回给请求方。
+// 执行方不在线 / 探针超时时该段标「不可用」,整条命令仍成功——语义是「中转在线、远端掉线」。
+func (c *Client) handleStatus(msg protocol.Message) {
+	payload, _ := msg.Payload.(map[string]interface{})
+	watchID := toString(payload["watch_id"])
+
+	if _, ok := c.server.GetWatchDir(watchID); !ok {
+		c.SendError(msg.ID, "unknown watch_id")
+		return
+	}
+
+	nodes := []protocol.VersionInfo{{
+		Role:      "transit",
+		Version:   version.Version,
+		Commit:    version.Commit,
+		BuildTime: version.Date,
+		GOOS:      runtime.GOOS,
+		GOARCH:    runtime.GOARCH,
+		Go:        runtime.Version(),
+	}}
+	for w, ver := range c.server.ExecutorVersions() {
+		nodes = append(nodes, protocol.VersionInfo{
+			Role:    "executor",
+			WatchID: w,
+			Version: ver,
+		})
+	}
+	// executor 按 watch 排序,便于对比。
+	sort.SliceStable(nodes[1:], func(i, j int) bool { return nodes[i+1].WatchID < nodes[j+1].WatchID })
+
+	resp := protocol.StatusResponse{OK: true, Nodes: nodes}
+
+	executorID, ok := c.server.GetExecutor(watchID)
+	if !ok {
+		resp.Seg2 = protocol.StatusSegment{Unavailable: "executor offline"}
+		c.SendResponse(msg.ID, resp)
+		return
+	}
+
+	probeID := uuid.New().String()
+	probeCh := c.server.registerPending(probeID)
+	// 无论回包成功、探针超时还是发送失败,都严格清理 pending 条目,不残留到连接关闭。
+	defer c.server.deletePending(probeID)
+
+	// 探针复用 MsgPing→MsgPong:执行方在自身连接上回 MsgPong(RequestID=probeID),由
+	// server/client.go 的 case MsgPong 命中 pending 并投递。RTT 即「中转→执行方」段。
+	start := time.Now()
+	if err := c.server.SendTo(executorID, protocol.Message{Type: protocol.MsgPing, ID: probeID}); err != nil {
+		resp.Seg2 = protocol.StatusSegment{Unavailable: "executor unavailable"}
+		c.SendResponse(msg.ID, resp)
+		return
+	}
+
+	select {
+	case <-probeCh:
+		latency := time.Since(start).Milliseconds()
+		resp.Seg2 = protocol.StatusSegment{LatencyMS: &latency}
+	case <-time.After(statusProbeTimeout):
+		resp.Seg2 = protocol.StatusSegment{Unavailable: "executor probe timeout"}
+	}
+
+	c.SendResponse(msg.ID, resp)
+}
+
+// maybeResolvePending 把执行方的探针回包(带 RequestID 的 MsgPong)交给 `pending` 中的等待方。
+// 命中即返回 true(已消费,不再向下处理)。
+func (c *Client) maybeResolvePending(msg protocol.Message) bool {
+	if msg.RequestID == "" {
+		return false
+	}
+	ch, ok := c.server.resolvePending(msg.RequestID)
+	if !ok {
+		return false
+	}
+	select {
+	case ch <- msg:
+	default:
+	}
+	return true
 }
 
 // handlePushJob 处理流式 push-job 请求:有在线执行方则把元数据头转发给执行方,
