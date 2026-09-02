@@ -273,6 +273,16 @@ func (w *Watcher) processCommandsLoop(ctx context.Context) {
 }
 
 func (w *Watcher) heartbeat(ctx context.Context) {
+	// relay 执行方无需共享存储里的 `.heartbeat`：执行方存活/连通由 relay 连接自身的
+	// ws ping 心跳 + 自注册承载(`relay status` 的段 2 探针也走 client.Status,不读此文件)。
+	// 这条 `.heartbeat` 只服务于 local/fs-mcp/jumpserver 这类「读共享存储判断远端存活」
+	// 的 watch-pull 模型。而 relay 执行方自注册的 watch_id 通常不在中转的 watch 目录清单里,
+	// 再往共享存储写会被中转以 `unknown watch_id` 拒绝。故此处直接退出,不建也不写。
+	if w.cfg.Backend.Type == "relay" {
+		<-ctx.Done()
+		return
+	}
+
 	// Get command directory from backend config, default to /tmp/relay-commands
 	commandDir := "/tmp/relay-commands"
 	if dir, ok := w.cfg.Backend.Config["command_dir"].(string); ok && dir != "" && dir != "/" {
