@@ -973,10 +973,10 @@ func setupTunnelServer(t *testing.T, watchDir string) (*httptest.Server, string)
 
 // newEchoServer 起一个回显 TCP 服务(模拟 executor 内网可达的目标),并统计连接数。
 type echoServer struct {
-	ln      net.Listener
-	mu      sync.Mutex
-	conns   int
-	closed  chan struct{}
+	ln     net.Listener
+	mu     sync.Mutex
+	conns  int
+	closed chan struct{}
 }
 
 func newEchoServer(t *testing.T) (*echoServer, string) {
@@ -1029,7 +1029,7 @@ func registerTunnelExecutor(t *testing.T, wsURL, watchID string, allow bool) *cl
 				sess.Reject("target not allowed by network_allow")
 				return
 			}
-			addr := fmt.Sprintf("%s:%d", sess.Target(), sess.Port())
+			addr := net.JoinHostPort(sess.Target(), fmt.Sprintf("%d", sess.Port()))
 			conn, err := net.Dial("tcp", addr)
 			if err != nil {
 				sess.Reject("dial " + addr + ": " + err.Error())
@@ -1139,7 +1139,7 @@ func TestTunnel_Disabled(t *testing.T) {
 func TestTunnel_MultiExecutor_Independent(t *testing.T) {
 	watchDir := t.TempDir()
 	cfg := server.Config{
-		Addr:          ":0",
+		Addr: ":0",
 		WatchDirs: []server.WatchDirConfig{
 			{ID: "site-a", Dir: watchDir},
 			{ID: "site-b", Dir: watchDir},
