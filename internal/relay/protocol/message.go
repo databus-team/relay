@@ -218,6 +218,7 @@ type ServerUpgradeRequest struct {
 //   - MsgTunnelConnect  本地请求方 → 中转 → executor 的建连请求(携带目标与出口 watch)。
 //   - MsgTunnelData     双向字节流帧。
 //   - MsgTunnelEnd       隧道关闭(任一端断开);另一端收到后关停本地连接。
+//
 // 建连确认(成功/失败)经 MsgResponse/MsgError 回执(以建连消息 ID 作 RequestID),
 // 复用 exec 的转发-回包路径。多 executor 由 TunnelConnectRequest.WatchID 选定出口。
 type TunnelConnectRequest struct {
