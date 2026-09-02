@@ -20,10 +20,10 @@ server:
     enabled: false                # enable with cert_file/key_file for wss://
     cert_file: ""
     key_file: ""
-    # 隧道(relay tunnel SOCKS5)通道:默认关闭,显式 true 才放行 MsgTunnel*(与 relay watch 的
-    # backend.config.executor: true 配套,见下)。要收敛并发隧道数再设 max_tunnels(<=0 用默认 256)。
-    tunnel_enabled: false
-    # max_tunnels: 256
+  # 隧道(relay tunnel SOCKS5)通道:默认关闭,显式 true 才放行 MsgTunnel*(与 relay watch 的
+  # backend.config.executor: true 配套,见下)。要收敛并发隧道数再设 max_tunnels(<=0 用默认 256)。
+  tunnel_enabled: false
+  # max_tunnels: 256
 
 # Example: native relay backend
 # WebSocket-based relay server with streaming, compression, and event push
@@ -46,6 +46,13 @@ backend:
     #                                    # 不会自注册、不会把命令转发回本机——故可安全地与远端共用一份配置。
     #                                    # executor_dir: /path/to/remote/project   # push 时文件落在执行方的该目录下(可省略,默认进程当前目录)
     #                                    # config_path: ~/.relay/config.yaml        # relay sync 经 WS 流式把配置落盘到执行方的该文件(可省略,默认即此值)
+    # 隧道出网白名单(需配 executor: true 才有意义;executor 侧强制,默认拒绝):
+    # 条目为 host|ip|CIDR,可选端口用 @ 分隔(注意是 @ 不是 `:`),端口可列表/范围;无 @ 为任意端口。
+    # 未在 network_allow 显式放行的目标一律拒绝(fail-closed);空/缺省 = 拒绝一切隧道建连。
+    # network_allow:
+    #   - "10.0.0.0/8@80,443"
+    #   - "api.internal.com@443"
+    #   - "192.168.0.5@22"
 
 watch:
   - id: web-app-patches
