@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http/httptest"
 	"os"
@@ -350,6 +351,86 @@ func TestIntegration_Version(t *testing.T) {
 	}
 	if !hasExecutor {
 		t.Error("version台账 should include the registered executor for test-watch")
+	}
+}
+
+// decodeStatus 把 MsgStatus 的 Response payload 解成 StatusResponse。
+func decodeStatus(t *testing.T, resp *protocol.Response) protocol.StatusResponse {
+	t.Helper()
+	data, _ := json.Marshal(resp.Payload)
+	var st protocol.StatusResponse
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatalf("decode status response: %v", err)
+	}
+	return st
+}
+
+// TestIntegration_Status_Full:执行方在线时 status 返回 段2(>0)与 台账(中转+执行方)。
+func TestIntegration_Status_Full(t *testing.T) {
+	watchDir := t.TempDir()
+
+	ts, wsURL := setupTestServer(t, watchDir)
+	defer ts.Close()
+
+	exec := registerExecutorClient(t, wsURL)
+	defer exec.Disconnect()
+
+	ctx := context.Background()
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	resp, err := c.Request(ctx, protocol.MsgStatus, protocol.StatusRequest{WatchID: "test-watch"})
+	if err != nil {
+		t.Fatalf("status query: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("status not OK: %s", resp.Error)
+	}
+	st := decodeStatus(t, resp)
+	if st.Seg2.LatencyMS == nil || *st.Seg2.LatencyMS < 0 {
+		t.Errorf("seg2.latency_ms should be present >=0, got %v", st.Seg2.LatencyMS)
+	}
+
+	var hasTransit, hasExecutor bool
+	for _, n := range st.Nodes {
+		switch n.Role {
+		case "transit":
+			hasTransit = true
+		case "executor":
+			if n.WatchID == "test-watch" && n.Version == "test-build-1" {
+				hasExecutor = true
+			}
+		}
+	}
+	if !hasTransit || !hasExecutor {
+		t.Errorf("status ledger should include transit and executor; got %+v", st.Nodes)
+	}
+}
+
+// TestIntegration_Status_NoExecutor:无执行方时 段2 标不可用,命令仍成功(中转在线、远端掉线)。
+func TestIntegration_Status_NoExecutor(t *testing.T) {
+	watchDir := t.TempDir()
+
+	ts, wsURL := setupTestServer(t, watchDir)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	resp, err := c.Request(ctx, protocol.MsgStatus, protocol.StatusRequest{WatchID: "test-watch"})
+	if err != nil {
+		t.Fatalf("status query: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("status should succeed even with executor offline: %s", resp.Error)
+	}
+	st := decodeStatus(t, resp)
+	if st.Seg2.LatencyMS != nil {
+		t.Errorf("seg2.latency_ms should be nil when executor offline, got %v", *st.Seg2.LatencyMS)
+	}
+	if st.Seg2.Unavailable == "" {
+		t.Errorf("seg2.unavailable should name the outage reason, got empty")
 	}
 }
 
