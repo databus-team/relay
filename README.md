@@ -117,6 +117,9 @@ Arbitrarily large files (a multi-MB `relay` binary, a big patch) are handled: th
 binary chunks instead of being sent as one giant base64 message. If no executor is online, `push` falls back to staging the file on the
 transit server's `watch_dir` (the classic watch-and-pull flow) and prints a `[staged ...]` notice. Directories still use the plain staging path.
 
+- `--no-jobs`: transfer only — deliver the file without triggering the workspace's jobs on the remote executor.
+- `--dest <path>`: override the target destination with an absolute path, bypassing `watch_dir`. Requires `--no-jobs`.
+
 ### pull — Download File
 
 ```bash
@@ -264,7 +267,7 @@ same manual path.
 relay ws              # list workspace IDs
 relay ws -v           # verbose table with remote/local dirs and job counts
 relay ws --json       # output as JSON
-relay ws -w web-app   # details for a specific workspace
+relay ws --name web-app   # details for a specific workspace
 ```
 
 ### status — Link Health & Version in One Shot
@@ -272,8 +275,8 @@ relay ws -w web-app   # details for a specific workspace
 One-shot check: `本地→中转→远程执行方` 三段时延(local→transit, transit→executor, 两段之和)+ 各端点版本台账,吸收原 `ping` 与 `version -r` 的职责于单一命令。每段报告的都是该跳的往返(RTT)耗时,`total` 是前两段 RTT 之和。
 
 ```sh
-relay status -w web-app          # three-segment latency + version ledger
-relay status --json -w web-app   # machine-readable, same fields as text
+relay status          # three-segment latency + version ledger
+relay status --json   # machine-readable, same fields as text
 ```
 
 Only the `relay` backend measures all three segments. Other backends (local/fs-mcp/jumpserver) give the single reachable hop and mark the rest `N/A (not supported on <type> backend)`, keeping the same columns / JSON shape. When an executor is offline the `transit→executor` segment shows `N/A (executor offline)` and the command still succeeds — "transit up, executor down".
@@ -281,13 +284,11 @@ Only the `relay` backend measures all three segments. Other backends (local/fs-m
 Example for the `relay` backend with an online executor:
 
 ```
-status "web-app-patches" (relay backend)
-  local→transit      12 ms
-  transit→executor   45 ms
-  local total        57 ms
-  endpoints:
-    transit       v1.2.3        (linux/amd64)
-    executor      watch=web-app-patches  v1.2.3
+status (relay backend)
+  local→transit  12 ms
+  transit        v1.2.3 (linux/amd64)
+  executors:
+    web-app-patches  transit→executor 45 ms  total 57 ms  (v1.2.3)
 ```
 
 ### version — Local Build Info
@@ -316,7 +317,7 @@ curl --socks5-hostname 127.0.0.1:1080 http://intra.a.internal/ping
 ```
 
 - `--watch` selects the egress executor by the **executor's server watch id** (the `executor watch=...`
-  shown by `relay status`) — required. Unlike `exec`/`push`/`status` whose `-w` is a local workspace that
+  shown by `relay status`) — required. Unlike `exec`/`push` whose `-w` is a local workspace that
   gets mapped to the connection's watch id, the tunnel selector is passed straight through to the transit.
 - Default bind is loopback `127.0.0.1`; binding a non-loopback address prints a loud warning (no auth).
 - Server must enable the tunnel channel (`tunnel_enabled: true` in the `server:` section); otherwise
