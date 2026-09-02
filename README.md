@@ -165,11 +165,15 @@ Removes stale `cmd-*.json` and `result-*.json` files from the remote `command_di
 
 ### sync — Config Hot Reload
 
-Push the unified config to a running remote watcher (executor) without restarting it. Because all three ends share one `config.yaml`, syncing the file brings the executor's backend/watch/jobs up to date; the transit server re-reads the same file on restart.
+Push the unified config to a running remote watcher (executor) without restarting it. Because all three endpoints share one `config.yaml`, syncing the file brings the executor's `backend`/`watch`/`jobs` up to date; the transit server re-reads the same file on restart. Under a **relay** backend, sync streams the config straight to the executor over the WebSocket (no transit file staging).
 
 ```bash
-relay sync -c ~/.relay/config.yaml
+relay sync -c ~/.relay/config.yaml              # target = this config's backend.watch_id (single-root default)
+relay sync -c ~/.relay/config.yaml -e site-b     # target a specific executor by its watch_id (multi-executor)
 ```
+
+- `--executor/-e <watch_id>`: target a specific executor (e.g. push the shared config to `site-b` when several executors share one transit). Empty / omitted = sink the requester's own `backend.watch_id` (single-root fallback), same as `exec`/`push`.
+- The synced file is validated on the executor and written to its `config_path` (default `~/.relay/config.yaml`); `relay watch` picks it up on the next cycle.
 
 **How it works:**
 1. CLI reads the local config file and writes it as a command file in the shared `command_dir`
@@ -334,13 +338,24 @@ curl --socks5-hostname 127.0.0.1:1080 http://a-intra.pvt/00
 curl --socks5-hostname 127.0.0.1:1081 https://b-intra.pvt/api
 ```
 
-`network_allow` whitelist example (executor's `backend.config`):
+**`network_allow` is per-executor.** Each executor's `backend.config` carries the allowlist for the
+egress it may reach. In a multi-executor deployment put each executor's own whitelist in that executor's
+config (so `relay tunnel --watch site-a` is gated by site-a's allowlist, `--watch site-b` by site-b's).
+Format: `host|IP|CIDR[@port]` — `@` port is optional (`443`, `80,443`, `8000-9000`); missing `@` = any port.
+The transit and local CLI never need `network_allow`; only the executor enforces it.
 
 ```yaml
+# executor site-a's backend.config
 network_allow:
   - "10.0.0.0/8@80,443"
   - "api.internal.com@443"
   - "192.168.0.5@22"
+```
+
+```yaml
+# executor site-b's backend.config — a different intranet, its own whitelist
+network_allow:
+  - "172.16.0.0/12"
 ```
 
 ## Relay Backend Configuration

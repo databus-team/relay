@@ -84,7 +84,8 @@ var (
 	cleanupWatch = cleanupCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
 
 	// Sync command - push config to remote watcher for hot reload
-	syncCmd = kingpin.Command("sync", "Push config to remote watcher for hot reload")
+	syncCmd      = kingpin.Command("sync", "Push config to remote watcher for hot reload")
+	syncExecutor = syncCmd.Flag("executor", "Target executor's watch_id (default = this config's backend watch_id)").Short('e').String()
 
 	// Workspaces command - list configured workspaces from config
 	// (alias: `workspaces`; kingpin v2 doesn't render aliases in --help)
@@ -1321,12 +1322,18 @@ func runSync() {
 		os.Exit(1)
 	}
 
-	// 通道遵循 backend:支持流式的后端(relay)经 WS 直达执行方落盘,不绕中转文件交换。
+	// 通道遵循 backend:支持流式的后端(relay)经 WS 直达执行端落盘,不绕中转文件交换。
+	// targetWatch(--executor)指定目标执行方;空=单根回退到本配置的 backend.watch_id。
 	if cs, ok := b.(backend.ConfigSyncCapable); ok {
-		fmt.Printf("Syncing config via %s streaming channel...\n", cfg.Backend.Type)
+		target := *syncExecutor
+		if target != "" {
+			fmt.Printf("Syncing config to executor %q via %s streaming channel...\n", target, cfg.Backend.Type)
+		} else {
+			fmt.Printf("Syncing config via %s streaming channel...\n", cfg.Backend.Type)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
-		exit, err := cs.ConfigSync(ctx, configData)
+		exit, err := cs.ConfigSync(ctx, target, configData)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Sync failed: %v\n", err)
 			os.Exit(1)
@@ -1335,7 +1342,7 @@ func runSync() {
 			fmt.Fprintf(os.Stderr, "Sync failed on executor (exit %d)\n", exit)
 			os.Exit(1)
 		}
-		fmt.Println("Sync successful (config written on executor; restart relay watch to take effect)")
+		fmt.Println("Sync completed (config written on executor; restart relay watch to take effect)")
 		return
 	}
 

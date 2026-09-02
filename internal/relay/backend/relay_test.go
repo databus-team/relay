@@ -121,7 +121,7 @@ func TestEndToEnd_ConfigSync(t *testing.T) {
 	}
 
 	payload := []byte("name: relay\nversion: 2\nbackend:\n  type: relay\n")
-	exit, err := cs.ConfigSync(ctx, payload)
+	exit, err := cs.ConfigSync(ctx, "", payload)
 	if err != nil {
 		t.Fatalf("config sync: %v", err)
 	}

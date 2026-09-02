@@ -205,15 +205,18 @@ func (c *Client) UpgradeServer(ctx context.Context, content []byte) error {
 	_, err := c.execRoundTrip(ctx, ch, nil)
 	return err
 }
-func (c *Client) ConfigSync(ctx context.Context, payload []byte) (*protocol.ExecResponse, error) {
+func (c *Client) ConfigSync(ctx context.Context, targetWatch string, payload []byte) (*protocol.ExecResponse, error) {
 	reqID, ch := c.registerInStream()
 	defer c.unregisterInStream(reqID)
 
+	if targetWatch == "" {
+		targetWatch = c.watchID
+	}
 	msg := &protocol.Message{
 		Type: protocol.MsgConfigSync,
 		ID:   reqID,
 		Payload: protocol.ConfigSyncRequest{
-			WatchID: c.watchID,
+			WatchID: targetWatch,
 			Payload: base64.StdEncoding.EncodeToString(payload),
 		},
 	}

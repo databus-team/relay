@@ -332,11 +332,12 @@ func (b *RelayBackend) TunnelOpen(ctx context.Context, watchID, target string, p
 }
 
 // ConfigSync 请求方把新配置经中转流式直达执行方落盘(WS 流式通道,不写 command 文件)。
-func (b *RelayBackend) ConfigSync(ctx context.Context, payload []byte) (int, error) {
+// ConfigSync 经中转把配置流式直达指定执行方落盘(targetWatch 为其注册 watch_id;空=单根回退)。
+func (b *RelayBackend) ConfigSync(ctx context.Context, targetWatch string, payload []byte) (int, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return 1, err
 	}
-	resp, err := b.client.ConfigSync(ctx, payload)
+	resp, err := b.client.ConfigSync(ctx, targetWatch, payload)
 	if err != nil {
 		return 1, err
 	}

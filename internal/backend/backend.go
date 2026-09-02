@@ -79,9 +79,10 @@ type PushNoJobsSender interface {
 }
 
 // ConfigSyncCapable 可选接口：后端支持经其原生通道(relay 为 WS 流式)把配置直接同步
-// 到执行方落盘。runSync 据此决定走流式还是退回通用文件命令交换。
+// 到执行端落盘。targetWatch 指定目标执行方的注册 watch_id;空 = 单根回退(本后端自己的 watch)。
+// runSync 据此决定走流式还是退回通用文件命令交换。
 type ConfigSyncCapable interface {
-	ConfigSync(ctx context.Context, payload []byte) (int, error) // 返回执行方 apply 的 exit code
+	ConfigSync(ctx context.Context, targetWatch string, payload []byte) (int, error) // 返回执行方 apply 的 exit code
 }
 
 type BackendFactory func(config map[string]interface{}) (FileTransferBackend, error)
