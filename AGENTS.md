@@ -1,160 +1,220 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-05-26
-**Commit:** d26a1ca
-**Branch:** feat/file-exchange-system
+**Generated:** 2026-09-02 (rewritten against current code — supersedes the 2026-05-26 edition)
 
 ## OVERVIEW
 
-Go-based file exchange & remote command execution system. Monitors remote directories via pluggable backends, triggers exec jobs on file pattern matches. Supports config hot-reload without restart.
+Go-based file exchange & remote command execution system, built around a **star topology with a single transit relay server (中转)**:
 
-Stack: Go 1.25, kingpin (CLI), MCP SDK, yaml.v3
+```
+本机 macOS ──> relay server (transit, Linux) <── 远端 executors (Windows/Linux, NAT 后)
+```
+
+- The transit server is the only network intersection point; all traffic (push / exec / sync / tunnel / status) flows through it over WebSocket.
+- Executors are the `relay watch` processes that **self-register** on the transit and execute jobs / answer exec / host tunnels.
+- A single shared `config.yaml` drives all three ends (transit reads `server:`, executor reads `backend:`+`workspaces:`, CLI reads `backend:`+`workspaces:`).
+- Event-driven for the relay backend (fsnotify upstream, WS push downstream); polling fallback for local/fs-mcp/jumpserver.
+
+Stack: Go 1.25, kingpin (CLI), gorilla/websocket, yaml.v3, zstd (protocol compression), fsnotify.
 
 ## STRUCTURE
 
 ```
 relay/
-├── cmd/relay/          # Entry point: CLI commands (watch/push/pull/exec/sync/list/cleanup)
+├── cmd/relay/                 # CLI entry: all subcommands (server/status/tunnel/watch/push/...)
+│   ├── main.go               # kingpin wiring + most run*() handlers (server/sync/ws/version/job/status...)
+│   ├── server.go             # runServer + transit self-upgrade injection
+│   └── tunnel.go             # local SOCKS5 egress tunnel (runTunnel)
 ├── internal/
-│   ├── backend/        # FileTransferBackend interface + 3 implementations
-│   ├── watcher/        # Daemon: polling loop, config hot-reload, job execution
-│   ├── exchange/       # CmdFile/ResultFile protocol (JSON over shared dir)
-│   ├── config/         # YAML config loader with Windows path normalization
-│   └── auth/           # HTTP proxy auth with token caching
-├── scripts/            # Shell command-responder for remote exec
-└── docs/               # Plans and brainstorms
+│   ├── relay/
+│   │   ├── server/           # Transit WebSocket server: routing, executor registry, upgrade, tunnel, fs watcher
+│   │   ├── client/           # Relay client: dial/reconnect/heartbeat/stream/tunnel/connection pool
+│   │   ├── protocol/         # Wire MessageType + message structs + zstd compression
+│   │   └── backend/          # `relay` backend (executor-side role): register/exec/tunnel/network_allow
+│   ├── backend/              # FileTransferBackend interface + local/fs-mcp/jumpserver implementations
+│   ├── config/               # YAML config: workspaces(+executor binding) + server block + tunnel_allow
+│   ├── watcher/              # Executor/watch daemon: event-driven or polling, job chains, config hot-reload
+│   ├── exchange/             # cmd/result file protocol (shared-dir exchange for non-relay backends)
+│   ├── jobrunner/            # Run config-defined jobs locally (job run, push-triggered)
+│   ├── daemon/               # Daemon lifecycle (pid/log) + binary self-replace/upgrade
+│   ├── logx/                 # Debug logging toggle
+│   └── version/              # Build version stamp (set via ldflags)
+├── scripts/                  # relay-deploy.sh (deploy-remote/transit), command-responder.sh
+├── docs/                     # plans/, brainstorms/, relay-protocol.md, relay-positioning.md
+├── config.example.relay.yaml # One shared config for all three ends
+├── Makefile
+└── README.md
 ```
 
 ## WHERE TO LOOK
 
+### CLI / cmd
+
 | Task | Location | Notes |
 |------|----------|-------|
-| CLI commands | `cmd/relay/main.go` | Each subcommand = one `runXxx()` func |
-| Add a backend | `internal/backend/` | See `## internal/backend/` below |
-| Watcher loop | `internal/watcher/watcher.go` | Run(), processWatch(), checkConfigSync() |
-| Cmd protocol | `internal/exchange/cmdfile.go` | CmdFile, ResultFile, ConfigSyncOp |
-| Config schema | `internal/config/config.go` | Config struct + WatchConfig/JobConfig |
-| Auth proxy | `internal/auth/proxy.go` | Browser-based login, cookie extraction |
+| All subcommands & dispatch | `cmd/relay/main.go` | kingpin wiring; one `run*()` per command |
+| `server` (transit) | `cmd/relay/server.go` | `runServer()`, legacy vs unified config, `transitSelfUpgrade` |
+| `tunnel` (SOCKS5) | `cmd/relay/tunnel.go` | `runTunnel`, SOCKS5 handshake, egress executor via `-w` |
+| `status` | `cmd/relay/main.go` → `runStatus`/`printStatus` | Deployment-wide latency + version ledger |
+| `ws` (alias `workspaces`) | `runWorkspaces`/`resolveWatches` | List/JSON/verbose workspace table |
+| `sync` (`-e` target executor) | `runSync` | WS streaming to executor, or cmd-file fallback |
+| `push` (direct + `--no-jobs`/`--dest`) | `runPush` · `runLocalJobsForPush` | Direct-to-executor with jobs, or transport-only |
+| `exec` | `runExec` | Streaming via `ExecStreamBackend`, else exec |
+| `job run` | `runJobRun` | Run one config job locally |
+| Version stamp | `internal/version/version.go` | `Version`/`Commit`/`Date`, `String()`, `Full()` |
 
-## CONVENTIONS
+### relay server (transit)
 
-- **Standard Go layout**: `cmd/` for binary, `internal/` for packages
-- **Error handling**: `fmt.Fprintf(os.Stderr, ...)` + `os.Exit(1)` in main; errors returned from internal
-- **Testing**: Standard `testing` package, `_test.go` beside source, table-driven tests
-- **Dependency injection**: Backend factory pattern via `RegisterBackend()`/`init()`
-- **Config format**: YAML with `yaml:` struct tags, env var expansion (`$VAR`)
-- **Windows compat**: MSYS-style path normalization (`/d/...` → `D:\...`)
+| Symbol | Location | Role |
+|--------|----------|------|
+| `Server` / `New` / `Serve` | `internal/relay/server/server.go:23/114/228` | WS upgrade serving, connection handling |
+| `handleConnection` | `server.go:271` | Per-conn read/write loops |
+| `RegisterExecutor` / `UnregisterExecutor` | `server.go:405/421` | **self-registration** of executors by watch_id (replaced stale) |
+| `GetExecutor` / `ExecutorEndpoints` / `ExecutorVersions` | `server.go:442/457/431` | Executor routing + version ledger |
+| `SendTo` / `Subscribe` / `BroadcastToSubscribers` | `server.go:360/372/657` | Message routing + file-event fan-out |
+| `SetUpgradeSwap` | `server.go:224` | Injected transit self-upgrade swap closure |
+| Tunnel registry (`TunnelEnabled`, `maxTunnels`=256) | `server.go:537/86`, `registerTunnel` | Gated `MsgTunnel*` egress |
+| `FileWatcher` (fsnotify) | `internal/relay/server/watcher.go:16` | Emits `MsgFileEvent` to subscribers |
+| `Client` inbound handlers | `internal/relay/server/client.go` | exec/list/delete/push/pull/exec_sync/status/upgrade/tunnel |
 
-## ANTI-PATTERNS
+### relay client
 
-- **No global state** beyond the backend registry map (`backends` var in backend.go)
-- **No `as any`/`@ts-ignore`** — this is Go, type-safe
-- **No framework** beyond standard lib + kingpin + MCP SDK
-- **No ORM** — no database layer
+| `Client` / `New` / `Connect` | `internal/relay/client/client.go:16/71/95` | WS transport, message dispatch |
+| Reconnect backoff | `internal/relay/client/reconnect.go:9` | default 1s→30s ×10, doubling |
+| Heartbeat | `internal/relay/client/heartbeat.go:12` | every **30s**; timeout if last pong > **90s** → disconnect; generation-tracked |
+| `Request` / `sendAndWait` | `client.go:365/394` | Request/response + pending map |
+| `RegisterExecutor` | `client.go:431` | Executor self-registration handshake |
+| `Status` / `Version` / `Ping` | `client.go:466/447/551` | `relay status` / version catalog / liveness |
+| Stream (`Pull`/`Push`) | `client.go:27` (`stream.go`) | Chunked binary over WS |
+| Exec / ConfigSync / PushJob / Transport | `client/exec.go` | Streaming exec, config push, push jobs, send |
+| Tunnel | `client/tunnel.go` | `TunnelOpen`/`TunnelStream`, fail-closed on backlog/transport loss |
+| Connection pool | `client/pool.go` | `GetOrConnect` keyed url|token|watch|headers → multi executor |
 
-## internal/backend/
+### relay protocol
 
-Pluggable file transfer backends with factory pattern.
+| `MessageType` + all `Msg*` | `internal/relay/protocol/message.go:4-32` | Wire message tags |
+| Message structs | `message.go` | Connect/List/Exec/Push/Pull/PushJob/ConfigSync/Status/Tunnel... |
+| `StatusResponse`/`StatusSegment` | `message.go:181/159` | Transit + per-executor latency segments |
+| `Compress`/`Decompress` | `protocol/compress.go` | zstd, binary WS frames |
 
-### WHERE TO LOOK
+### relay backend (executor side)
 
-| File | Role |
-|------|------|
-| `backend.go` | `FileTransferBackend` interface (7 methods), `RegisterBackend()`/`NewBackend()` |
-| `local.go` | Local filesystem backend (`base_dir` + `command_dir`). Registered as `"local"` in its own `init()` |
-| `fs_mcp.go` | MCP SDK backend over HTTP SSE. `remote_root`, `url`, custom `headers`. Uses `exchange.FileExchange` for remote exec |
-| `jumpserver.go` | JumpServer API backend via REST. Token auth with auto-login. No exec support |
+| `RelayBackend` / `NewRelayBackend` | `internal/relay/backend/relay.go:29/89` | `backend.type=relay` file/exec interface |
+| `SetExecutorRole` | `relay.go:63` | `relay watch` sets executor role (CLI doesn't) |
+| `registerExecutor` | `relay.go:553` | Self-register watch_id on connect |
+| `Exec` / `ExecStream` / `PushJob` / `PushNoJobs` / `Transport` | `relay.go:239-312` | Inbound exec/push on executor |
+| `ConfigSync` | `relay.go:336` | Stream config onto executor disk |
+| `UpgradeServer` | `relay.go:349` | Transit self-upgrade stream + verify + ACK |
+| `TunnelOpen` / `handleInboundTunnelConnect` | `relay.go:327/392` | SOCKS egress; validates `network_allow` |
+| `Events` / `SubscribeEvents` | `relay.go:735/739` | Relay-driven (event) watch channel |
+| registry `init` | `relay.go:780` | `backend.RegisterBackend("relay", ...)` |
 
-### IMPLEMENTING A BACKEND
+### config (workspaces + executor + server)
 
-1. Implement `FileTransferBackend` — `ListDir`, `Read`, `Write`, `Delete`, `SupportsExec`, `Exec`, `Ping`
-2. Return `ErrNotSupported` from `Exec` if unsupported; set `SupportsExec()` = `false`
-3. Write constructor: `func NewXxxBackend(config map[string]interface{}) (FileTransferBackend, error)`
-4. Register: `func init() { RegisterBackend("name", NewXxxBackend) }`
-5. Import the package in `cmd/relay/main.go` (side-effect import)
+| `Config` struct | `internal/config/config.go:15` | `Backend` + `Workspaces[]` + `Server` + `Interval` |
+| `WorkspaceConfig` | `config.go:47` | `ID/WatchDir/LocalDir/Paths/Jobs/AutoCleanup/TTL/Executor` |
+| `Executor` binding | `config.go:55` | binds a workspace's jobs to one executor by its `watch_id`; empty = single-root |
+| `ServerConfig` | `config.go:26` | `Addr/WatchRoot/Auth/TLS/TunnelEnabled/MaxTunnels` |
+| `GetWorkspaceByID` | `config.go:165` | lookup a single workspace |
+| `GetWorkspacesByExecutor` | `config.go:176` | all workspaces bound to an executor `watch_id` |
+| `ApplyConfigFile` | `config.go:138` | validate + backup + **atomic tmp/rename** config write |
+| `Load`/`LoadFromBytes` | `config.go:89/105` | YAML load with env expansion + home expand |
+| `NormalizeWindowsPath` (MSYS→`D:\`) | `config.go:186` | Windows path normalization |
+| `ParseNetworkAllowlist`/`CheckTunnelTarget` | `internal/config/tunnel_allow.go:53/126` | tunnel egress allow rule engine |
 
-### CONVENTIONS
+### watcher
 
-- Constructors type-assert each key from `map[string]interface{}`
-- `init()` auto-registration — no manual wiring
-- `ErrNotSupported` for optional methods
-- Each backend has its own `resolvePath()` helper
+| `Watcher` struct | `internal/watcher/watcher.go:25` | cfg, configPath, processed, pendingConfig |
+| `New` / `Run` | `watcher.go:40/60` | factory per-workspace backend; event-driven (`runEventDriven` for relay) or ticker |
+| `runEventDriven` | `watcher.go:106` | relay-backend event loop |
+| `processCommands` / `processCommandsLoop` | `watcher.go:352/239` | command file polling (adapts 2s→30s) for non-relay backends |
+| `heartbeat` | `watcher.go:275` | shared-store `.heartbeat` every 5s, **skipped for relay** executor |
+| `handleConfigSync` / `applyPendingConfig` | `watcher.go:457/530` | staged config hot-reload |
+| `processWatch` / `executeJobs` | `watcher.go:599/662` | glob-match + job chain with `if:` gating |
+| `SubstituteVariables` | `watcher.go:789` | `{file_path}`/`{file_name}`/`{file_dir}`/`{file_remote_path}`/`{timestamp}` |
+| `cleanupProcessedMap` | `watcher.go:344` | caps `processed` (#threshold) |
 
-### ANTI-PATTERNS
+### backend / exchange / daemon / jobrunner
 
-- Do NOT register backends in `backend.go`'s `init()`. Each backend owns its own `init()` + file
-- Do NOT use a switch/enum for backend selection — the registry replaces dispatch
+| `FileTransferBackend` interface | `internal/backend/backend.go:22` | `ListDir/Read/Write/Delete/SupportsExec/Exec/Ping`; `ErrNotSupported` |
+| Backend registry | `backend.go:92/96` + `init()` per backend | `local`, `fs-mcp`, `jumpserver`, `relay` |
+| Optional capability interfaces | `backend.go:33-84` | `EventBackend`, `ExecStreamBackend`, `PushJobSender`, `PushNoJobsSender`, `ConfigSyncCapable`, `PushJobHandler` |
+| `local.go` / `fs_mcp.go` / `jumpserver.go` | `internal/backend/` | local FS, MCP-over-SSE (no exec support), JumpServer REST (no exec support) |
+| Cmd/result protocol | `internal/exchange/cmdfile.go` | JSON over shared dir (fallback path for non-relay backends, `config_sync` cmd-file) |
+| Daemon lifecycle | `internal/daemon/*.go` | start/stop/restart, `PidFile`, self-replace, `ReplaceBinaryWithKeep` |
+| Local job runner | `internal/jobrunner/jobrunner.go` | `Run`/`RunJobs` with condition slots |
 
 ## COMMANDS
 
+Build/deploy targets in `Makefile` (all stamp version via `internal/version`):
+
 ```bash
-make build          # Build binary (./relay)
-make test           # go test -v -race ./...
-make fmt            # go fmt ./...
-make vet            # go vet ./...
-make build-release  # Stripped, CGO_ENABLED=0
-make deploy-remote  # Auto-deliver new binary to remote executor (RESTART=1 to swap+restart)
-make deploy-transit # One-click transit server upgrade via controlled self-upgrade
+make build           # dev binary (./relay)
+make build-release   # CGO_ENABLED=0, stripped (-s -w) + version stamp
+make build-linux     # cross-compile Linux amd64 → relay-linux (stamped)
+make build-windows   # cross-compile Windows amd64 → relay.exe (stamped)
+make build-debug     # debug symbols (-gcflags -N -l)
+make test            # go test -v -race ./...
+make test-coverage   # coverage.out + html
+make clean / fmt / vet / deps / run
+make install         # build-release → ~/.local/bin/relay
+make deploy-remote   # scripts/relay-deploy.sh remote   (RESTART=1 to swap+restart)
+make deploy-transit  # scripts/relay-deploy.sh transit  (controlled self-upgrade)
+make deploy          # all (remote + transit)
+make help
 ```
 
-### Server self-upgrade protocol (`MsgServerUpgrade`)
+CLI usage (key forms):
 
-The transit box gets a **controlled self-upgrade** channel (`relay server-remote` /
-`make deploy-transit`) instead of assuming SSH/executor reachability. The client streams a
-locally-built relay binary; the transit (a) verifies the sha256 digest, (b) self-checks the
-binary with its `version` subcommand, (c) sends a success ACK *first*, then (d) swaps.
-Key invariants:
+```bash
+relay watch [run|start|stop|status|restart|upgrade]   # executor (daemon actions)
+relay server [run|start|stop|status|restart|upgrade]  # transit (daemon actions)
+relay push [-w <id>] <file> [--no-jobs] [--dest <abs>]
+relay exec  [-w <id>] <cmd...>
+relay job run [-w <id>] <jobid> [file]
+relay sync  [-e <executor-watch-id>]
+relay ws [-v] [--json] [--name <id>]                   # alias: relay workspaces
+relay status [--json]                                  # whole deployment health + versions
+relay version [--json]                                 # local build (remote ledger via `status`)
+relay server-remote [--binary <path>]                  # one-command transit self-upgrade
+relay tunnel [--listen 127.0.0.1:1080] -w <egress-executor-watch>  # SOCKS5
+relay pull [<filename>] [-d]    relay push ...   relay list [-w]   relay cleanup -w <id>
+```
 
-| Concern | Rule |
-|---|---|
-| Auth | Only on token-authenticated sessions; server must set `auth.tokens` or the channel is **closed by default** |
-| Integrity | sha256 digest only — proves arrival == declared, not source authenticity |
-| Bootability | `version` subprocess self-check is a damage/not-startable guard, not authenticity |
-| Write surface | Lands only in a server-generated temp file (`/tmp/relay-upgrade-*`); never client-chosen paths |
-| Rollback | Pre-swap binary kept as `<binary>.prev`; **no auto-rollback** |
+Pass `-c <config>` (default `~/.relay/config.yaml`) to share one config across ends; `relay sync` ships it to the executor.
 
-Wiring: server exposes `SetUpgradeSwap(fn)`; `cmd/relay/server.go` injects
-`transitSelfUpgrade` (backup `.prev` → `daemon.ReplaceBinaryWithKeep` → re-exec). Client side:
-`Client.UpgradeServer` (exec.go) → `RelayBackend.UpgradeServer` → CLI `server-remote`.
-Deletion/digest-mismatch/self-check-fail paths abort before touching the running instance.
+## IMPLEMENTATION NOTES (current)
 
-## internal/watcher/
+- **Executor self-registration + per-workspace binding.** An executor (`relay watch` with `backend.type=relay`) starts by calling `Client.RegisterExecutor(watchID)` to register on the transit (server's `RegisterExecutor` overwrites stale entries → one active instance per watch). `workspaces[].executor` binds a workspace's jobs to the executor whose `watch_id` matches that value; empty = single-root fallback. `Config.GetWorkspacesByExecutor` maps an executor to the workspaces it owns.
+- **Push direct + fallback.** On `relay push`, the relay backend uses `PushJobSender` to fan the file directly to the target executor through the transit (never the shared-dir → staged by the transit), and the executor runs its workspace jobs locally, streaming the job output back. `--no-jobs`/`--dest` uses `PushNoJobsSender` (transport-only). If no online executor is registered for that workspace (`executor: none`), the push **falls back** to staging the file on the transit watch dir (watch-pull) — this fallback is verified in `TestEndToEnd_PushJobNoExecutorFallback`.
+- **Tunnel `network_allow` fail-closed.** Local `relay tunnel -w <egress-watch>` opens a SOCKS5 listener and forwards each CONNECT to the chosen executor via the transit. The **executor** validates the destination against its `backend.config.network_allow` (host/IP/CIDR + optional `@port` list/range). Unlisted targets are rejected by default (fail-closed); an empty/absent `network_allow` denies all. Server gates the channel behind `server.tunnel_enabled` + `max_tunnels` (default 256). Non-loopback listen prints a warning (no auth on the tunnel itself).
+- **`status` 3-segment latency.** `relay status` (replaces legacy `ping`/`version -r`) reports a whole-deployment health/version ledger: Seg1 = local→transit latency; the transit -- CLI requests a status that probes each online executor (Seg2 = transit→executor) and returns transit + executor build identities; `Total = Seg1 + Seg2`. Executors offline are marked N/A, and non-relay backends give only the single-hop segment. `--json` mirrors the text fields.
+- **Heart beats 30s/90s.** The relay client sends a WS heartbeat every 30s; if no pong arrives for >90s it disconnects and lets reconnect take over (heartbeat is generation-guarded so only the current connection's ticker runs). The legacy shared-store `.heartbeat` (5s) is **skipped** by the relay executor — liveness there is carried by the relay connection + self-registration, not a shared file.
+- **Reconnect 1s→30×10.** Default `reconnect.go` config: initial 1s, exponential ×2 up to 30s max, max 10 retries, then gives up (`failAllPending` + close). A successful reconnect restarts `readLoop` + heartbeat (single writeLoop persists).
+- **Config atomic write.** `ApplyConfigFile` parses/validates the payload, backs up the current file to `config.bak`, writes to `config.tmp`, then `os.Rename` (atomic). It is shared by both sync paths: the exchange/`command`-file watcher (`handleConfigSync`) and the relay WS streaming `ConfigSync`. `relay sync` pushes the shared config to the executor.
+- **Streaming/interaction.** `MsgExec*`/push/stream transfer binary content via `StreamStart`/`StreamData`/`StreamEnd` (binary frames + zstd) rather than in JSON headers; file events fan out via `MsgFileEvent` to subscribers.
 
-Daemon polling remote directories and executing job chains on file pattern matches.
+## CONVENTIONS
 
-### WHERE TO LOOK
-| Symbol | File:Line | Role |
-|--------|-----------|------|
-| `Watcher` struct | `watcher.go:24` | Core state: cfg, configPath, processed, jobResults, pendingConfig |
-| `Run()` | `watcher.go:47` | Main ticker loop, calls `runOnce()` each interval |
-| `processWatch()` | `watcher.go:429` | Lists remote dir, glob-matches files, triggers `executeJobs()` |
-| `executeJobs()` | `watcher.go:476` | Sequential job execution with `if:` condition gating |
-| `processCommandsLoop()` | `watcher.go:79` | Background goroutine: polls command dir for sync/exec cmds |
-| `handleConfigSync()` | `watcher.go:300` | Decodes base64 payload, validates, backs up, stages for next cycle |
-| `applyPendingConfig()` | `watcher.go:363` | Atomic rename of staged config at top of `runOnce()` |
+- **Standard Go layout**: `cmd/` for the binary, `internal/` for packages.
+- **Config is unified**: one shared `config.yaml` per `relay server`, `relay watch`, `relay push`; only the relevant section is read on each side.
+- **Backend registry**: constructor `init()`-based `RegisterBackend("name", NewX)`; `NewBackend(type, cfg)` dispatch, no switch.
+- **Error handling**: `fmt.Fprintf(os.Stderr, ...)` + `os.Exit(1)` in `main`; internal returns errors.
+- **Windows compat**: MSYS-style normalization (`/d/...` → `D:\...`) via `NormalizeWindowsPath`; `relay/backend` has `msysToWindowsPath` for exec dirs.
+- **Testing**: standard `testing`, table-driven, `_test.go` beside source; backend/integration tests in `internal/relay/backend/relay_test.go` spin up an in-process hub via `httptest`.
+- **Bilingual code**: ID-agnostic; comments frequently Chinese, wire types English.
 
-### KEY BEHAVIOR
-- **Two concurrent loops**: main ticker (watch processing) + command processor (config sync, remote exec)
-- **Staged config reload**: sync decoded/validated in command loop, staged via `pendingConfig`, applied via atomic rename at start of next `runOnce()`
-- **processed map**: dual-purpose (file paths + cmd paths); capped at 5000 entries via `cleanupProcessedMap()`; reset is lossy, seen files may re-trigger
-- **Job conditions**: `jobs.<id>.success` / `jobs.<id>.failure` evaluated via `evaluateCondition()`
-- **Variable expansion**: `{file_path}`, `{file_name}`, `{file_dir}`, `{file_remote_path}`, `{timestamp}`
-- **Heartbeat**: goroutine writes timestamp to `commandDir/.heartbeat` every 5s
-- **Adaptive backoff**: command polling starts at 2s, doubles to 30s max when idle
+## ANTI-PATTERNS
 
-### CONVENTIONS
-- Watch dirs processed in parallel via `errgroup.Group`
-- Backend created per-watch via `NewBackend()` factory (not hardcoded)
-- `exec.CommandContext` + `context.WithTimeout` for job timeouts; no sleeping during jobs
-
-### ANTI-PATTERNS
-- `processed` map reset clears all tracked state, can cause re-triggers on active dirs
-- `runLocalCommand()` logs to stdout/stderr but discards output from job results tracking
-- Command processor uses same `processed` map as file watcher (shared namespace collision risk)
+- **No global state** beyond the backend registry (`backends` var) and the relay executor-role flag (`SetExecutorRole`).
+- **No pooling surprises**: Worker pool is keyed by url+token+watch+headers and only reused when connected — reuse of a dead client is re-connected, not implicitly refreshed.
+- **Do not send binary/payload in JSON headers** — use stream messages + zstd.
+- **Do not assume a target executor is online**: egress/exec/push must degrade cleanly (the return fallback) instead of erroring in a way that drops the file.
 
 ## NOTES
 
-- `processed` map in watcher can grow unbounded (was fixed in 15ff849)
-- Config hot-reload: staged at sync, applied on next cycle (not immediate)
-- Polling-based architecture (no filesystem events)
-- Module path is `github.com/user/relay` — update before publishing
+- `processed` map is bounded by `cleanupProcessedMap` (reset is lossy; files may re-trigger after a clear).
+- Config hot-reload is staged (synced then applied on next cycle / next event), never immediate.
+- Watcher in non-relay mode is polling; the relay backend is **event-driven** (no polling).
+- Module path is `github.com/user/relay` — update before publishing.
+- Docs: `docs/relay-protocol.md` (wire spec), `docs/relay-positioning.md` (arch rationale / why-not-alternatives), latest plans under `docs/plans/`.

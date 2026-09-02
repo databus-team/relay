@@ -66,7 +66,6 @@ type JobConfig struct {
 	Cmd      string `yaml:"cmd,omitempty"`
 	Cwd      string `yaml:"cwd,omitempty"`
 	If       string `yaml:"if,omitempty"`
-	KeepFile bool   `yaml:"keep_file"`
 	Timeout  int    `yaml:"timeout,omitempty"` // seconds, optional per-job timeout
 }
 

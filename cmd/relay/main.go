@@ -553,25 +553,22 @@ type jobConfigJSON struct {
 	ID       string `json:"id"`
 	Type     string `json:"type"`
 	Cmd      string `json:"cmd,omitempty"`
-	Cwd      string `json:"cwd,omitempty"`
-	Path     string `json:"path,omitempty"`
-	If       string `json:"if,omitempty"`
-	KeepFile bool   `json:"keep_file"`
-	Timeout  int    `json:"timeout,omitempty"`
+	Cwd     string `json:"cwd,omitempty"`
+	If      string `json:"if,omitempty"`
+	Timeout int    `json:"timeout,omitempty"`
 }
 
 func toWorkspaceJSON(w config.WorkspaceConfig) workspaceJSON {
 	jobs := make([]jobConfigJSON, len(w.Jobs))
 	for i, j := range w.Jobs {
 		jobs[i] = jobConfigJSON{
-			ID:       j.ID,
-			Type:     j.Type,
-			Cmd:      j.Cmd,
-			Cwd:      j.Cwd,
-			If:       j.If,
-			KeepFile: j.KeepFile,
-			Timeout:  j.Timeout,
-		}
+		ID:      j.ID,
+		Type:    j.Type,
+		Cmd:     j.Cmd,
+		Cwd:     j.Cwd,
+		If:      j.If,
+		Timeout: j.Timeout,
+	}
 	}
 	return workspaceJSON{
 		ID:       w.ID,
