@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -142,7 +143,20 @@ func New(cfg Config) (*Server, error) {
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
 
+	log.Printf("[server] up: id=%s addrs=%d dirs=%v tunnel_enabled=%t max_tunnels=%d",
+		s.serverID, len(s.watchDirs), watchIDs(s.watchDirs), cfg.TunnelEnabled, maxTunnels)
+
 	return s, nil
+}
+
+// watchIDs 抽取启动摘要里要展示的 watch 登目录;顺序固定便于日志对齐。
+func watchIDs(m map[string]string) []string {
+	ids := make([]string, 0, len(m))
+	for id := range m {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 func (s *Server) StartFileWatcher(ctx context.Context) error {
@@ -277,6 +291,7 @@ func (s *Server) handleConnection(conn *websocket.Conn) {
 	token := toString(payload["token"])
 
 	if !s.validateToken(token) {
+		log.Printf("[session] rejected connect from %s: invalid token", conn.RemoteAddr())
 		conn.WriteJSON(protocol.Message{
 			Type:    protocol.MsgConnectAck,
 			ID:      uuid.New().String(),
@@ -295,6 +310,8 @@ func (s *Server) handleConnection(conn *websocket.Conn) {
 	s.clientMu.Lock()
 	s.clients[clientID] = client
 	s.clientMu.Unlock()
+
+	log.Printf("[session] %s connected (id=%s)", conn.RemoteAddr(), clientID)
 
 	watchDirs := make([]string, 0, len(s.watchDirs))
 	for id := range s.watchDirs {
@@ -319,6 +336,8 @@ func (s *Server) handleConnection(conn *websocket.Conn) {
 	s.clientMu.Lock()
 	delete(s.clients, clientID)
 	s.clientMu.Unlock()
+
+	log.Printf("[session] %s disconnected (id=%s)", conn.RemoteAddr(), clientID)
 }
 
 func (s *Server) validateToken(token string) bool {
@@ -382,9 +401,12 @@ func (s *Server) UnsubscribeAll(clientID string) {
 }
 
 // RegisterExecutor 将 clientID 注册为 watchID 的执行方,并记录其 relay 构建版本。
-func (s *Server) RegisterExecutor(watchID, clientID, version string) {
+// 返回 (旧执行方 clientID, 是否发生了覆盖),便于上层做替换告警。
+func (s *Server) RegisterExecutor(watchID, clientID, version string) (prev string, replaced bool) {
 	s.executorMu.Lock()
 	defer s.executorMu.Unlock()
+	prev = s.executors[watchID]
+	replaced = prev != "" && prev != clientID
 	s.executors[watchID] = clientID
 	if version != "" {
 		s.executorVers[watchID] = version
@@ -392,6 +414,7 @@ func (s *Server) RegisterExecutor(watchID, clientID, version string) {
 		// 旧版执行方不携带 version,清空以表示未知,避免与真实值混淆。
 		delete(s.executorVers, watchID)
 	}
+	return prev, replaced
 }
 
 // UnregisterExecutor 若 clientID 是 watchID 的执行方则移除。

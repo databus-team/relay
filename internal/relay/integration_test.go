@@ -1298,3 +1298,69 @@ func TestTunnel_DeniedDoesNotLeak(t *testing.T) {
 		t.Fatalf("valid tunnel open after a denied one must succeed (registry must not leak): %v", err)
 	}
 }
+
+// TestIntegration_ExecutorDynamicWatch:执行方动态注册一个「不在 server watch 白名单里」的
+// watch_id,server 仍应放行并可按该 watch 路由 exec/status(不依赖 watch 存储目录占位)。
+func TestIntegration_ExecutorDynamicWatch(t *testing.T) {
+	dir := t.TempDir()
+	cfg := server.Config{
+		Addr: ":0",
+		// 故意只声明一个无关 watch:动态 watch "extranet" 不在白名单里。
+		WatchDirs: []server.WatchDirConfig{{ID: "unrelated", Dir: t.TempDir()}},
+		Auth:      server.AuthConfig{Type: "token", Tokens: []string{"test-token"}},
+	}
+	srv, err := server.New(cfg)
+	if err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/relay"
+
+	ctx := context.Background()
+
+	// 执行方动态注册一个不存在于 server WatchDirs 的 watch —— 旧实现会因
+	// handleRegisterExecutor 校验 watch_dirs 而回 unknown watch_id 拒绝。
+	exec := connectTestClient(t, wsURL)
+	defer exec.Disconnect()
+	exec.SetExecHandler(func(sess *client.ExecSession) {
+		go func() {
+			_ = sess.Write(true, sess.Cmd()+"\n")
+			_ = sess.Done(protocol.ExecResponse{ExitCode: 0})
+		}()
+	})
+	if err := exec.RegisterExecutor(ctx, "extraneous", "add", "dyn-build"); err != nil {
+		t.Fatalf("dynamic executor registration for non-whitelisted watch must succeed: %v", err)
+	}
+
+	// status 必须能路由到动态 watch 且带出版本台账。
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+	resp, err := c.Request(ctx, protocol.MsgStatus, protocol.StatusRequest{WatchID: "extraneous"})
+	if err != nil {
+		t.Fatalf("status for dynamic watch: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("status not OK for dynamic watch: %s", resp.Error)
+	}
+	st := decodeStatus(t, resp)
+	var hasExecutor bool
+	for _, n := range st.Nodes {
+		if n.Role == "executor" && n.WatchID == "extraneous" && n.Version == "dyn-build" {
+			hasExecutor = true
+		}
+	}
+	if !hasExecutor {
+		t.Errorf("status ledger should include the dynamically-registered executor; got %+v", st.Nodes)
+	}
+
+	// exec 必须透明转发到动态 watch 的执行方并拿到回执。
+	exresp, err := c.Request(ctx, protocol.MsgExec, map[string]interface{}{"watch_id": "extraneous", "cmd": "echo hi"})
+	if err != nil {
+		t.Fatalf("exec to dynamic watch: %v", err)
+	}
+	if exresp.Error != "" {
+		t.Fatalf("exec to dynamic watch errored: %s", exresp.Error)
+	}
+	_ = dir
+}
