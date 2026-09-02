@@ -413,9 +413,9 @@ type StatusSegment struct {
 type StatusResponse struct {
     OK    bool           `json:"ok"`
     Error string         `json:"error,omitempty"`
-    Seg1  StatusSegment  `json:"seg1"`  // 本地→中转 单程(请求方本地 `Ping` 计时)
-    Seg2  StatusSegment  `json:"seg2"`  // 中转→执行方 单程(中转探针测得;离线/未注册=不可用)
-    Total StatusSegment  `json:"total"` // Seg1 + Seg2 本地单程累计
+    Seg1  StatusSegment  `json:"seg1"`  // 本地→中转 往返 RTT(请求方本地 `Ping` 计时)
+    Seg2  StatusSegment  `json:"seg2"`  // 中转→执行方 往返 RTT(中转探针测得;离线/未注册=不可用)
+    Total StatusSegment  `json:"total"` // Seg1 + Seg2 两段 RTT 之和
     Nodes []VersionInfo  `json:"nodes,omitempty"` // 参与端点版本台账
 }
 ```

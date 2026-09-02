@@ -446,27 +446,34 @@ func (c *Client) handleStatus(msg protocol.Message) {
 
 	probeID := uuid.New().String()
 	probeCh := c.server.registerPending(probeID)
-	// 无论回包成功、探针超时还是发送失败,都严格清理 pending 条目,不残留到连接关闭。
-	defer c.server.deletePending(probeID)
 
 	// 探针复用 MsgPing→MsgPong:执行方在自身连接上回 MsgPong(RequestID=probeID),由
-	// server/client.go 的 case MsgPong 命中 pending 并投递。RTT 即「中转→执行方」段。
+	// 下方的 case MsgPong 命中 pending 并投递。RTT 即「中转→执行方」段。
+	// 发送带写超时兜底,防止 half-open 连接把探针写卡死(与等待回包一起受 statusProbeTimeout 约束)。
 	start := time.Now()
-	if err := c.server.SendTo(executorID, protocol.Message{Type: protocol.MsgPing, ID: probeID}); err != nil {
+	if err := c.server.sendProbe(executorID, protocol.Message{Type: protocol.MsgPing, ID: probeID}, statusProbeTimeout); err != nil {
+		c.server.deletePending(probeID)
 		resp.Seg2 = protocol.StatusSegment{Unavailable: "executor unavailable"}
 		c.SendResponse(msg.ID, resp)
 		return
 	}
 
-	select {
-	case <-probeCh:
-		latency := time.Since(start).Milliseconds()
-		resp.Seg2 = protocol.StatusSegment{LatencyMS: &latency}
-	case <-time.After(statusProbeTimeout):
-		resp.Seg2 = protocol.StatusSegment{Unavailable: "executor probe timeout"}
-	}
-
-	c.SendResponse(msg.ID, resp)
+	// 等待回包放到独立 goroutine,避免阻塞请求方连接的读循环(读循环是这台连接的唯一读者,
+	// 若在此同步等待 5s,该连接上其它入站帧(心跳/exec 回包/文件事件)都会被堵住)。
+	// 连接断开时 `c.closeCh` 关闭 → 立即返回并由 defer 清掉 pending,不必等满超时。
+	go func() {
+		defer c.server.deletePending(probeID)
+		select {
+		case <-probeCh:
+			latency := time.Since(start).Milliseconds()
+			resp.Seg2 = protocol.StatusSegment{LatencyMS: &latency}
+		case <-time.After(statusProbeTimeout):
+			resp.Seg2 = protocol.StatusSegment{Unavailable: "executor probe timeout"}
+		case <-c.closeCh:
+			return
+		}
+		_ = c.SendResponse(msg.ID, resp)
+	}()
 }
 
 // maybeResolvePending 把执行方的探针回包(带 RequestID 的 MsgPong)交给 `pending` 中的等待方。
@@ -728,6 +735,16 @@ func (c *Client) handleStreamEnd(msg protocol.Message) {
 func (c *Client) Send(msg protocol.Message) error {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
+	return c.conn.WriteJSON(msg)
+}
+
+// sendWithDeadline 用写超时发送一条消息,防 half-open 连接下 WriteJSON 无限阻塞
+// (statusProbeTimeout 只约束等待回包,不约束把探针写出去)。超时后复位写 deadline。
+func (c *Client) sendWithDeadline(msg protocol.Message, dur time.Duration) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(dur))
+	defer func() { _ = c.conn.SetWriteDeadline(time.Time{}) }()
 	return c.conn.WriteJSON(msg)
 }
 

@@ -873,8 +873,6 @@ func runExec() {
 	fmt.Print(result)
 }
 
-// runPing 探活远端 watcher。workspace 解析:显式 -w 优先,否则按 cwd 推断,
-// 推断失败则报可用清单退出(与 exec 的折叠逻辑一致)。
 // statusTimeout 是 `relay status` 单条命令的上限(含对中转 status 请求的等待)。
 const statusTimeout = 15 * time.Second
 
@@ -914,7 +912,7 @@ func runStatus() {
 	if rb, ok := b.(*relaybackend.RelayBackend); ok {
 		ctx, cancel := context.WithTimeout(context.Background(), statusTimeout)
 		defer cancel()
-		st, err := rb.Status(ctx)
+		st, err := rb.Status(ctx, watchCfg.ID)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)

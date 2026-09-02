@@ -465,6 +465,18 @@ func (s *Server) DeletePushRelay(streamID string) {
 	delete(s.pushRelay, streamID)
 }
 
+// sendProbe 向某执行方发送一条带写超时的探针(中转测 transit→executor 段)。
+// 写超时兜底,防止 half-open 连接把探针发送卡死在 TCP 层(statusProbeTimeout 同时约束发送与等待)。
+func (s *Server) sendProbe(clientID string, msg protocol.Message, timeout time.Duration) error {
+	s.clientMu.RLock()
+	client, ok := s.clients[clientID]
+	s.clientMu.RUnlock()
+	if !ok {
+		return fmt.Errorf("client not found: %s", clientID)
+	}
+	return client.sendWithDeadline(msg, timeout)
+}
+
 // SendToBinary 向某客户端发送一条 JSON 消息后紧跟一个二进制帧(供流式块透传)。
 func (s *Server) SendToBinary(clientID string, msg protocol.Message, raw []byte) error {
 	s.clientMu.RLock()

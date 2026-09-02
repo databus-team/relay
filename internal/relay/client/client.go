@@ -294,11 +294,16 @@ func (c *Client) handleMessage(msg protocol.Message) {
 	case protocol.MsgPing:
 		// 作为执行方应答中转探针:回响 MsgPong(RequestID 对应入站 MsgPing 的 ID)。
 		// 经发送队列出站(比直写连接安全),镜像 server/client.go 的 MsgPing→MsgPong 写法。
-		c.sendMessage(&protocol.Message{
+		// 用非阻塞投递:发送队列满时丢弃。探针本就允许超时降级(中转把该段标不可用),
+		// 不因探针回包阻塞执行方自身的读写循环(避免 status 风暴挤掉正常心跳/exec 帧)。
+		select {
+		case c.sendCh <- sendMsg{Message: &protocol.Message{
 			Type:      protocol.MsgPong,
 			ID:        uuid.New().String(),
 			RequestID: msg.ID,
-		})
+		}}:
+		default:
+		}
 	case protocol.MsgPong:
 		c.lastPong.Store(timeNow())
 		if msg.RequestID != "" {

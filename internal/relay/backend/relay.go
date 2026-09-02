@@ -616,22 +616,26 @@ func (b *RelayBackend) Ping(ctx context.Context, commandDir, watchID string) err
 	return b.client.Ping(ctx)
 }
 
-// Status 返回中转让位于 watch 的一站式连通性快照:本地→中转(段1,本地 Ping 计时)、
-// 中转→执行方(段2,由中转探针测得)与 本地单程累计;并附各端点版本台账。
+// Status 返回中转让位于 watch 的一站式连通性快照:本地→中纪(段1,本地 Ping 计时)、
+// 中纪→执行方(段2,由中转探针测得)与 本地累计;并附各端点版本台账。
 // 执行方离线/探针超时 → 段2 为空(标不可用),命令仍成功;段2 不可用时累计跟着不可用。
-func (b *RelayBackend) Status(ctx context.Context) (protocol.StatusResponse, error) {
+// watchID 为空时退回后端配置的 watch_id,从而 `relay status -w` 能实际选择被探活的执行方。
+func (b *RelayBackend) Status(ctx context.Context, watchID string) (protocol.StatusResponse, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return protocol.StatusResponse{}, err
 	}
+	if watchID == "" {
+		watchID = b.watchID
+	}
 
-	// 段1:本地→中转 → 本地 Ping 计时(RTT)。
+	// 段1:本地→中转 → 本地 Ping 计时(往返 RTT)。
 	seg1Start := time.Now()
 	if err := b.client.Ping(ctx); err != nil {
 		return protocol.StatusResponse{}, fmt.Errorf("ping transit: %w", err)
 	}
 	seg1 := time.Since(seg1Start).Milliseconds()
 
-	st, err := b.client.Status(ctx, b.watchID)
+	st, err := b.client.Status(ctx, watchID)
 	if err != nil {
 		return protocol.StatusResponse{}, err
 	}

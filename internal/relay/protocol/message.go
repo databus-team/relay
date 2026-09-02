@@ -151,8 +151,10 @@ type VersionResponse struct {
 	Nodes []VersionInfo `json:"nodes"`
 }
 
-// StatusSegment 描述某一跳链路的单向时延。LatencyMS 为 nil 表示该段暂不可用
-// (例如远端执行方离线/未注册),Unavailable 给出断点原因,匹配 `relay status` 的降级语义。
+// StatusSegment 描述某一跳链路的实测时延(往返 RTT):`local→transit` 与 `transit→executor`
+// 各测一次往返并原样记录,`total = seg1 + seg2` 是两段 RTT 之和(读作「总往返」,非单程单跳)。
+// LatencyMS 为 nil 表示该段暂不可用(例如远端执行方离线/未注册),Unavailable 给出断点原因,
+// 匹配 `relay status` 的降级语义。
 type StatusSegment struct {
 	LatencyMS   *int64 `json:"latency_ms,omitempty"` // nil = 该段不可用
 	Unavailable string `json:"unavailable,omitempty"`
@@ -164,9 +166,9 @@ type StatusRequest struct {
 }
 
 // StatusResponse 中转对 MsgStatus 的应答,承接 `relay status` 的一站式连通性+版本台账。
-//   - Seg1:  本地→中转 单程时延(由请求方本地 `Ping` 计时,中转不填)
-//   - Seg2:  中转→执行方 单程时延(由中转探针测得;执行方离线/未注册时标不可用)
-//   - Total: Seg1 + Seg2 的本地单程累计(由请求方累加)
+//   - Seg1:  本地→中转 往返 RTT(由请求方本地 `Ping` 计时,中转不填)
+//   - Seg2:  中转→执行方 往返 RTT(由中转探针测得;执行方离线/未注册时标不可用)
+//   - Total: Seg1 + Seg2 两段 RTT 之和(由请求方累加)
 //   - Nodes: 参与端点版本台账(中转 + 各在线执行方)
 type StatusResponse struct {
 	OK    bool          `json:"ok"`
