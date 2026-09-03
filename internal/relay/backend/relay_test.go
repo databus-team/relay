@@ -48,14 +48,14 @@ func TestEndToEnd_ExecStream(t *testing.T) {
 
 	// 执行方:watch 上注册为 executor,true 触发流式 sh -c 执行
 	if _, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-exe", "watch_id": "test", "watch_dir": ".", "executor": true,
+		"url": wsURL, "token": "tok-exe", "executor_id": "test", "watch_dir": ".", "executor": true,
 	}); err != nil {
 		t.Fatalf("executor backend: %v", err)
 	}
 
 	// 请求方:只发起 exec,不做 executor
 	reqBackend, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+		"url": wsURL, "token": "tok-req", "executor_id": "test", "watch_dir": ".",
 	})
 	if err != nil {
 		t.Fatalf("requester backend: %v", err)
@@ -103,7 +103,7 @@ func TestEndToEnd_ConfigSync(t *testing.T) {
 
 	// 执行方:注册为 executor,config_path 指向要落盘的文件
 	if _, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-exe", "watch_id": "test", "executor": true,
+		"url": wsURL, "token": "tok-exe", "executor_id": "test", "executor": true,
 		"config_path": configPath,
 	}); err != nil {
 		t.Fatalf("executor backend: %v", err)
@@ -111,7 +111,7 @@ func TestEndToEnd_ConfigSync(t *testing.T) {
 
 	// 请求方:走 config-sync 流程
 	reqBackend, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+		"url": wsURL, "token": "tok-req", "executor_id": "test", "watch_dir": ".",
 	})
 	if err != nil {
 		t.Fatalf("requester backend: %v", err)
@@ -144,7 +144,7 @@ func TestEndToEnd_ConfigSync(t *testing.T) {
 	}
 }
 
-// 端到端:config-sync 必须保留执行方身份字段(executor/watch_id),不得被本地协调方
+// 端到端:config-sync 必须保留执行方身份字段(executor/executor_id),不得被本地协调方
 // 配置覆写,否则注册失败。
 func TestEndToEnd_ConfigSyncPreservesExecutorIdentity(t *testing.T) {
 	SetExecutorRole(true)
@@ -163,13 +163,13 @@ func TestEndToEnd_ConfigSyncPreservesExecutorIdentity(t *testing.T) {
 	ctx := context.Background()
 
 	if _, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-exe", "watch_id": "test", "executor": true,
+		"url": wsURL, "token": "tok-exe", "executor_id": "test", "executor": true,
 		"config_path": configPath,
 	}); err != nil {
 		t.Fatalf("executor backend: %v", err)
 	}
 	reqBackend, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+		"url": wsURL, "token": "tok-req", "executor_id": "test", "watch_dir": ".",
 	})
 	if err != nil {
 		t.Fatalf("requester backend: %v", err)
@@ -179,7 +179,7 @@ func TestEndToEnd_ConfigSyncPreservesExecutorIdentity(t *testing.T) {
 		t.Fatalf("requester backend does not implement ConfigSyncCapable")
 	}
 
-	// 推来的本地协调方配置不含 watch_id/executor
+	// 推来的本地协调方配置不含 executor_id/executor
 	payload := []byte("name: relay\nversion: 3\nbackend:\n  type: relay\n  config:\n    url: ws://x:8443/relay\nworkspaces:\n  - id: w\n    paths: [\"*.patch\"]\n")
 	exit, err := cs.ConfigSync(ctx, "", payload)
 	if err != nil {
@@ -222,14 +222,14 @@ func TestEndToEnd_PushJob(t *testing.T) {
 
 	// 执行方:注册为 executor,配 executor_dir,注册 push-job handler
 	if _, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-exe", "watch_id": "test", "executor": true, "executor_dir": execRoot,
+		"url": wsURL, "token": "tok-exe", "executor_id": "test", "executor": true, "executor_dir": execRoot,
 	}); err != nil {
 		t.Fatalf("executor backend: %v", err)
 	}
 	// (handler 由 watcher 注入,直接构造再取下执行方 backend 对象比较麻烦;改为经 client 单测覆盖。)
 
 	reqBackend, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+		"url": wsURL, "token": "tok-req", "executor_id": "test", "watch_dir": ".",
 	})
 	if err != nil {
 		t.Fatalf("requester backend: %v", err)
@@ -278,13 +278,13 @@ func TestEndToEnd_PushNoJobs(t *testing.T) {
 
 	// 执行方:注册为 executor,配 executor_dir。
 	if _, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-exe", "watch_id": "test", "executor": true, "executor_dir": execRoot,
+		"url": wsURL, "token": "tok-exe", "executor_id": "test", "executor": true, "executor_dir": execRoot,
 	}); err != nil {
 		t.Fatalf("executor backend: %v", err)
 	}
 
 	reqBackend, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+		"url": wsURL, "token": "tok-req", "executor_id": "test", "watch_dir": ".",
 	})
 	if err != nil {
 		t.Fatalf("requester backend: %v", err)
@@ -323,12 +323,12 @@ func TestEndEndPushJobLarge(t *testing.T) {
 
 	ctx := context.Background()
 	if _, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-exe", "watch_id": "test", "executor": true, "executor_dir": execRoot,
+		"url": wsURL, "token": "tok-exe", "executor_id": "test", "executor": true, "executor_dir": execRoot,
 	}); err != nil {
 		t.Fatalf("executor backend: %v", err)
 	}
 	reqBackend, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+		"url": wsURL, "token": "tok-req", "executor_id": "test", "watch_dir": ".",
 	})
 	if err != nil {
 		t.Fatalf("requester backend: %v", err)
@@ -369,7 +369,7 @@ func TestEndToEnd_PushJobNoExecutorFallback(t *testing.T) {
 
 	ctx := context.Background()
 	reqBackend, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+		"url": wsURL, "token": "tok-req", "executor_id": "test", "watch_dir": ".",
 	})
 	if err != nil {
 		t.Fatalf("requester backend: %v", err)
@@ -412,7 +412,7 @@ func TestEndToEnd_ExecNoExecutor(t *testing.T) {
 	defer client.CloseAll()
 
 	reqBackend, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+		"url": wsURL, "token": "tok-req", "executor_id": "test", "watch_dir": ".",
 	})
 	if err != nil {
 		t.Fatalf("requester backend: %v", err)
@@ -439,13 +439,13 @@ func TestEndToEnd_Status(t *testing.T) {
 
 	// 执行方:watch 上注册为 executor。
 	if _, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-exe", "watch_id": "test", "watch_dir": ".", "executor": true,
+		"url": wsURL, "token": "tok-exe", "executor_id": "test", "watch_dir": ".", "executor": true,
 	}); err != nil {
 		t.Fatalf("executor backend: %v", err)
 	}
 
 	reqRaw, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+		"url": wsURL, "token": "tok-req", "executor_id": "test", "watch_dir": ".",
 	})
 	if err != nil {
 		t.Fatalf("requester backend: %v", err)
@@ -490,14 +490,14 @@ func TestEndToEnd_Status_MultiExecutor(t *testing.T) {
 
 	for _, wid := range []string{"site-a", "site-b"} {
 		if _, err := NewRelayBackend(map[string]interface{}{
-			"url": wsURL, "token": "tok-exe", "watch_id": wid, "watch_dir": ".", "executor": true,
+			"url": wsURL, "token": "tok-exe", "executor_id": wid, "watch_dir": ".", "executor": true,
 		}); err != nil {
 			t.Fatalf("executor backend %s: %v", wid, err)
 		}
 	}
 
 	reqRaw, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-req", "watch_id": "site-a", "watch_dir": ".",
+		"url": wsURL, "token": "tok-req", "executor_id": "site-a", "watch_dir": ".",
 	})
 	if err != nil {
 		t.Fatalf("requester backend: %v", err)
@@ -530,7 +530,7 @@ func TestEndToEnd_Status_ExecutorOffline(t *testing.T) {
 
 	ctx := context.Background()
 	reqRaw, err := NewRelayBackend(map[string]interface{}{
-		"url": wsURL, "token": "tok-req", "watch_id": "test", "watch_dir": ".",
+		"url": wsURL, "token": "tok-req", "executor_id": "test", "watch_dir": ".",
 	})
 	if err != nil {
 		t.Fatalf("requester backend: %v", err)

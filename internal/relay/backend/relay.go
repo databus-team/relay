@@ -97,8 +97,6 @@ func NewRelayBackend(params map[string]interface{}) (backend.FileTransferBackend
 	}
 	if executorID, ok := params["executor_id"].(string); ok {
 		cfg.ExecutorID = executorID
-	} else if legacy, ok := params["watch_id"].(string); ok { // 过渡期内兼容旧配置键
-		cfg.ExecutorID = legacy
 	}
 	if watchDir, ok := params["watch_dir"].(string); ok {
 		cfg.WatchDir = watchDir
