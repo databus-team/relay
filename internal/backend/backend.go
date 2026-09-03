@@ -46,17 +46,16 @@ type ExecChunk struct {
 	Data   string
 }
 
-// ExecStreamBackend 可选接口:backend 支持流式输出远程执行。
+// ExecStreamBackend 网络层支持流式输出远程执行。
 type ExecStreamBackend interface {
-	// ExecStream 流式执行,onChunk 在每次收到增量输出时回调(nil 可忽略);返回 exit code。
-	// targetWatch 若非空即目标执行方的注册 watch_id(bind 到某 executor 的 workspace 才填);
-	// 空 = 单根回退(默认根 watch)。
-	ExecStream(ctx context.Context, targetWatch, cmd string, cwd string, timeout int, onChunk func(ExecChunk)) (int, error)
+	// ExecStream 流式执行,onChunk 每次收到增量输出帧时回调(nil 可忽略);返回 exit code。
+	// targetExecutor 若非空即目标执行方的节点身份(executor_id);空 = 单根回退(本端身份)。
+	ExecStream(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, onChunk func(ExecChunk)) (int, error)
 }
 
-// PushJobHandler 执行方在文件落地本地后,为某工作区跑 jobs 的处理器。
+// PushJobHandler 执行方在文件落盘本地后,为某工作区跑 jobs 的处理器。
 // out 用于把 job 输出回传请求方;返回 0 表示全部成功,非 0 表示有 job 失败。
-type PushJobHandler func(watchID string, absPath string, out func(ExecChunk)) int
+type PushJobHandler func(executorID string, absPath string, out func(ExecChunk)) int
 
 // PushJobCapable 可选接口:执行方后端可注册「push 文件落地后本地跑 jobs」的回调。
 // 由远端 relay watch 注入,复用其自身的 watch 配置与 job 执行逻辑。
@@ -64,25 +63,25 @@ type PushJobCapable interface {
 	SetPushJobHandler(h PushJobHandler)
 }
 
-// PushJobSender 可选接口：后端把文件直达远端执行方并触发 jobs(relay backend 实现);
+// PushJobSender 可选接口:后端把文件直接送到执行方并触发 jobs(relay backend 实现);
 // 无在线执行方时由中转兜底落地到暂存目录。
-// targetWatch 语义同 ExecStreamBackend(空=单根回退)。
+// targetExecutor 语义同 ExecStreamBackend(空=单根回退)。
 type PushJobSender interface {
-	PushJob(ctx context.Context, targetWatch, relPath string, content []byte, on func(ExecChunk)) (int, error)
+	PushJob(ctx context.Context, targetExecutor, relPath string, content []byte, on func(ExecChunk)) (int, error)
 }
 
-// PushNoJobsSender 可选接口：把文件纯下发到执行方 ddest 绝对路径,但不触发任何
+// PushNoJobsSender 可选接口:把文件纯下发到执行方 dest 绝对路径,但不触发任何
 // workspace job(relay backend 经 client.Transport 的 Jobs=false 通道实现)。
 // 对应 `relay push --no-jobs [--dest <abs>]`(部署二进制等场景)。
 type PushNoJobsSender interface {
-	PushNoJobs(ctx context.Context, targetWatch, dest string, content []byte) (int, error)
+	PushNoJobs(ctx context.Context, targetExecutor, dest string, content []byte) (int, error)
 }
 
-// ConfigSyncCapable 可选接口：后端支持经其原生通道(relay 为 WS 流式)把配置直接同步
-// 到执行端落盘。targetWatch 指定目标执行方的注册 watch_id;空 = 单根回退(本后端自己的 watch)。
+// ConfigSyncCapable 可选接口:后端支持经其原生通道(relay 为 WS 流式)把配置直接同步
+// 到执行端落盘。targetExecutor 指定目标执行方的节点身份(executor_id);空 = 单根回退。
 // runSync 据此决定走流式还是退回通用文件命令交换。
 type ConfigSyncCapable interface {
-	ConfigSync(ctx context.Context, targetWatch string, payload []byte) (int, error) // 返回执行方 apply 的 exit code
+	ConfigSync(ctx context.Context, targetExecutor string, payload []byte) (int, error) // 返回执行方 apply 的 exit code
 }
 
 type BackendFactory func(config map[string]interface{}) (FileTransferBackend, error)

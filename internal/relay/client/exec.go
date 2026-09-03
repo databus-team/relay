@@ -74,15 +74,15 @@ func (c *Client) streamChunkedContent(ctx context.Context, streamID string, tota
 	return nil
 }
 
-// ExecStream 发送执行请求并流式接收输出。onChunk 每次收到增量输出帧时回调(nil 可忽略)。
+// ExecStream 发送命令请求并流式接收输出。onChunk 每次收到增量输出帧时回调(nil 可忽略)。
 // 返回最终 ExecResponse(含聚合 stdout/stderr 与 exit code)。
-// targetWatch 若非空则以它作为请求路由键(目标执行器 watch_id);空则回退到本端根 watch。
-func (c *Client) ExecStream(ctx context.Context, targetWatch, cmd, cwd string, timeout int, onChunk func(protocol.ExecChunk)) (*protocol.ExecResponse, error) {
+// targetExecutor 若非空则以它作为请求路由目标(目标执行方 executor_id);空则回退到本端身份。
+func (c *Client) ExecStream(ctx context.Context, targetExecutor, cmd, cwd string, timeout int, onChunk func(protocol.ExecChunk)) (*protocol.ExecResponse, error) {
 	if timeout <= 0 {
 		timeout = 30
 	}
-	if targetWatch == "" {
-		targetWatch = c.watchID
+	if targetExecutor == "" {
+		targetExecutor = c.id
 	}
 
 	reqID, ch := c.registerInStream()
@@ -92,10 +92,10 @@ func (c *Client) ExecStream(ctx context.Context, targetWatch, cmd, cwd string, t
 		Type: protocol.MsgExec,
 		ID:   reqID,
 		Payload: protocol.ExecRequest{
-			WatchID: targetWatch,
-			Cmd:     cmd,
-			Cwd:     cwd,
-			Timeout: timeout,
+			ExecutorID: targetExecutor,
+			Cmd:        cmd,
+			Cwd:        cwd,
+			Timeout:    timeout,
 		},
 	}
 
@@ -176,10 +176,10 @@ func (c *Client) UpgradeServer(ctx context.Context, content []byte) error {
 		Type: protocol.MsgServerUpgrade,
 		ID:   reqID,
 		Payload: protocol.ServerUpgradeRequest{
-			WatchID:  c.watchID,
-			Size:     total,
-			Digest:   digest,
-			StreamID: streamID,
+			ExecutorID: c.id,
+			Size:       total,
+			Digest:     digest,
+			StreamID:   streamID,
 		},
 	}
 	select {
@@ -197,19 +197,19 @@ func (c *Client) UpgradeServer(ctx context.Context, content []byte) error {
 	_, err := c.execRoundTrip(ctx, ch, nil)
 	return err
 }
-func (c *Client) ConfigSync(ctx context.Context, targetWatch string, payload []byte) (*protocol.ExecResponse, error) {
+func (c *Client) ConfigSync(ctx context.Context, targetExecutor string, payload []byte) (*protocol.ExecResponse, error) {
 	reqID, ch := c.registerInStream()
 	defer c.unregisterInStream(reqID)
 
-	if targetWatch == "" {
-		targetWatch = c.watchID
+	if targetExecutor == "" {
+		targetExecutor = c.id
 	}
 	msg := &protocol.Message{
 		Type: protocol.MsgConfigSync,
 		ID:   reqID,
 		Payload: protocol.ConfigSyncRequest{
-			WatchID: targetWatch,
-			Payload: base64.StdEncoding.EncodeToString(payload),
+			ExecutorID: targetExecutor,
+			Payload:    base64.StdEncoding.EncodeToString(payload),
 		},
 	}
 
@@ -222,11 +222,11 @@ func (c *Client) ConfigSync(ctx context.Context, targetWatch string, payload []b
 }
 
 // PushJob 将文件内容以 64KB 分块流式直达远端执行方并在其项目目录落地触发流式 jobs。
-// 返回最终 ExecResponse(含写入 jobs 输出与 exit code);无在线执行方时由中转兜底暂存。
-// targetWatch 语义同 ExecStream(空=单根回退)。
-func (c *Client) PushJob(ctx context.Context, targetWatch, relPath string, content []byte, onChunk func(protocol.ExecChunk)) (*protocol.ExecResponse, error) {
-	if targetWatch == "" {
-		targetWatch = c.watchID
+// 返回最终 ExecResponse(含写入 jobs 输出与 exit code);无推送时由中转兜底暂存。
+// target 语义同 targetExecutor(空=单根回退)。
+func (c *Client) PushJob(ctx context.Context, targetExecutor, relPath string, content []byte, onChunk func(protocol.ExecChunk)) (*protocol.ExecResponse, error) {
+	if targetExecutor == "" {
+		targetExecutor = c.id
 	}
 	if len(content) == 0 {
 		content = []byte{}
@@ -245,11 +245,11 @@ func (c *Client) PushJob(ctx context.Context, targetWatch, relPath string, conte
 		Type: protocol.MsgPushJob,
 		ID:   reqID,
 		Payload: protocol.PushJobRequest{
-			WatchID:  targetWatch,
-			RelPath:  relPath,
-			Size:     total,
-			Digest:   digest,
-			StreamID: streamID,
+			ExecutorID: targetExecutor,
+			RelPath:    relPath,
+			Size:       total,
+			Digest:     digest,
+			StreamID:   streamID,
 		},
 	}
 
@@ -268,9 +268,9 @@ func (c *Client) PushJob(ctx context.Context, targetWatch, relPath string, conte
 	return c.execRoundTrip(ctx, ch, onChunk)
 }
 
-// Transport 将 content 以流式纯下发(targetWatch 上)写到执行端的绝对路径 dest,
+// Transport 将 content 以流式纯下发(targetExecutor 上)写到执行端的绝对路径 dest,
 // 不触发任何 workspace job(Jobs=false)。返回执行的收尾响应。
-func (c *Client) Transport(ctx context.Context, targetWatch, dest string, content []byte) (*protocol.ExecResponse, error) {
+func (c *Client) Transport(ctx context.Context, targetExecutor, dest string, content []byte) (*protocol.ExecResponse, error) {
 	if len(content) == 0 {
 		content = []byte{}
 	}
@@ -288,12 +288,12 @@ func (c *Client) Transport(ctx context.Context, targetWatch, dest string, conten
 		Type: protocol.MsgPushJob,
 		ID:   reqID,
 		Payload: protocol.PushJobRequest{
-			WatchID:  targetWatch,
-			RelPath:  dest,
-			Size:     total,
-			Digest:   digest,
-			StreamID: streamID,
-			Jobs:     &jobs,
+			ExecutorID: targetExecutor,
+			RelPath:    dest,
+			Size:       total,
+			Digest:     digest,
+			StreamID:   streamID,
+			Jobs:       &jobs,
 		},
 	}
 
@@ -311,16 +311,16 @@ func (c *Client) Transport(ctx context.Context, targetWatch, dest string, conten
 }
 
 // PushJobSession 是一次入站 push-job(执行方视角)的写回句柄。
-// Temp 是流式内容落地的临时文件;执行方处理(writePushedFile)后把最终路径写回 AbsPath。
+// Temp 是流式内容落地的临时文件;执行方落盘后把最终路径写回 AbsPath。
 type PushJobSession struct {
-	client    *Client
-	requestID string
-	WatchID   string
-	RelPath   string
-	Temp      *os.File
-	AbsPath   string
-	Jobs      bool // true=跑 workspace jobs;false=纯传输(RelPath 为绝对落盘路径)
-	seq       atomic.Int64
+	client     *Client
+	requestID  string
+	ExecutorID string
+	RelPath    string
+	Temp       *os.File
+	AbsPath    string
+	Jobs       bool // true=跑 workspace jobs;false=纯传输(RelPath 为绝对落盘路径)
+	seq        atomic.Int64
 }
 
 // Write 写回写输出(流回请求方)。
@@ -378,7 +378,7 @@ func (c *Client) handleInboundPushJob(msg protocol.Message) {
 
 	// Jobs 语义:未携带(nil)=跑 jobs;显式 false=纯传输(不跑 job,落盘后即完成)。
 	jobs := req.Jobs == nil || (req.Jobs != nil && *req.Jobs)
-	sess := &PushJobSession{client: c, requestID: msg.ID, WatchID: req.WatchID, RelPath: req.RelPath, Temp: tmp, Jobs: jobs}
+	sess := &PushJobSession{client: c, requestID: msg.ID, ExecutorID: req.ExecutorID, RelPath: req.RelPath, Temp: tmp, Jobs: jobs}
 	pr := &inboundPushReceive{
 		streamID: req.StreamID,
 		stream:   sess,
@@ -486,11 +486,11 @@ type ExecSession struct {
 	seq       atomic.Int64
 }
 
-// Cmd / Cwd / Timeout / WatchID 返回本次入站请求的命令、工作目录、超时秒数与目标 watch。
-func (e *ExecSession) Cmd() string     { return e.req.Cmd }
-func (e *ExecSession) Cwd() string     { return e.req.Cwd }
-func (e *ExecSession) Timeout() int    { return e.req.Timeout }
-func (e *ExecSession) WatchID() string { return e.req.WatchID }
+// Cmd / Cwd / Timeout / ExecutorID 返回本次入站请求的命令、工作目录、超时秒数与目标执行方。
+func (e *ExecSession) Cmd() string        { return e.req.Cmd }
+func (e *ExecSession) Cwd() string        { return e.req.Cwd }
+func (e *ExecSession) Timeout() int       { return e.req.Timeout }
+func (e *ExecSession) ExecutorID() string { return e.req.ExecutorID }
 
 // SetExecHandler 设置入站 exec 处理回调。设置后,该客户端成为可被中转转发 exec 的执行方。
 func (c *Client) SetExecHandler(fn func(*ExecSession)) {
@@ -503,10 +503,10 @@ func (c *Client) SetExecHandler(fn func(*ExecSession)) {
 func (c *Client) handleInboundExec(msg protocol.Message) {
 	payload, _ := msg.Payload.(map[string]interface{})
 	req := protocol.ExecRequest{
-		WatchID: toString(payload["watch_id"]),
-		Cmd:     toString(payload["cmd"]),
-		Cwd:     toString(payload["cwd"]),
-		Timeout: int(toFloat64(payload["timeout"])),
+		ExecutorID: toString(payload["executor_id"]),
+		Cmd:        toString(payload["cmd"]),
+		Cwd:        toString(payload["cwd"]),
+		Timeout:    int(toFloat64(payload["timeout"])),
 	}
 	if req.Timeout <= 0 {
 		req.Timeout = 30
@@ -531,8 +531,8 @@ type ConfigSyncSession struct {
 	req       protocol.ConfigSyncRequest
 }
 
-func (s *ConfigSyncSession) WatchID() string { return s.req.WatchID }
-func (s *ConfigSyncSession) Payload() string { return s.req.Payload }
+func (s *ConfigSyncSession) ExecutorID() string { return s.req.ExecutorID }
+func (s *ConfigSyncSession) Payload() string    { return s.req.Payload }
 
 // SetConfigSyncHandler 设置入站 config-sync 处理回调。与 SetExecHandler/SetPushJobHandler 同构。
 func (c *Client) SetConfigSyncHandler(fn func(*ConfigSyncSession)) {
@@ -545,8 +545,8 @@ func (c *Client) SetConfigSyncHandler(fn func(*ConfigSyncSession)) {
 func (c *Client) handleInboundConfigSync(msg protocol.Message) {
 	payload, _ := msg.Payload.(map[string]interface{})
 	req := protocol.ConfigSyncRequest{
-		WatchID: toString(payload["watch_id"]),
-		Payload: toString(payload["payload"]),
+		ExecutorID: toString(payload["executor_id"]),
+		Payload:    toString(payload["payload"]),
 	}
 
 	c.configSyncM.RLock()

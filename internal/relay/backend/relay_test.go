@@ -153,7 +153,7 @@ func TestEndToEnd_ConfigSyncPreservesExecutorIdentity(t *testing.T) {
 	watchDir := t.TempDir()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	// seed 一份带执行器身份的运行配置
-	if err := os.WriteFile(configPath, []byte("name: relay\nversion: 2\nbackend:\n  type: relay\n  config:\n    watch_id: test\n    executor: true\n"), 0644); err != nil {
+	if err := os.WriteFile(configPath, []byte("name: relay\nversion: 2\nbackend:\n  type: relay\n  config:\n    executor_id: test\n    executor: true\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	ts, wsURL := newTestHub(t, watchDir)
@@ -200,8 +200,8 @@ func TestEndToEnd_ConfigSyncPreservesExecutorIdentity(t *testing.T) {
 	if cfg.Backend.Config["executor"] != true {
 		t.Errorf("executor identity lost: %#v", cfg.Backend.Config["executor"])
 	}
-	if cfg.Backend.Config["watch_id"] != "test" {
-		t.Errorf("watch_id identity lost: got %v", cfg.Backend.Config["watch_id"])
+	if cfg.Backend.Config["executor_id"] != "test" {
+		t.Errorf("executor_id identity lost: got %v", cfg.Backend.Config["executor_id"])
 	}
 	if v, _ := cfg.Backend.Config["url"].(string); v != "ws://x:8443/relay" {
 		t.Errorf("shared url not overlaid: %v", cfg.Backend.Config["url"])
@@ -466,8 +466,8 @@ func TestEndToEnd_Status(t *testing.T) {
 		t.Fatalf("executors: got %d, want 1: %+v", len(st.Executors), st.Executors)
 	}
 	e := st.Executors[0]
-	if e.WatchID != "test" {
-		t.Errorf("executor watch: got %q, want %q", e.WatchID, "test")
+	if e.ExecutorID != "test" {
+		t.Errorf("executor watch: got %q, want %q", e.ExecutorID, "test")
 	}
 	if e.Seg2.LatencyMS == nil || *e.Seg2.LatencyMS < 0 {
 		t.Errorf("seg2 missing (executor should be online): %+v", e.Seg2)
@@ -513,10 +513,10 @@ func TestEndToEnd_Status_MultiExecutor(t *testing.T) {
 	}
 	for _, e := range st.Executors {
 		if e.Seg2.LatencyMS == nil || *e.Seg2.LatencyMS < 0 {
-			t.Errorf("executor %q seg2 missing: %+v", e.WatchID, e.Seg2)
+			t.Errorf("executor %q seg2 missing: %+v", e.ExecutorID, e.Seg2)
 		}
 		if e.Total.LatencyMS == nil {
-			t.Errorf("executor %q total missing: %+v", e.WatchID, e.Total)
+			t.Errorf("executor %q total missing: %+v", e.ExecutorID, e.Total)
 		}
 	}
 }

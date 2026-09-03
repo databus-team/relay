@@ -252,7 +252,7 @@ func TestHandleConfigSyncPreservesExecutorIdentity(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
 	// seed 一份带执行器身份的运行配置
-	if err := os.WriteFile(configPath, []byte("name: relay\nversion: 2\nbackend:\n  type: relay\n  config:\n    watch_id: site-b\n    executor: true\n"), 0644); err != nil {
+	if err := os.WriteFile(configPath, []byte("name: relay\nversion: 2\nbackend:\n  type: relay\n  config:\n    executor_id: site-b\n    executor: true\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -285,8 +285,8 @@ func TestHandleConfigSyncPreservesExecutorIdentity(t *testing.T) {
 	if cfg.Backend.Config["executor"] != true {
 		t.Errorf("executor identity lost: %#v", cfg.Backend.Config["executor"])
 	}
-	if cfg.Backend.Config["watch_id"] != "site-b" {
-		t.Errorf("watch_id identity lost: got %v", cfg.Backend.Config["watch_id"])
+	if cfg.Backend.Config["executor_id"] != "site-b" {
+		t.Errorf("executor_id identity lost: got %v", cfg.Backend.Config["executor_id"])
 	}
 	if v, _ := cfg.Backend.Config["url"].(string); v != "ws://x:8443/relay" {
 		t.Errorf("shared url not overlaid: %v", cfg.Backend.Config["url"])

@@ -126,23 +126,24 @@ type ExecChunk struct {
 	Data   string `json:"data"`
 }
 
-// RegisterExecutorRequest 向中转注册/注销某 watch 的 executor(远端执行方)。
+// RegisterExecutorRequest 向中转注册/注销某 executor(远端执行方)。executor_id 是执行方的
+// 节点身份(其 backend.config.executor_id),与中转 watch 存储目录是两回事。
 type RegisterExecutorRequest struct {
-	WatchID string `json:"watch_id"`
-	Action  string `json:"action"`            // "add" / "remove"
-	Version string `json:"version,omitempty"` // 执行方 relay 构建版本(用于 relay version 对比)
+	ExecutorID string `json:"executor_id"`
+	Action     string `json:"action"`            // "add" / "remove"
+	Version    string `json:"version,omitempty"` // 执行方 relay 构建版本(用于 relay version 对比)
 }
 
 // VersionInfo 描述部署中一个 relay 节点的构建信息,用于 `relay version` 跨机对比。
 type VersionInfo struct {
-	Role      string `json:"role"`               // "local"|"transit"|"executor"
-	WatchID   string `json:"watch_id,omitempty"` // executor 归属的 watch;其余角色为空
-	Version   string `json:"version"`
-	Commit    string `json:"commit,omitempty"`
-	BuildTime string `json:"build_time,omitempty"`
-	GOOS      string `json:"goos"`
-	GOARCH    string `json:"goarch"`
-	Go        string `json:"go"`
+	Role       string `json:"role"`                  // "local"|"transit"|"executor"
+	ExecutorID string `json:"executor_id,omitempty"` // executor 的节点身份;其余角色为空
+	Version    string `json:"version"`
+	Commit     string `json:"commit,omitempty"`
+	BuildTime  string `json:"build_time,omitempty"`
+	GOOS       string `json:"goos"`
+	GOARCH     string `json:"goarch"`
+	Go         string `json:"go"`
 }
 
 // VersionResponse 中转对 MsgVersion 的应答:本机(transit)构建信息 + 各在线执行方构建信息。
@@ -167,15 +168,15 @@ type StatusSegment struct {
 type StatusRequest struct{}
 
 // ExecutorHealth 中转对单个已注册执行方的体检结果。
-//   - WatchID: 执行方自注册的 watch_id(executor 身份)
-//   - Version: 该执行方的 relay 构建版本
-//   - Seg2:    中→执行方 往返 RTT;执行方离线/探针超时标不可用
-//   - Total:   Seg1(本地→中转)+ Seg2,由请求方在本地累加
+//   - ExecutorID: 执行方的节点身份(executor_id)
+//   - Version:    执行方的 relay 构建版本
+//   - Seg2:       中→执行方 往返 RTT;执行方离线/探针超时标不可用
+//   - Total:      Seg1(本地→中转)+ Seg2,由请求方在本地累加
 type ExecutorHealth struct {
-	WatchID string        `json:"watch_id"`
-	Version string        `json:"version,omitempty"`
-	Seg2    StatusSegment `json:"seg2"`
-	Total   StatusSegment `json:"total,omitempty"`
+	ExecutorID string        `json:"executor_id"`
+	Version    string        `json:"version,omitempty"`
+	Seg2       StatusSegment `json:"seg2"`
+	Total      StatusSegment `json:"total,omitempty"`
 }
 
 // StatusResponse 中转对 MsgStatus 的应答,承接 `relay status` 的一站式连通性+版本台账。
@@ -193,23 +194,24 @@ type StatusResponse struct {
 
 // PushJobRequest push 一个文件直达远端执行方。
 // 这是流式 push 的元数据头:文件内容分块走 MsgStreamData(二进制)/MsgStreamEnd。
-// 默认(Jobs=true)会触发所在 workspace 的 jobs;Jobs=false 时是纯下发传输,执行方
-// 把内容原子写到 RelPath(可为绝对路径,用于部署二进制等)即完成,不跑任何 job。
+// ExecutorID 是目标执行方的节点身份。默认(Jobs=true)会触发所在 workspace 的 jobs;
+// Jobs=false 时是纯下发传输,执行方把内容原子写到 RelPath(可为绝对路径,用于部署二进制等)
+// 即完成,不跑任何 job。
 type PushJobRequest struct {
-	WatchID  string `json:"watch_id"`
-	RelPath  string `json:"rel_path"` // 落盘目标:相对执行方项目根,或 Jobs=false 时的绝对路径
-	Mode     uint32 `json:"mode"`
-	Size     int64  `json:"size"`
-	Digest   string `json:"digest"` // sha256 十六进制,落盘后校验
-	StreamID string `json:"stream_id"`
-	Jobs     *bool  `json:"jobs,omitempty"` // nil/true=跑 jobs(默认);false=纯传输
+	ExecutorID string `json:"executor_id"`
+	RelPath    string `json:"rel_path"` // 落盘目标:相对执行方项目根,或 Jobs=false 时的绝对路径
+	Mode       uint32 `json:"mode"`
+	Size       int64  `json:"size"`
+	Digest     string `json:"digest"` // sha256 十六进制,落盘后校验
+	StreamID   string `json:"stream_id"`
+	Jobs       *bool  `json:"jobs,omitempty"` // nil/true=跑 jobs(默认);false=纯传输
 }
 
 // ConfigSyncRequest 流式 config-sync 载荷:把一份新配置(local 端 ExpandEnv 后、
 // base64 编码)发到远端执行方,由其校验+原子落盘到自身 config_path。单次应答。
 type ConfigSyncRequest struct {
-	WatchID string `json:"watch_id"`
-	Payload string `json:"payload"` // base64 编码的整份配置内容
+	ExecutorID string `json:"executor_id"`
+	Payload    string `json:"payload"` // base64 编码的整份配置内容
 }
 
 // ServerUpgradeRequest 服务器自升级请求:客户端把本地构建的新 relay 二进制经流式
@@ -217,27 +219,27 @@ type ConfigSyncRequest struct {
 // 绝不转发执行方。二进制内容不放入请求头,经 MsgStreamStart/MsgStreamData/MsgStreamEnd
 // 流式帧承载。
 type ServerUpgradeRequest struct {
-	WatchID  string `json:"watch_id"`
-	Size     int64  `json:"size"`
-	Digest   string `json:"digest"` // sha256 十六进制,落盘后校验
-	StreamID string `json:"stream_id"`
+	ExecutorID string `json:"executor_id"`
+	Size       int64  `json:"size"`
+	Digest     string `json:"digest"` // sha256 十六进制,落盘后校验
+	StreamID   string `json:"stream_id"`
 }
 
 // 隧道消息族(经 executor 出网的 SOCKS5 隧道):
-//   - MsgTunnelConnect  本地请求方 → 中转 → executor 的建连请求(携带目标与出口 watch)。
+//   - MsgTunnelConnect  本地请求方 → 中转 → executor 的建连请求(携带目标与出口 executor_id)。
 //   - MsgTunnelData     双向字节流帧。
-//   - MsgTunnelEnd       隧道关闭(任一端断开);另一端收到后关停本地连接。
+//   - MsgTunnelEnd       隧道关闭(任一端断开);另一端触发后关停本地连接。
 //
 // 建连确认(成功/失败)经 MsgResponse/MsgError 回执(以建连消息 ID 作 RequestID),
-// 复用 exec 的转发-回包路径。多 executor 由 TunnelConnectRequest.WatchID 选定出口。
+// 复用 exec 的转发-回包路径。多 executor 由 TunnelConnectRequest.ExecutorID 选定出口。
 type TunnelConnectRequest struct {
-	WatchID  string `json:"watch_id,omitempty"` // 出口 executor 拥有的 watch;空=按 WatchID 推断
-	Target   string `json:"target"`             // 目标主机(域名/IP 字面量)
-	Port     uint16 `json:"port"`               // 目标端口
-	StreamID string `json:"stream_id"`          // 隧道 ID(全局唯一)
+	ExecutorID string `json:"executor_id"`
+	Target     string `json:"target"`    // 目标主机(域名/IP 字面量)
+	Port       uint16 `json:"port"`      // 目标端口
+	StreamID   string `json:"stream_id"` // 隧道 ID(全局唯一)
 }
 
-// TunnelData 双向隧道字节流帧。Data 经 JSON base64 承载(与 ws 流式帧同风味,不走二进制帧)。
+// TunnelData 双向隧道数据帧。Data 经 JSON base64 承载(与 ws 流式帧同风味,不走二进制帧)。
 type TunnelData struct {
 	StreamID string `json:"stream_id"`
 	Data     []byte `json:"data,omitempty"`
@@ -265,14 +267,14 @@ type PullRequest struct {
 	Offset  int64  `json:"offset"`
 }
 
-// ExecRequest 远程执行请求
+// ExecRequest 远程执行请求。ExecutorID 指定在哪个执行方上运行。
 type ExecRequest struct {
-	WatchID string   `json:"watch_id"`
-	Cmd     string   `json:"cmd"`
-	Args    []string `json:"args,omitempty"`
-	Env     []string `json:"env,omitempty"`
-	Cwd     string   `json:"cwd,omitempty"`
-	Timeout int      `json:"timeout"`
+	ExecutorID string   `json:"executor_id"`
+	Cmd        string   `json:"cmd"`
+	Args       []string `json:"args,omitempty"`
+	Env        []string `json:"env,omitempty"`
+	Cwd        string   `json:"cwd,omitempty"`
+	Timeout    int      `json:"timeout"`
 }
 
 // DeleteRequest 删除文件请求

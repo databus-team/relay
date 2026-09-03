@@ -15,8 +15,8 @@ var (
 )
 
 // GetOrConnect 获取(或新建并连接)一个客户端。opts 里可带 WithHeaders 等选项。
-func GetOrConnect(ctx context.Context, url, token, watchID string, opts ...Option) (*Client, error) {
-	key := url + "|" + token + "|" + watchID + "|" + headersKey(getHeader(opts))
+func GetOrConnect(ctx context.Context, url, token, id string, opts ...Option) (*Client, error) {
+	key := url + "|" + token + "|" + id + "|" + headersKey(getHeader(opts))
 
 	poolMu.RLock()
 	c, ok := pool[key]
@@ -37,7 +37,7 @@ func GetOrConnect(ctx context.Context, url, token, watchID string, opts ...Optio
 		c.Disconnect()
 	}
 
-	c, err := New(url, token, watchID, opts...)
+	c, err := New(url, token, id, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("create client: %w", err)
 	}

@@ -119,6 +119,7 @@ transit server's `watch_dir` (the classic watch-and-pull flow) and prints a `[st
 
 - `--no-jobs`: transfer only — deliver the file without triggering the workspace's jobs on the remote executor.
 - `--dest <path>`: override the target destination with an absolute path, bypassing `watch_dir`. Requires `--no-jobs`.
+- `-e/--executor <id>`: address a specific executor directly by its `executor_id` (no workspace binding needed) — mutually exclusive with `-w`. Useful with `--no-jobs`/`--dest` for node-level ops (e.g. binary deploys to an executor that has no bound workspace).
 
 ### pull — Download File
 
@@ -145,7 +146,7 @@ Lists files in the watch's remote `watch_dir` with size and modification time.
 relay exec -w web-app-patches "npm run build"
 ```
 
-Forwards a command to the remote side for execution. Requires a backend that supports `Exec` (local, fs_mcp, relay). The `-w` flag sets the working directory to the watch's `local_dir`. When omitted, `-w` is inferred from the cwd when it can be; otherwise `exec` falls back to its no-workspace behavior.
+Forwards a command to the remote side for execution. Requires a backend that supports `Exec` (local, fs_mcp, relay). The `-w` flag sets the working directory to the watch's `local_dir`. When omitted, `-w` is inferred from the cwd when it can be; otherwise `exec` falls back to its no-workspace behavior. Use `-e/--executor <id>` to address a specific executor by its `executor_id` directly (no workspace), rather than going through a workspace's bound executor.
 
 With the **relay** backend, output is **streamed back in real time** (stdout/stderr appear as the remote command runs, e.g. build logs and `tail -f`), and the local exit code mirrors the remote command's exit code. The relay server only forwards the request to the remote executor — if none is registered for the watch, `exec` errors. See [Transparent forwarding](#relay-backend-configuration).
 
@@ -171,11 +172,11 @@ Removes stale `cmd-*.json` and `result-*.json` files from the remote `command_di
 Push the unified config to a running remote watcher (executor) without restarting it. Because all three endpoints share one `config.yaml`, syncing the file brings the executor's `backend`/`watch`/`jobs` up to date; the transit server re-reads the same file on restart. Under a **relay** backend, sync streams the config straight to the executor over the WebSocket (no transit file staging).
 
 ```bash
-relay sync -c ~/.relay/config.yaml              # target = this config's backend.watch_id (single-root default)
-relay sync -c ~/.relay/config.yaml -e site-b     # target a specific executor by its watch_id (multi-executor)
+relay sync -c ~/.relay/config.yaml              # target = this config's backend.executor_id (single-root default)
+relay sync -c ~/.relay/config.yaml -e site-b     # target a specific executor by its executor_id (multi-executor)
 ```
 
-- `--executor/-e <watch_id>`: target a specific executor (e.g. push the shared config to `site-b` when several executors share one transit). Empty / omitted = sink the requester's own `backend.watch_id` (single-root fallback), same as `exec`/`push`.
+- `--executor/-e <executor_id>`: target a specific executor's node identity (e.g. push the shared config to `site-b` when several executors share one transit). Empty / omitted = fall back to the requester's own `backend.executor_id` (single-root), same as `exec`/`push`.
 - The synced file is validated on the executor and written to its `config_path` (default `~/.relay/config.yaml`); `relay watch` picks it up on the next cycle.
 
 **How it works:**
@@ -223,7 +224,7 @@ workspaces:
   - id: web-app-patches
     watch_dir: web-app/patches
     ttl: 30m
-    # executor: site-a            # 绑定到这台 executor(值=其 backend.config.watch_id);留空=单根
+    # executor: site-a            # 绑定到这台 executor(值=其 backend.config.executor_id);留空=单根
 ```
 
 The legacy standalone `server.yaml` (top-level `addr`/`watch`/`auth`/`tls`) is still accepted via `--server-config` for backward compatibility. Environment variables (`$VAR`, `${VAR}`) are expanded in all string values.
@@ -237,17 +238,18 @@ pushes the relay binary to your deployment.
   `relay status`), probing each one's OS/arch, cross-compiling, and pushing via
   `relay push --no-jobs --dest`. Offline executors are skipped (they can't receive a push anyway).
   With `RESTART=1` it then detached-swaps and restarts each executor and verifies **each** one has
-  switched to the new commit (per-`watch_id` check in `relay status --json`).
+  switched to the new commit (per-`executor_id` check in `relay status --json`).
 - Narrow the target set with `RELAY_EXECUTORS`, a comma/space-separated list of executor
-  `watch_id`s (only ones that are online are deployed):
+  `executor_id`s (only ones that are online are deployed):
   ```bash
   RESTART=1 RELAY_EXECUTORS="site-a,site-b" make deploy-remote
   ```
 - **`make deploy-transit`** / **`make deploy`** additionally deploys the transit via the
   `server-remote` self-upgrade channel (see below).
 
-`make deploy-remote` locates each executor through a config workspace bound to it
-(`workspaces[].executor == <watch_id>`); executors with no bound workspace are skipped.
+`make deploy-remote` addresses each executor directly by its `executor_id`
+(`relay exec --executor <id>` / `relay push --no-jobs --executor <id>`) — node-identity routing, so no
+`workspaces[].executor` binding is needed; executors with no bound workspace (e.g. extranet) are deployed too.
 
 ### server-remote — One-Click Transit Upgrade
 
@@ -341,13 +343,13 @@ Whitelist is enforced **executor-side** and **deny by default**; an empty/missin
 every tunnel connect.
 
 ```sh
-relay tunnel --listen 127.0.0.1:1080 --watch site-a   # egress via executor site-a
+relay tunnel --listen 127.0.0.1:1080 --executor site-a   # egress via executor site-a
 curl --socks5-hostname 127.0.0.1:1080 http://intra.a.internal/ping
 ```
 
-- `--watch` selects the egress executor by the **executor's server watch id** (the `executor watch=...`
-  shown by `relay status`) — required. Unlike `exec`/`push` whose `-w` is a local workspace that
-  gets mapped to the connection's watch id, the tunnel selector is passed straight through to the transit.
+- `--executor` (`-w` alias) selects the egress executor by its node identity **executor_id** (the
+  `executors[].executor_id` shown by `relay status --json`) — required. It is passed straight through to the
+  transit and routed to the target executor by executor_id (no workspace mapping).
 - Default bind is loopback `127.0.0.1`; binding a non-loopback address prints a loud warning (no auth).
 - Server must enable the tunnel channel (`tunnel_enabled: true` in the `server:` section); otherwise
   tunnel requests are rejected.
@@ -361,8 +363,8 @@ list every online executor per watch so you can see which egresses are available
 
 ```sh
 # executor M1 (watch site-a) and M2 (watch site-b) both online on the same transit
-relay tunnel --listen 127.0.0.1:1080 --watch site-a   # egress M1
-relay tunnel --listen 127.0.0.1:1081 --watch site-b   # egress M2, independent
+relay tunnel --listen 127.0.0.1:1080 --executor site-a   # egress M1
+relay tunnel --listen 127.0.0.1:1081 --executor site-b   # egress M2, independent
 
 curl --socks5-hostname 127.0.0.1:1080 http://a-intra.pvt/00
 curl --socks5-hostname 127.0.0.1:1081 https://b-intra.pvt/api
@@ -370,7 +372,7 @@ curl --socks5-hostname 127.0.0.1:1081 https://b-intra.pvt/api
 
 **`network_allow` is per-executor.** Each executor's `backend.config` carries the allowlist for the
 egress it may reach. In a multi-executor deployment put each executor's own whitelist in that executor's
-config (so `relay tunnel --watch site-a` is gated by site-a's allowlist, `--watch site-b` by site-b's).
+config (so `relay tunnel --executor site-a` is gated by site-a's allowlist, `--executor site-b` by site-b's).
 Format: `host|IP|CIDR[@port]` — `@` port is optional (`443`, `80,443`, `8000-9000`); missing `@` = any port.
 The transit and local CLI never need `network_allow`; only the executor enforces it.
 
@@ -398,7 +400,7 @@ backend:
   config:
     url: "wss://server:8443/relay"     # WebSocket URL
     token: "${RELAY_TOKEN}"            # authentication token
-    watch_id: web-app-patches          # watch ID to subscribe to on server
+    executor_id: web-app-patches       # 此执行方的节点身份(executor_id);被 relay exec/push/... 按此路由
     watch_dir: .                       # remote directory (relative to server's watch dir)
     command_dir: /tmp/relay-commands   # command directory for config hot-reload
 ```
@@ -407,10 +409,10 @@ backend:
 |-------|-------------|
 | `url` | WebSocket URL (`ws://` or `wss://`) |
 | `token` | Auth token (must match server config) |
-| `watch_id` | Server-side watch ID to subscribe to |
+| `executor_id` | 此执行方的节点身份(executor_id);`relay exec/push/sync/tunnel` 按它路由到该节点 |
 | `watch_dir` | Remote directory path (relative to server's watch dir) |
 | `command_dir` | Shared directory for config sync commands |
-| `executor` | 仅在 `relay watch`(执行方进程)生效:注册为 `watch_id` 的执行方以接收经中转转发的 `relay exec` / `relay push`。本地 CLI(exec/push/sync)不读取此字段,故同一份配置可与远端共用 |
+| `executor` | 仅在 `relay watch`(执行方进程)生效:注册为 `executor_id` 的执行方以接收经中转转发的 `relay execute` / `relay push`。本地 CLI(exec/push/sync)不读取此字段,故同一份配置可与远端共用 |
 | `executor_dir` | push 时执行方把文件落到该目录(默认进程当前目录),作为远端项目根;`relay exec` 在本地执行(| Exec 时的工作目录用请求的 cwd) |
 
 **Transparent forwarding (transit server only):** The relay server is a pure transparent forwarder — it **never** executes commands itself. When
@@ -451,7 +453,7 @@ The relay server configuration (addr / watch_root / auth / tls) lives in the `se
 | `workspaces[].paths` | Array of glob patterns to match files |
 | `workspaces[].jobs` | Actions to execute when file matches |
 | `workspaces[].auto_cleanup` | Delete remote file after all jobs succeed (default: false) |
-| `workspaces[].executor` | Bind this workspace to an executor's `backend.config.watch_id` (empty = single-root fallback) |
+| `workspaces[].executor` | Bind this workspace's jobs to an executor's `executor_id` (empty = single-root fallback) |
 | `interval_seconds` | Watch poll interval (default: 60, ignored in event-driven mode) |
 
 ## File Cleanup

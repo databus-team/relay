@@ -35,11 +35,11 @@ backend:
     # headers:                          # 可选:WebSocket 握手携带的 HTTP 头(中转前置鉴权)
     #   Cookie: "code-server-session=..."
     #   X-Api-Key: ${RELAY_API_KEY}
-    watch_id: web-app-patches          # subscribe to this watch on server
+    executor_id: web-app-patches          # 此执行方的节点身份(executor_id);被 relay exec/push/... 按此路由
     watch_dir: .                       # remote watch directory (relative to server's watch dir)
     command_dir: /tmp/relay-commands   # shared command directory for hot-reload
     # executor: true                    # 声明本配置对应的执行方角色:
-    #                                    # 仅在 relay watch(执行方进程)侧生效——注册为 watch_id 的执行方,
+    #                                    # 仅在 relay watch(执行方进程)侧生效——注册为 executor_id 的执行方,
     #                                    # 接收经中转转发的 relay exec / relay push 并本地执行。
     #                                    # 本地 CLI(relay exec / relay push / relay sync)不读取此字段:
     #                                    # 即便同一份配置带 executor: true,本地 exec 仍透明转发到远端执行方,
@@ -58,7 +58,7 @@ workspaces:
   - id: web-app-patches
     watch_dir: .                       # relative to server's watch_root (server) and remote dir (client)
     local_dir: /path/to/local/repo
-    # 绑定执行器:该 workspace 的 jobs 由这台 executor 执行,值 = executor 侧 backend.config.watch_id
+    # 绑定执行器:该 workspace 的 jobs 由这台 executor 执行,值 = executor 侧 backend.config.executor_id
     # (即 `relay status` 里 `executor watch=...`)。留空 = 单根回退(支持单执行器/默认场景)。
     # executor: site-a
     paths: ["*.patch"]

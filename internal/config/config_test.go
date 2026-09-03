@@ -86,7 +86,7 @@ backend:
   type: relay
   config:
     url: "wss://t:8443/relay"
-    watch_id: patches
+    executor_id: patches
 
 workspaces:
   - id: patches
@@ -140,7 +140,7 @@ backend:
   config:
     url: ws://transit:8443/relay
     token: tok
-    watch_id: site-b
+    executor_id: site-b
     executor: true
     executor_dir: /remote/proj
     network_allow:
@@ -174,8 +174,8 @@ workspaces:
 		}
 		m := unmarshalMap(t, merged)
 		got := m["backend"].(map[string]interface{})["config"].(map[string]interface{})
-		if got["watch_id"] != "site-b" {
-			t.Errorf("watch_id = %v (want preserved site-b)", got["watch_id"])
+		if got["executor_id"] != "site-b" {
+			t.Errorf("watch_id = %v (want preserved site-b)", got["executor_id"])
 		}
 		if got["executor"] != true {
 			t.Errorf("executor = %v (want preserved true)", got["executor"])
@@ -205,7 +205,7 @@ workspaces:
 		stdin := `backend:
   config:
     executor: false
-    watch_id: shadow
+    executor_id: shadow
 `
 		dir := t.TempDir()
 		p := dir + "/config.yaml"
@@ -220,8 +220,8 @@ workspaces:
 		if got["executor"] != true {
 			t.Errorf("executor = %v (want base true)", got["executor"])
 		}
-		if got["watch_id"] != "site-b" {
-			t.Errorf("watch_id = %v (want base site-b)", got["watch_id"])
+		if got["executor_id"] != "site-b" {
+			t.Errorf("watch_id = %v (want base site-b)", got["executor_id"])
 		}
 	})
 
@@ -232,7 +232,7 @@ workspaces:
 			t.Fatal(err)
 		}
 		m := unmarshalMap(t, merged)["backend"].(map[string]interface{})["config"].(map[string]interface{})
-		if _, ok := m["watch_id"]; ok {
+		if _, ok := m["executor_id"]; ok {
 			t.Errorf("watch_id should be absent (identity not invented)")
 		}
 		if m["url"] != "ws://newhost:8443/relay" {
@@ -257,7 +257,7 @@ workspaces:
 		}
 		m := unmarshalMap(t, merged)
 		cfg := m["backend"].(map[string]interface{})["config"].(map[string]interface{})
-		if cfg["executor"] != true || cfg["watch_id"] != "site-b" {
+		if cfg["executor"] != true || cfg["executor_id"] != "site-b" {
 			t.Errorf("identity not preserved: %v", cfg)
 		}
 		if len(m["workspaces"].([]interface{})) != 1 {

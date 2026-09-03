@@ -226,27 +226,27 @@ func (c *Client) handleDelete(msg protocol.Message) {
 	c.SendResponse(msg.ID, nil)
 }
 
-// forwardToExecutor 把到达中转的请求原样透明转发给该 watch 的已注册执行方。
-// 执行方按 watch_id 动态注册(不依赖 watch 存储白名单),此处只按 watch_id 解析当前在线执行方:
-// 找到 → 记录请求方归属(供返回值流原路返回)→ 原样转发(保留 msg.ID 作关联)。
-// 无执行方或转发失败时回执错误——任一 watch 无执行方即失败,不透传暂存。
+// forwardToExecutor 把到达中转的请求原样透明转发给目标已注册执行方。
+// 执行方按 executor_id 动态注册(不依赖 watch 存储白名单),此处只按 executor_id 解析当前
+// 在线执行方:找到 → 记录请求方归属(供返回值流原路返回)→ 原样转发(保留 msg.ID 作关联)。
+// 无执行方或转发失败时回执错误——任一目标无执行方即失败,不透传暂存。
 func (c *Client) forwardToExecutor(msg protocol.Message) {
 	payload, _ := msg.Payload.(map[string]interface{})
-	watchID := toString(payload["watch_id"])
+	executorID := toString(payload["executor_id"])
 
-	executorID, ok := c.server.GetExecutor(watchID)
+	outID, ok := c.server.GetExecutor(executorID)
 	if !ok {
-		c.SendError(msg.ID, "no executor registered for watch '"+watchID+"'")
+		c.SendError(msg.ID, "no executor registered for executor_id '"+executorID+"'")
 		return
 	}
 
 	c.server.SetReqOwner(msg.ID, c.id)
-	if err := c.server.SendTo(executorID, msg); err != nil {
+	if err := c.server.SendTo(outID, msg); err != nil {
 		c.server.ClearReqOwner(msg.ID)
 		c.SendError(msg.ID, "executor unavailable: "+err.Error())
 		return
 	}
-	log.Printf("[exec] relay watch=%s -> executor %s type=%s", watchID, executorID, msg.Type)
+	log.Printf("[exec] relay executor=%s -> conn %s type=%s", executorID, outID, msg.Type)
 }
 
 // handleExec 处理执行请求。纯透明转发给该 watch 的已注册执行方。
@@ -380,31 +380,31 @@ func selfCheckBinary(ctx context.Context, binPath string) error {
 	return nil
 }
 
-// handleRegisterExecutor 处理执行方注册/注销。执行方 watch_id 由执行方自声明并动态注册,
+// handleRegisterExecutor 处理执行方注册/注销。executor_id 由执行方自声明并动态注册,
 // 不要求预存在 server 的 watch 白名单——server 只是路由层,任一台持有合法 token 的执行方都能
-// 声明自己的 watch 身份接入(与文件存储所用的 watch 目录是两回事)。
+// 声明自己的节点身份接入(与文件存储所用的 watch 目录是两回事)。
 func (c *Client) handleRegisterExecutor(msg protocol.Message) {
 	payload, _ := msg.Payload.(map[string]interface{})
-	watchID := toString(payload["watch_id"])
+	executorID := toString(payload["executor_id"])
 	action := toString(payload["action"])
 	version := toString(payload["version"])
 
 	switch action {
 	case "add", "":
-		prev, replaced := c.server.RegisterExecutor(watchID, c.id, version)
+		prev, replaced := c.server.RegisterExecutor(executorID, c.id, version)
 		if replaced {
-			log.Printf("[executor] watch=%s replaced previous executor %s by %s (v=%s)", watchID, prev, c.id, version)
+			log.Printf("[executor] executor=%s replaced previous executor %s by %s (v=%s)", executorID, prev, c.id, version)
 		} else {
-			log.Printf("[executor] watch=%s registered executor %s (v=%s)", watchID, c.id, version)
+			log.Printf("[executor] executor=%s registered executor %s (v=%s)", executorID, c.id, version)
 		}
 	case "remove":
-		c.server.UnregisterExecutor(watchID, c.id)
-		log.Printf("[executor] watch=%s unregistered executor %s", watchID, c.id)
+		c.server.UnregisterExecutor(executorID, c.id)
+		log.Printf("[executor] executor=%s unregistered executor %s", executorID, c.id)
 	default:
 		c.SendError(msg.ID, "invalid action")
 		return
 	}
-	c.SendResponse(msg.ID, map[string]interface{}{"ok": true, "watch_id": watchID, "executor": c.id})
+	c.SendResponse(msg.ID, map[string]interface{}{"ok": true, "executor_id": executorID, "executor": c.id})
 }
 
 // handleTunnelConnect 处理隧道建连请求:校验隧道通道、按出口 watch 解析执行方,登记隧道
@@ -425,33 +425,33 @@ func (c *Client) handleTunnelConnect(msg protocol.Message) {
 		c.SendError(msg.ID, "tunnel: missing stream_id")
 		return
 	}
-	if req.WatchID == "" {
-		c.SendError(msg.ID, "tunnel: missing watch_id")
+	if req.ExecutorID == "" {
+		c.SendError(msg.ID, "tunnel: missing executor_id")
 		return
 	}
 
-	executorID, ok := c.server.GetExecutor(req.WatchID)
+	outID, ok := c.server.GetExecutor(req.ExecutorID)
 	if !ok {
-		log.Printf("[tunnel] deny connect watch=%s stream=%s from %s: no online executor", req.WatchID, req.StreamID, c.id)
-		c.SendError(msg.ID, fmt.Sprintf("no online executor for watch %q", req.WatchID))
+		log.Printf("[tunnel] deny connect executor=%s stream=%s from %s: no online executor", req.ExecutorID, req.StreamID, c.id)
+		c.SendError(msg.ID, fmt.Sprintf("no online executor for %q", req.ExecutorID))
 		return
 	}
 
-	if !c.server.registerTunnel(req.StreamID, c.id, executorID) {
-		log.Printf("[tunnel] reject connect watch=%s stream=%s from %s: tunnel budget exhausted", req.WatchID, req.StreamID, c.id)
+	if !c.server.registerTunnel(req.StreamID, c.id, outID) {
+		log.Printf("[tunnel] reject connect executor=%s stream=%s from %s: tunnel budget exhausted", req.ExecutorID, req.StreamID, c.id)
 		c.SendError(msg.ID, "tunnel: too many concurrent tunnels")
 		return
 	}
 
 	// 记录请求方归属,供执行方回流(建连确认)原路返回。
 	c.server.SetReqOwner(msg.ID, c.id)
-	if err := c.server.SendTo(executorID, msg); err != nil {
+	if err := c.server.SendTo(outID, msg); err != nil {
 		c.server.ClearReqOwner(msg.ID)
 		c.server.deleteTunnel(req.StreamID)
 		c.SendError(msg.ID, "executor unavailable: "+err.Error())
 		return
 	}
-	log.Printf("[tunnel] open watch=%s stream=%s requester=%s -> executor=%s", req.WatchID, req.StreamID, c.id, executorID)
+	log.Printf("[tunnel] open executor=%s stream=%s requester=%s -> conn=%s", req.ExecutorID, req.StreamID, c.id, outID)
 }
 
 // handleTunnelData 双向字节流帧:按 streamID 在中转两侧原样透传(不落盘/不解释/不聚合 R3)。
@@ -500,7 +500,7 @@ func (c *Client) handleTunnelEnd(msg protocol.Message) {
 	_ = c.server.SendTo(target, msg)
 }
 
-// versionLedger 组装端点版本台账:中转端 + 各 endpoint 在线执行方,每端按 watch 排序便于对比。
+// versionLedger 组装端点版本台账:中转端 + 各在线执行方,按 executor_id 排序便于对比。
 func (c *Client) versionLedger() []protocol.VersionInfo {
 	nodes := []protocol.VersionInfo{{
 		Role:      "transit",
@@ -511,14 +511,14 @@ func (c *Client) versionLedger() []protocol.VersionInfo {
 		GOARCH:    runtime.GOARCH,
 		Go:        runtime.Version(),
 	}}
-	for watchID, ver := range c.server.ExecutorVersions() {
+	for eid, ver := range c.server.ExecutorVersions() {
 		nodes = append(nodes, protocol.VersionInfo{
-			Role:    "executor",
-			WatchID: watchID,
-			Version: ver,
+			Role:       "executor",
+			ExecutorID: eid,
+			Version:    ver,
 		})
 	}
-	sort.SliceStable(nodes[1:], func(i, j int) bool { return nodes[i+1].WatchID < nodes[j+1].WatchID })
+	sort.SliceStable(nodes[1:], func(i, j int) bool { return nodes[i+1].ExecutorID < nodes[j+1].ExecutorID })
 	return nodes
 }
 
@@ -540,29 +540,29 @@ func (c *Client) handleStatus(msg protocol.Message) {
 		return
 	}
 
-	watchIDs := make([]string, 0, len(endpoints))
-	for wid := range endpoints {
-		watchIDs = append(watchIDs, wid)
+	executorIDs := make([]string, 0, len(endpoints))
+	for eid := range endpoints {
+		executorIDs = append(executorIDs, eid)
 	}
-	sort.Strings(watchIDs)
+	sort.Strings(executorIDs)
 
-	results := make([]protocol.ExecutorHealth, len(watchIDs))
+	results := make([]protocol.ExecutorHealth, len(executorIDs))
 	// 各执行方独立连接,并发探针互不争用同一连接的写锁。回包等待放 goroutine,
-	// 避免阻塞请求方连接的读循环(读循环是这台连接的唯一读者,若在此同步阻塞,该连接上
+	// 避免阻塞请求方连接的读循环(读循环是这台连接的唯一读者,若在此同步等待,该连接上
 	// 其它入站帧——心跳/exec 回包/文件事件——都会被堵住)。连接断开时 `c.closeCh` 关闭,
-	// 各等待方由 defer 清 pending 直接返回,不必等满超时。
+	// 各等待方由 defer 关 pending 直接返回,不必等满超时。
 	go func() {
 		var wg sync.WaitGroup
-		for i, wid := range watchIDs {
-			i, wid := i, wid // loop 变量捕获
-			ep := endpoints[wid]
+		for i, eid := range executorIDs {
+			i, eid := i, eid // loop 变量捕获
+			ep := endpoints[eid]
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				results[i] = protocol.ExecutorHealth{
-					WatchID: wid,
-					Version: ep.Version,
-					Seg2:    c.probeExecutor(ep.ClientID),
+					ExecutorID: eid,
+					Version:    ep.Version,
+					Seg2:       c.probeExecutor(ep.ClientID),
 				}
 			}()
 		}
@@ -629,11 +629,11 @@ func (c *Client) maybeResolvePending(msg protocol.Message) bool {
 
 // handlePushJob 处理流式 push-job 请求:有在线执行方则把元数据头转发给执行方,
 // 并登记其执行方 streamID 供后续内容帧透传;无执行方时回退为「中根本发暂存流式接收」。
-// 执行方段按 watch_id 动态路由,不要求 watch 存储目录;仅当无执行方、需回退到磁盘暂存时,
-// 才要求该 watch 有目录(没有就明确报「无此 watch 目录」)。
+// 执行方段按 executor_id 动态路由,不要求 watch 存储目录;仅当无执行方、需回退到磁盘暂存时,
+// 才要求该 id 对应一个 watch 目录(没有就明确报「无此 watch 目录」)。
 func (c *Client) handlePushJob(msg protocol.Message) {
 	payload, _ := msg.Payload.(map[string]interface{})
-	watchID := toString(payload["watch_id"])
+	executorID := toString(payload["executor_id"])
 	relPath := toString(payload["rel_path"])
 	streamID := toString(payload["stream_id"])
 
@@ -642,23 +642,24 @@ func (c *Client) handlePushJob(msg protocol.Message) {
 		return
 	}
 
-	if executorID, ok := c.server.GetExecutor(watchID); ok {
+	if outID, ok := c.server.GetExecutor(executorID); ok {
 		c.server.SetReqOwner(msg.ID, c.id)
-		c.server.SetPushRelay(streamID, pushRelayInfo{executorID: executorID, reqID: msg.ID, requesterID: c.id})
-		if err := c.server.SendTo(executorID, msg); err != nil {
+		c.server.SetPushRelay(streamID, pushRelayInfo{executorID: outID, reqID: msg.ID, requesterID: c.id})
+		if err := c.server.SendTo(outID, msg); err != nil {
 			c.server.ClearReqOwner(msg.ID)
 			c.server.DeletePushRelay(streamID)
 			c.SendError(msg.ID, "executor unavailable: "+err.Error())
 			return
 		}
-		log.Printf("[push] watch=%s relay -> executor %s stream=%s", watchID, executorID, streamID)
+		log.Printf("[push] executor=%s relay -> conn %s stream=%s", executorID, outID, streamID)
 		return
 	}
 
-	// 无执行方:退回中转暂存,必须存在磁盘 watch 目录。
-	dir, ok := c.server.GetWatchDir(watchID)
+	// 无执行方:退回中转暂存,必须存在磁盘 watch 目录。目录 id 已按 workspace 绑定,与
+	// executor_id 解耦;此处仅在找不到执行方的回退场景下,借 executor_id 兼作目录查找。
+	dir, ok := c.server.GetWatchDir(executorID)
 	if !ok {
-		c.SendError(msg.ID, "no executor and no watch dir for '"+watchID+"'")
+		c.SendError(msg.ID, "no executor and no watch dir for '"+executorID+"'")
 		return
 	}
 	fullPath := safePath(dir, relPath)

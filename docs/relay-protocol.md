@@ -355,8 +355,8 @@ relay 二进制复用既有流式分块 + sha256 摘要交付，**仅由中转�
 ```go
 // Client → Server: 服务器自升级请求(元数据头;二进制内容走流式 MsgStreamData/MsgStreamEnd)
 type ServerUpgradeRequest struct {
-    WatchID  string `json:"watch_id"`   // 归属 watch(信息性)
-    Size     int64  `json:"size"`       // 二进制字节数
+    ExecutorID string `json:"executor_id"` // 归属(信息性)
+    Size       int64  `json:"size"`        // 二进制字节数
     Digest   string `json:"digest"`     // sha256 十六进制,落盘后校验
     StreamID string `json:"stream_id"`  // 本升级流 ID
 }
@@ -412,8 +412,8 @@ type StatusSegment struct {
 }
 
 type ExecutorHealth struct {
-    WatchID string        `json:"watch_id"`          // 执行方自注册的 watch_id(身份)
-    Version string        `json:"version,omitempty"` // 执行方构建版本(含 commit)
+    ExecutorID string        `json:"executor_id"` // 执行方自注册的 executor_id(节点身份)
+    Version    string        `json:"version,omitempty"` // 执行方构建版本(含 commit)
     Seg2    StatusSegment `json:"seg2"`              // 中转→执行方 往返 RTT(离线/超时=不可用)
     Total   StatusSegment `json:"total,omitempty"`   // Seg1 + Seg2(请求方累加)
 }
@@ -440,12 +440,12 @@ CONNECT 目标的访问经中转转发到所选 executor 的网络出口。**出
 executor 侧强制,**默认拒绝**;空/缺省 `network_allow` 拒绝一切建连(fail-closed)。
 
 ```go
-// 建连请求(携带出口 watch 与目标)。成功/失败经 MsgResponse/MsgError(以建连消息 ID 作 RequestID)回执。
+// 建连请求(携带出口 executor_id 与目标)。成功/失败经 MsgResponse/MsgError(以建连消息 ID 作 RequestID)回执。
 type TunnelConnectRequest struct {
-    WatchID  string `json:"watch_id,omitempty"` // 出口 executor 拥有的 watch;多 executor 按此路由
-    Target   string `json:"target"`             // 目标主机(域名/IP 字面量)
-    Port     uint16 `json:"port"`               // 目标端口
-    StreamID string `json:"stream_id"`          // 隧道 ID(全局唯一)
+    ExecutorID string `json:"executor_id"` // 出口 executor 的节点身份;按此路由
+    Target     string `json:"target"`      // 目标主机(域名/IP 字面量)
+    Port       uint16 `json:"port"`        // 目标端口
+    StreamID   string `json:"stream_id"`   // 隧道 ID(全局唯一)
 }
 
 type TunnelData struct { StreamID string `json:"stream_id"`; Data []byte `json:"data,omitempty"` }
@@ -471,14 +471,14 @@ type TunnelEnd  struct { StreamID string `json:"stream_id"`; Reason string `json
 
 ### 4.10 多 executor 与工作区隧道选择
 
-一台中转可同时挂载**多台**远端 executor(每台各自独立的 watch_id)。执行方的 watch_id 由执行方自声明并
-**动态注册**(`MsgRegisterExecutor`),不要求预先出现在中转 watch 白名单——中转只是路由层。`relay status` /
-版本台账按 watch 逐条展示每台在线执行方及其构建版本,用户据此得知有哪些出口可选。`relay exec` / `relay push`
-在选定 workspace 后,按该 workspace 的 `executor:` 字段取其目标执行方的 watch_id 作为路由键;`relay tunnel
---watch` 的取值同样直接是**执行方注册的服务端 watch_id**(见 `relay status` 的 `executors[]`),这与
-`relay exec` / `relay push` 的 `-w`(工作区名,client 端再映射到目标执行方 watch_id)语义不同、也不做
-cwd 推断,`--watch` 必填。`relay status` 不需要 `-w`:它报告整座部署。多台 executor 同时在线时,本地可并排多条 `relay tunnel`(不同 `--listen` 端口、各自
-`--watch`),分别经各自执行器访问各自内网白名单目标,互不干扰(一台不影响其它)。
+一台中转可同时挂载**多台**远端 executor(每台各自独立的 executor_id)。执行方的 executor_id 由执行方自声明并
+**动态注册**(`MsgRegisterExecutor`),不要求预先出现在中转 watch 白名单——中转只是路由层。`relay status`
+与版本台账按 executor 逐条列出所有在线执行方及其构建版本,用户据此得知有哪些出口可选。`relay exec` / `relay push`
+经 `-w <workspace>`(路由到该 workspace 绑定的 executor)或 `-e/--executor <id>`(按 executor_id 节点直连,无需 workspace)
+选定目标执行方;`relay tunnel --executor <id>` 的取值同样直接取**执行方注册的 executor_id**(见 `relay status --json`
+的 `executors[].executor_id`),与 `exec`/`push` 的 `-w`(工作区名,再映射到该执行方)不同、也不做 cwd 推断,
+`--executor` 必填。`relay status` 不需要 `-w`:它报告整座部署。多台 executor 在线时,本地可并排多条
+`relay tunnel`(不同 `--listen` 端口、各自 `--executor`),分别经各自执行方访问各自内网白名单目标,互不干扰。
 
 ---
 
@@ -800,7 +800,7 @@ backend:
   config:
     url: "wss://server:8443/relay"
     token: "${RELAY_TOKEN}"
-    watch_id: "web-app"               # 执行方(relay watch)自注册的身份;exec/push/tunnel 按此路由
+    executor_id: "web-app"            # 执行方(relay watch)自注册的身份;exec/push/tunnel 按此路由
     # 或 auto 模式: 订阅所有事件，客户端过滤
     auto_subscribe: false
 
@@ -876,8 +876,8 @@ relay_server:
 ### 8.3 Unified config:workspaces 与执行器绑定
 
 统一的 `config.yaml` 由三端共用(server / executor / 本地 CLI),每端只读自己相关段。顶层作业配置列表
-原来是 `watch:`;为与执行方自注册的 `watch_id`(一台执行器的身份)区分,现改名为 **`workspaces:`**。每个
-条目是「一份作业配置」,可经 **`executor:`** 字段显式绑定到某台执行器(其值即执行器侧 `backend.config.watch_id`)。
+原来是 `watch:`;为与执行方自注册的 `executor_id`(一台执行器的节点身份)区分,现改名为 **`workspaces:`**。每个
+条目是「一份作业配置」,可经 **`executor:`** 字段显式绑定到某台执行器(其值即执行器侧 `backend.config.executor_id`)。
 
 ```yaml
 # server 段:仅 relay server 读取(单根 vs 工作区见 8.2;列表模式这里不填 watch_root)
@@ -893,7 +893,7 @@ backend:
   config:
     url: "wss://server:8443/relay"
     token: "${RELAY_TOKEN}"
-    watch_id: "site-a"       # 这台执行器自注册的 watch_id
+    executor_id: "site-a"    # 这台执行器自注册的 executor_id(节点身份)
     executor: true           # 本配置对应的进程以执行方角色注册
 
 workspaces:
@@ -901,7 +901,7 @@ workspaces:
     watch_dir: databus_backend
     local_dir: /d/Group_Projects/databus_backend
     paths: ["*.patch"]
-    executor: site-a         # 路由到 watch_id=site-a 的执行器(留空 = 单根回退)
+    executor: site-a         # 路由到 executor_id=site-a 的执行器(留空 = 单根回退)
     jobs:
       - id: apply
         type: exec
@@ -909,15 +909,16 @@ workspaces:
 ```
 
 **路由语义**
-- 请求方(`relay exec` / `relay push`)选定某 workspace 后,以 `workspace.executor` 为目标执行方的
-  `watch_id` 作为请求的 `watch_id`/`targetWatch` 路由键;中转按该 watch_id 在线执行方转发。
-- `executor` 留空(或 workspace 直接就是单台根配置)时,沿用单根回退:请求路由到本端 backend
-  的 `watch_id`(`c.watchID`),与历史行为一致。
-- 执行方收到 push 落地后,按「其注册 watch_id 是否等于 workspace 的 `executor`」优先认领该 workspace
+- 请求方(`relay exec` / `relay push`)经 `-w <workspace>` 时以 `workspace.executor` 为目标执行方的
+  `executor_id` 作路由;或经 `-e/--executor <id>` 直接以 executor_id 节点寻址(无需 workspace)。
+  中转按 executor_id 找在线执行方转发。
+- `executor` 留空(或 workspace 直接就是单台根配置)时,沿用单根回退:请求路由到本端 backend 的
+  `executor_id`,与历史行为一致。
+- 执行方收到 push 落地后,按「其注册 executor_id 是否等于 workspace 的 `executor`」优先认领该 workspace
   (多个绑定到同一执行器时,再按落盘路径中 `watch_dir`/id 段消歧),最后才用路径推断兜底。
-- **动态注册**:执行方的 `watch_id` 无需预存在中转 watch 白名单;`MsgRegisterExecutor` 直接登记,
-  中转按 `executors[watch_id]` 路由(`relay exec` / `relay push` / `relay tunnel`)。文件存储类操作
-  (list/pull/delete/subscribe/暂存回退)仍按中转的 watch 目录判。
+- **动态注册**:执行方的 `executor_id` 无需预存在中转 watch 白名单;`MsgRegisterExecutor` 直接登记,
+  中转按 `executors[executor_id]` 路由(exec/push/tunnel)。文件存储类(list/pull/delete/subscribe/暂存回退)
+  仍按中转的 watch 目录(目录 id 跟随 workspace)。
 
 ---
 

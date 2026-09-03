@@ -55,7 +55,8 @@ var (
 
 	// Push command - upload files, optionally without running workspace jobs
 	pushCmd    = kingpin.Command("push", "Push file to remote (optionally run/wait workspace jobs)")
-	pushWatch  = pushCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
+	pushWatch  = pushCmd.Flag("watch", "Target workspace ID (defaults to current directory name); mutually exclusive with --executor").Short('w').String()
+	pushExec   = pushCmd.Flag("executor", "Route directly to this executor (executor_id) without a workspace binding").Short('e').String()
 	pushSrc    = pushCmd.Arg("source", "Source file to push").Required().String()
 	pushDest   = pushCmd.Flag("dest", "Destination absolute path on the executor (defaults to <watch_dir>/<filename>; requires --no-jobs)").String()
 	pushNoJobs = pushCmd.Flag("no-jobs", "Transfer only; do not run workspace jobs on the remote").Bool()
@@ -68,8 +69,9 @@ var (
 	jobRunFile  = jobRun.Arg("file", "Local file to bind to {file_path} and friends").String()
 
 	// Exec command - command forwarding (requires watch running)
-	execCmd   = kingpin.Command("exec", "Forward command to remote backend")
-	execWatch = execCmd.Flag("watch", "Target watch ID").Short('w').String()
+	execCmd   = kingpin.Command("exec", "Forward command to remote executor")
+	execWatch = execCmd.Flag("watch", "Target workspace ID (defaults to current directory name); mutually exclusive with --executor").Short('w').String()
+	execExec  = execCmd.Flag("executor", "Route directly to this executor (executor_id) without a workspace binding").Short('e').String()
 	// 支持多词命令:relay exec git status 会收成 ["git","status"] 再空格 join。
 	// 含以 - 开头参数的命令(如 git log --oneline)仍须整体加引号,避免被当 flag。
 	execCmdStr = execCmd.Arg("command", "Command to execute (multiple words are joined)").Required().Strings()
@@ -85,7 +87,7 @@ var (
 
 	// Sync command - push config to remote watcher for hot reload
 	syncCmd      = kingpin.Command("sync", "Push config to remote watcher for hot reload")
-	syncExecutor = syncCmd.Flag("executor", "Target executor's watch_id (default = this config's backend watch_id)").Short('e').String()
+	syncExecutor = syncCmd.Flag("executor", "Target executor's executor_id (default = this config's backend executor_id)").Short('e').String()
 
 	// Workspaces command - list configured workspaces from config
 	// (alias: `workspaces`; kingpin v2 doesn't render aliases in --help)
@@ -107,9 +109,9 @@ var (
 	serverRemoteExpect = serverRemoteCmd.Flag("expect", "Expected transit version after swap (default: this relay's version.String())").String()
 
 	// Tunnel command - 本地 SOCKS5 出网隧道,经所选 executor 出口访问内网白名单目标。
-	tunnelCmd    = kingpin.Command("tunnel", "本地 SOCKS5 出网隧道:经所选 executor 访问其内网白名单目标")
-	tunnelListen = tunnelCmd.Flag("listen", "Local SOCKS5 listen address").Default("127.0.0.1:1080").String()
-	tunnelWatch  = tunnelCmd.Flag("watch", "Egress executor's server watch id (see `relay status` -> executors[] watch_id); required").Short('w').Required().String()
+	tunnelCmd      = kingpin.Command("tunnel", "本地 SOCKS5 出网隧道:经所选 executor 访问其内网白名单")
+	tunnelListen   = tunnelCmd.Flag("listen", "Local SOCKS5 listen address").Default("127.0.0.1:1080").String()
+	tunnelExecName = tunnelCmd.Flag("executor", "Egress executor's executor_id (see `relay status` -> executors[].executor_id); required").Short('w').Required().String()
 )
 
 func main() {
@@ -554,9 +556,9 @@ type workspaceJSON struct {
 }
 
 type jobConfigJSON struct {
-	ID       string `json:"id"`
-	Type     string `json:"type"`
-	Cmd      string `json:"cmd,omitempty"`
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Cmd     string `json:"cmd,omitempty"`
 	Cwd     string `json:"cwd,omitempty"`
 	If      string `json:"if,omitempty"`
 	Timeout int    `json:"timeout,omitempty"`
@@ -566,13 +568,13 @@ func toWorkspaceJSON(w config.WorkspaceConfig) workspaceJSON {
 	jobs := make([]jobConfigJSON, len(w.Jobs))
 	for i, j := range w.Jobs {
 		jobs[i] = jobConfigJSON{
-		ID:      j.ID,
-		Type:    j.Type,
-		Cmd:     j.Cmd,
-		Cwd:     j.Cwd,
-		If:      j.If,
-		Timeout: j.Timeout,
-	}
+			ID:      j.ID,
+			Type:    j.Type,
+			Cmd:     j.Cmd,
+			Cwd:     j.Cwd,
+			If:      j.If,
+			Timeout: j.Timeout,
+		}
 	}
 	return workspaceJSON{
 		ID:       w.ID,
@@ -630,10 +632,24 @@ func runPush() {
 		os.Exit(1)
 	}
 
-	watchCfg, err := lookupWatch(cfg, *pushWatch)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+	if *pushExec != "" && *pushWatch != "" {
+		fmt.Fprintln(os.Stderr, "Error: --executor and --watch are mutually exclusive")
 		os.Exit(1)
+	}
+
+	// 目标:直接按 executor_id 寻址(不经 workspace),或经 -w/当前目录解析到绑定的 executor。
+	var target string
+	var watchDir string
+	if *pushExec != "" {
+		target = *pushExec // 节点直连,无 workspace 视角
+	} else {
+		watchCfg, err := lookupWatch(cfg, *pushWatch)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+			os.Exit(1)
+		}
+		watchDir = watchCfg.WatchDir
+		target = watchCfg.Executor
 	}
 
 	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
@@ -645,7 +661,6 @@ func runPush() {
 	ctx := context.Background()
 	src := *pushSrc
 
-	watchDir := watchCfg.WatchDir
 	filename := filepath.Base(src)
 
 	// --dest 只能与 --no-jobs 一起用(true 时路径可越过 watch_dir 到达执行方任何位置)。
@@ -666,7 +681,12 @@ func runPush() {
 		return
 	}
 
-	dest := watchDir + "/" + filename
+	// 直接寻址时无 workspace 视角:默认落到执行方自身 exec_dir 下的 basename,
+	// 也可经 --dest 覆盖为绝对路径(部署常用)。workspace 路由时落到 <watch_dir>/<file>。
+	dest := filename
+	if *pushExec == "" {
+		dest = watchDir + "/" + filename
+	}
 	if *pushNoJobs && *pushDest != "" {
 		dest = *pushDest
 	}
@@ -682,12 +702,12 @@ func runPush() {
 		return content
 	}
 
-	// 纯下发(不跑 workspace job): 走 Jobs=false 通道,落到 dest(绝对)或 watch_dir 目录。
-	// 路由到 workspace 绑定的 executor(executor: <id>),空则单根回退。
-	targetWatch := watchCfg.Executor
+	// 纯下发(不跑 workspace job):走 Jobs=false 通道,落到 dest(绝对)或目标 executor 目录。
+	// 路由到 -w 绑定的 executor,或 --executor 直接指定的 executor;空则单根回退。
+	targetExecutor := target
 	if *pushNoJobs {
 		if tn, ok := b.(backend.PushNoJobsSender); ok {
-			exit, perr := tn.PushNoJobs(ctx, targetWatch, dest, readContent())
+			exit, perr := tn.PushNoJobs(ctx, targetExecutor, dest, readContent())
 			if perr != nil {
 				fmt.Fprintf(os.Stderr, "Push error: %v\n", perr)
 				os.Exit(1)
@@ -704,7 +724,7 @@ func runPush() {
 
 	// 直达后端(relay):把文件直接送到目标 executor 并触发其本地 jobs;输出流式显示。
 	if pj, ok := b.(backend.PushJobSender); ok {
-		exit, perr := pj.PushJob(ctx, targetWatch, dest, readContent(), func(c backend.ExecChunk) {
+		exit, perr := pj.PushJob(ctx, targetExecutor, dest, readContent(), func(c backend.ExecChunk) {
 			if c.Stdout {
 				os.Stdout.WriteString(c.Data)
 			} else {
@@ -774,16 +794,16 @@ func runLocalJobsForPush(watchID, absPath string, out func(backend.ExecChunk)) i
 
 // resolvePushWorkspace 决定 push 落地后该跑哪个 workspace 的 jobs。
 // 优先级:
-//  1. sess.WatchID 恰是一个 workspace id → 精确命中。
-//  2. 执行方(以 watchID 标识)显式绑定的 workspaces(Executor == watchID)→ 若唯一直接返回,
+//  1. sess.ExecutorID 恰是一个 workspace id → 精确命中。
+//  2. 执行方(以 executorID 标识)显式绑定的 workspaces(Executor == executorID)→ 若唯一直接返回,
 //     多个则由落盘路径 absPath 其中做路径消歧。
 //  3. 回退:在全部 workspaces 中用 absPath(形如 <executor_root>/<workspace>/<file>,
 //     匹配 watch_dir 字符串或 id 路径段)推导。
-func resolvePushWorkspace(cfg *config.Config, watchID, absPath string) *config.WorkspaceConfig {
-	if wc, err := cfg.GetWorkspaceByID(watchID); err == nil {
+func resolvePushWorkspace(cfg *config.Config, executorID, absPath string) *config.WorkspaceConfig {
+	if wc, err := cfg.GetWorkspaceByID(executorID); err == nil {
 		return wc
 	}
-	if owned := cfg.GetWorkspacesByExecutor(watchID); len(owned) > 0 {
+	if owned := cfg.GetWorkspacesByExecutor(executorID); len(owned) > 0 {
 		if len(owned) == 1 {
 			return owned[0]
 		}
@@ -854,25 +874,33 @@ func runExec() {
 		os.Exit(1)
 	}
 
-	// Fold workspace resolution: an explicit -w wins; otherwise try to infer it
-	// from the cwd basename. Inferring is best-effort for exec — when it can't
-	// resolve, exec keeps its existing no-workspace forwarding behavior.
-	w := *execWatch
-	if w == "" {
-		if inferred, err := resolveWorkspaceID(cfg, ""); err == nil {
-			w = inferred
-		}
+	if *execWatch != "" && *execExec != "" {
+		fmt.Fprintln(os.Stderr, "Error: --executor and --watch are mutually exclusive")
+		os.Exit(1)
 	}
 
-	var execCwd, targetWatch string
-	if w != "" {
-		watchCfg, err := cfg.GetWorkspaceByID(w)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
-			os.Exit(1)
+	// 目标与 cwd:--executor 直接按节点身份寻址(不经 workspace,无本地 cwd 映射);
+	// 否则按 -w/当前目录解析到绑定的 executor。
+	var execCwd, targetExecutor string
+	w := *execWatch
+	if *execExec != "" {
+		targetExecutor = *execExec
+		w = ""
+	} else {
+		if w == "" {
+			if inferred, err := resolveWorkspaceID(cfg, ""); err == nil {
+				w = inferred
+			}
 		}
-		execCwd = watchCfg.LocalDir
-		targetWatch = watchCfg.Executor // 绑定 executor 时按其注册 watch_id 路由;空则单根回退
+		if w != "" {
+			watchCfg, err := cfg.GetWorkspaceByID(w)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+				os.Exit(1)
+			}
+			execCwd = watchCfg.LocalDir
+			targetExecutor = watchCfg.Executor // 绑定 executor 时按其 executor_id 路由;空则单根回退
+		}
 	}
 
 	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
@@ -911,7 +939,7 @@ func runExec() {
 
 	// 支持流式的后端(relay)逐帧实时转发输出,并以 exit code 收尾
 	if eb, ok := b.(backend.ExecStreamBackend); ok {
-		exit, err := eb.ExecStream(ctx, targetWatch, cmd, execCwd, 0, func(chunk backend.ExecChunk) {
+		exit, err := eb.ExecStream(ctx, targetExecutor, cmd, execCwd, 0, func(chunk backend.ExecChunk) {
 			if chunk.Stdout {
 				os.Stdout.WriteString(chunk.Data)
 			} else {
@@ -1018,7 +1046,7 @@ func printStatus(backendName string, st protocol.StatusResponse, jsonOut bool) {
 	fmt.Println("  executors:")
 	for _, e := range st.Executors {
 		fmt.Printf("    %s  transit→executor %s  total %s  (%s)\n",
-			e.WatchID, segmentText(e.Seg2), segmentText(e.Total), identStr(e.Version))
+			e.ExecutorID, segmentText(e.Seg2), segmentText(e.Total), identStr(e.Version))
 	}
 }
 
@@ -1356,7 +1384,7 @@ func runSync() {
 	}
 
 	// 通道遵循 backend:支持流式的后端(relay)经 WS 直达执行端落盘,不绕中转文件交换。
-	// targetWatch(--executor)指定目标执行方;空=单根回退到本配置的 backend.watch_id。
+	// --executor 指定目标执行方;空=单根回退到本配置的 backend.executor_id。
 	if cs, ok := b.(backend.ConfigSyncCapable); ok {
 		target := *syncExecutor
 		if target != "" {

@@ -60,10 +60,10 @@ func TestMessageRoundTrip(t *testing.T) {
 				Type: MsgExec,
 				ID:   "exec-id",
 				Payload: ExecRequest{
-					WatchID: "watch-1",
-					Cmd:     "ls -la",
-					Cwd:     "/tmp",
-					Timeout: 30,
+					ExecutorID: "watch-1",
+					Cmd:        "ls -la",
+					Cwd:        "/tmp",
+					Timeout:    30,
 				},
 			},
 		},
@@ -114,10 +114,10 @@ func TestMessageRoundTrip(t *testing.T) {
 				ID:       "sup-id",
 				StreamID: "stream-1",
 				Payload: ServerUpgradeRequest{
-					WatchID:  "watch-1",
-					Size:     4096,
-					Digest:   "abcdef0123456789",
-					StreamID: "stream-1",
+					ExecutorID: "watch-1",
+					Size:       4096,
+					Digest:     "abcdef0123456789",
+					StreamID:   "stream-1",
 				},
 			},
 		},
@@ -128,10 +128,10 @@ func TestMessageRoundTrip(t *testing.T) {
 				ID:       "tunnel-id-1",
 				StreamID: "tunnel-id-1",
 				Payload: TunnelConnectRequest{
-					WatchID:  "site-a",
-					Target:   "api.internal.com",
-					Port:     443,
-					StreamID: "tunnel-id-1",
+					ExecutorID: "site-a",
+					Target:     "api.internal.com",
+					Port:       443,
+					StreamID:   "tunnel-id-1",
 				},
 			},
 		},
@@ -243,10 +243,10 @@ func TestMessageRoundTrip(t *testing.T) {
 
 func TestServerUpgradeRequestRoundTrip(t *testing.T) {
 	in := ServerUpgradeRequest{
-		WatchID:  "watch-1",
-		Size:     4096,
-		Digest:   "abcdef0123456789",
-		StreamID: "stream-1",
+		ExecutorID: "watch-1",
+		Size:       4096,
+		Digest:     "abcdef0123456789",
+		StreamID:   "stream-1",
 	}
 
 	msg := Message{Type: MsgServerUpgrade, ID: "sup-id", StreamID: in.StreamID, Payload: in}
@@ -269,17 +269,17 @@ func TestServerUpgradeRequestRoundTrip(t *testing.T) {
 		t.Fatalf("unmarshal payload: %v", err)
 	}
 
-	if p.WatchID != in.WatchID || p.Size != in.Size || p.Digest != in.Digest || p.StreamID != in.StreamID {
+	if p.ExecutorID != in.ExecutorID || p.Size != in.Size || p.Digest != in.Digest || p.StreamID != in.StreamID {
 		t.Errorf("payload mismatch: got %+v, want %+v", p, in)
 	}
 }
 
 func TestTunnelConnectRequestRoundTrip(t *testing.T) {
 	in := TunnelConnectRequest{
-		WatchID:  "site-a",
-		Target:   "10.0.0.5",
-		Port:     8080,
-		StreamID: "tunnel-9",
+		ExecutorID: "site-a",
+		Target:     "10.0.0.5",
+		Port:       8080,
+		StreamID:   "tunnel-9",
 	}
 
 	msg := Message{Type: MsgTunnelConnect, ID: in.StreamID, StreamID: in.StreamID, Payload: in}
@@ -302,7 +302,7 @@ func TestTunnelConnectRequestRoundTrip(t *testing.T) {
 		t.Fatalf("unmarshal payload: %v", err)
 	}
 
-	if p.WatchID != in.WatchID || p.Target != in.Target || p.Port != in.Port || p.StreamID != in.StreamID {
+	if p.ExecutorID != in.ExecutorID || p.Target != in.Target || p.Port != in.Port || p.StreamID != in.StreamID {
 		t.Errorf("payload mismatch: got %+v, want %+v", p, in)
 	}
 }
@@ -321,10 +321,10 @@ func TestStatusResponseRoundTrip(t *testing.T) {
 			Transit: VersionInfo{Role: "transit", Version: "1.0", GOOS: "linux", GOARCH: "amd64"},
 			Executors: []ExecutorHealth{
 				{
-					WatchID: "watch-1",
-					Version: "1.0",
-					Seg2:    StatusSegment{LatencyMS: &lat},
-					Total:   StatusSegment{LatencyMS: &lat},
+					ExecutorID: "watch-1",
+					Version:    "1.0",
+					Seg2:       StatusSegment{LatencyMS: &lat},
+					Total:      StatusSegment{LatencyMS: &lat},
 				},
 			},
 		},
@@ -367,7 +367,7 @@ func TestStatusResponseRoundTrip(t *testing.T) {
 		t.Fatalf("executors: got %d, want 1", len(p.Executors))
 	}
 	e := p.Executors[0]
-	if e.WatchID != "watch-1" || e.Version != "1.0" {
+	if e.ExecutorID != "watch-1" || e.Version != "1.0" {
 		t.Errorf("executor headers mismatch: got %+v", e)
 	}
 	if e.Seg2.LatencyMS == nil || *e.Seg2.LatencyMS != lat {
@@ -414,7 +414,7 @@ func TestServerUpgradeRequestNullPayload(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got.WatchID != "" || got.Size != 0 || got.Digest != "" || got.StreamID != "" {
+	if got.ExecutorID != "" || got.Size != 0 || got.Digest != "" || got.StreamID != "" {
 		t.Errorf("zero-value mismatch: got %+v", got)
 	}
 }

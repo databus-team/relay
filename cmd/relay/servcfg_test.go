@@ -21,7 +21,7 @@ server:
 
 backend:
   config:
-    watch_id: storage
+    executor_id: storage
 
 workspaces:
   - id: rel
@@ -45,8 +45,9 @@ workspaces:
 		t.Fatalf("want 1 root watch, got %d", len(base.watchDirs))
 	}
 	got := base.watchDirs[0]
-	if got.ID != "storage" || got.Dir != "/data/relay" {
-		t.Errorf("root watch: id=%q dir=%q; want id=storage dir=/data/relay", got.ID, got.Dir)
+	// 目录 id 统一跟随 workspace:首个 workspace id=rel(backend.executor_id 不再兼任目录)。
+	if got.ID != "rel" || got.Dir != "/data/relay" {
+		t.Errorf("root watch: id=%q dir=%q; want id=rel dir=/data/relay", got.ID, got.Dir)
 	}
 }
 
@@ -219,8 +220,9 @@ server:
 	}
 }
 
-// 单根模式下 backend.config.watch_id 参与存储 id 的优先级(优先于 workspace/relay)。
-func TestUnifiedServerSingleRootBackendWatchID(t *testing.T) {
+// 单根模式下 backend.executor_id 不再兼任目录 id:存储 id 只跟随 workspace,无 workspace 时
+// 回退 "relay"(executor 身份与目录分层解耦)。
+func TestUnifiedServerSingleRootBackendExecutorIDIgnored(t *testing.T) {
 	data := []byte(`
 server:
   addr: ":8443"
@@ -228,13 +230,13 @@ server:
 backend:
   type: relay
   config:
-    watch_id: storage
+    executor_id: storage
 `)
 	base, err := unifiedServerBase(data)
 	if err != nil {
 		t.Fatalf("unifiedServerBase: %v", err)
 	}
-	if len(base.watchDirs) != 1 || base.watchDirs[0].ID != "storage" {
+	if len(base.watchDirs) != 1 || base.watchDirs[0].ID != "relay" {
 		t.Errorf("root watch: %+v", base.watchDirs)
 	}
 }

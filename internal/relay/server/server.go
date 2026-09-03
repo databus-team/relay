@@ -34,9 +34,9 @@ type Server struct {
 	subs  map[string]map[string]bool
 	subMu sync.RWMutex
 
-	// executors 记录每个 watch 上注册的执行方客户端(远端 watcher)。
+	// executors 记录每个 executor_id 上注册的执行方客户端(远端 watcher)。
 	executors map[string]string
-	// executorVers 记录每个 watch 执行方的 relay 构建版本,供 relay version 对比。
+	// executorVers 记录每个 executor 执行方的 relay 构建版本,供 relay version 对比。
 	executorVers map[string]string
 	executorMu   sync.RWMutex
 	// reqOwner 记录被转发的 exec 请求(reqID)归属的请求方客户端,用于把执行方回流帧转回去。
@@ -400,34 +400,34 @@ func (s *Server) UnsubscribeAll(clientID string) {
 	}
 }
 
-// RegisterExecutor 将 clientID 注册为 watchID 的执行方,并记录其 relay 构建版本。
-// 返回 (旧执行方 clientID, 是否发生了覆盖),便于上层做替换告警。
-func (s *Server) RegisterExecutor(watchID, clientID, version string) (prev string, replaced bool) {
+// RegisterExecutor 将 clientID 注册为 executorID 的执行方,并记录其 relay 构建版本。
+// 返回(旧执行方连接, 是否发生了覆盖),供上层做替换告警。
+func (s *Server) RegisterExecutor(executorID, clientID, version string) (prev string, replaced bool) {
 	s.executorMu.Lock()
 	defer s.executorMu.Unlock()
-	prev = s.executors[watchID]
+	prev = s.executors[executorID]
 	replaced = prev != "" && prev != clientID
-	s.executors[watchID] = clientID
+	s.executors[executorID] = clientID
 	if version != "" {
-		s.executorVers[watchID] = version
+		s.executorVers[executorID] = version
 	} else {
 		// 旧版执行方不携带 version,清空以表示未知,避免与真实值混淆。
-		delete(s.executorVers, watchID)
+		delete(s.executorVers, executorID)
 	}
 	return prev, replaced
 }
 
-// UnregisterExecutor 若 clientID 是 watchID 的执行方则移除。
-func (s *Server) UnregisterExecutor(watchID, clientID string) {
+// UnregisterExecutor 若 clientID 是 executorID 的执行方则移除。
+func (s *Server) UnregisterExecutor(executorID, clientID string) {
 	s.executorMu.Lock()
 	defer s.executorMu.Unlock()
-	if s.executors[watchID] == clientID {
-		delete(s.executors, watchID)
-		delete(s.executorVers, watchID)
+	if s.executors[executorID] == clientID {
+		delete(s.executors, executorID)
+		delete(s.executorVers, executorID)
 	}
 }
 
-// ExecutorVersions 返回各 watch 在线执行方的构建版本(watchID → version)。
+// ExecutorVersions 返回所有 executor 在线执行方的构建版本(executorID → version)。
 func (s *Server) ExecutorVersions() map[string]string {
 	s.executorMu.RLock()
 	defer s.executorMu.RUnlock()
@@ -438,11 +438,11 @@ func (s *Server) ExecutorVersions() map[string]string {
 	return out
 }
 
-// GetExecutor 返回 watchID 对应执行方客户端 ID。
-func (s *Server) GetExecutor(watchID string) (string, bool) {
+// GetExecutor 返回 executorID 对应执行方客户端 ID。
+func (s *Server) GetExecutor(executorID string) (string, bool) {
 	s.executorMu.RLock()
 	defer s.executorMu.RUnlock()
-	e, ok := s.executors[watchID]
+	e, ok := s.executors[executorID]
 	return e, ok
 }
 
@@ -452,14 +452,14 @@ type ExecutorEndpoint struct {
 	Version  string
 }
 
-// ExecutorEndpoints 返回全部已注册执行方的快照(watchID → 端点)。供 `relay status`
+// ExecutorEndpoints 返回全部已注册执行方的快照(executorID → 端点)。供 `relay status`
 // 对整座部署逐执行方探针;副本返回以保证调用方并发安全。
 func (s *Server) ExecutorEndpoints() map[string]ExecutorEndpoint {
 	s.executorMu.RLock()
 	defer s.executorMu.RUnlock()
 	out := make(map[string]ExecutorEndpoint, len(s.executors))
-	for wid, cid := range s.executors {
-		out[wid] = ExecutorEndpoint{ClientID: cid, Version: s.executorVers[wid]}
+	for eid, cid := range s.executors {
+		out[eid] = ExecutorEndpoint{ClientID: cid, Version: s.executorVers[eid]}
 	}
 	return out
 }
@@ -629,10 +629,10 @@ func (s *Server) SendToBinary(clientID string, msg protocol.Message, raw []byte)
 // cleanupClientState 断连时清理该 client 注册的执行方、待转发请求归属与流式 push 路由。
 func (s *Server) cleanupClientState(clientID string) {
 	s.executorMu.Lock()
-	for watchID, e := range s.executors {
+	for eid, e := range s.executors {
 		if e == clientID {
-			delete(s.executors, watchID)
-			delete(s.executorVers, watchID)
+			delete(s.executors, eid)
+			delete(s.executorVers, eid)
 		}
 	}
 	s.executorMu.Unlock()

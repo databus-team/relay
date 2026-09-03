@@ -44,7 +44,7 @@ type ServerTLSConfig struct {
 
 // WorkspaceConfig 一份「作业配置」:定义在什么目录上、对哪些文件、跑哪些 job。
 // 它只描述“做什么”与“在哪听”,并不等于某台执行器。Executor 字段把这份配置绑定到
-// 一台具体的执行器(其值即执行器侧 backend.config.watch_id / 注册身份);留空 = 单根回退。
+// 一台具体的执行器(其值即执行器侧 backend.config.executor_id / 注册身份);留空 = 单根回退。
 type WorkspaceConfig struct {
 	ID          string        `yaml:"id"`
 	WatchDir    string        `yaml:"watch_dir"`
@@ -53,7 +53,7 @@ type WorkspaceConfig struct {
 	Jobs        []JobConfig   `yaml:"jobs"`
 	AutoCleanup bool          `yaml:"auto_cleanup"`
 	TTL         time.Duration `yaml:"ttl"`                // 仅 server 端使用(中转自动清理)
-	Executor    string        `yaml:"executor,omitempty"` // 绑定到哪个执行器(其自身 watch_id);空=单根
+	Executor    string        `yaml:"executor,omitempty"` // 绑定到哪个执行器(其自身 executor_id);空=单根
 }
 
 type BackendConfig struct {
@@ -158,12 +158,12 @@ func ApplyConfigFile(payload []byte, configPath string) error {
 	return nil
 }
 
-// ExecutorOwnedKeys 是执行方自身身份/角色/本机相关的 backend.config 键,config-sync
+// ExecutorOwnedKeys 是执行方自身身份/角色/网络相关的 backend.config 键,config-sync
 // 不得覆盖,应从执行方当前落盘配置保留。本地(协调方)配置缺这些字段无碍;执行方缺了
 // 会导致注册失败——如 `executor: true`(角色开关,缺则 enableExecutor 不执行)与
-// `watch_id`(注册身份)被覆盖掉最典型。
+// `executor_id`(注册身份)被覆盖掉最典型。
 var ExecutorOwnedKeys = []string{
-	"watch_id", "watch_dir", "command_dir", "executor",
+	"executor_id", "watch_dir", "command_dir", "executor",
 	"executor_dir", "config_path", "network_allow", "headers",
 }
 
@@ -314,12 +314,12 @@ func (c *Config) GetWorkspaceByID(id string) (*WorkspaceConfig, error) {
 	return nil, fmt.Errorf("workspace not found: %s", id)
 }
 
-// GetWorkspacesByExecutor 返回所有显式绑定到给定执行器(其值即后端 watch_id)的 workspace。
+// GetWorkspacesByExecutor 返回所有显式绑定到给定执行器(其值即后端 executor_id)的 workspace。
 // 执行器侧用它判断“这份 workspace 的 jobs 该由我执行”;无匹配返回 nil。
-func (c *Config) GetWorkspacesByExecutor(watchID string) []*WorkspaceConfig {
+func (c *Config) GetWorkspacesByExecutor(executorID string) []*WorkspaceConfig {
 	var out []*WorkspaceConfig
 	for i := range c.Workspaces {
-		if c.Workspaces[i].Executor == watchID {
+		if c.Workspaces[i].Executor == executorID {
 			out = append(out, &c.Workspaces[i])
 		}
 	}

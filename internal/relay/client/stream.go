@@ -60,7 +60,7 @@ func (c *Client) Pull(ctx context.Context, path string) ([]byte, error) {
 		ID:       reqID,
 		StreamID: streamID,
 		Payload: protocol.PullRequest{
-			WatchID: c.watchID,
+			WatchID: c.id,
 			Path:    path,
 			Offset:  0,
 		},
@@ -107,7 +107,7 @@ func (c *Client) Push(ctx context.Context, path string, data []byte) error {
 		ID:       uuid.New().String(),
 		StreamID: streamID,
 		Payload: protocol.PushRequest{
-			WatchID:  c.watchID,
+			WatchID:  c.id,
 			Path:     path,
 			Size:     total,
 			StreamID: streamID,

@@ -69,7 +69,7 @@ relay/
 |--------|----------|------|
 | `Server` / `New` / `Serve` | `internal/relay/server/server.go:23/114/228` | WS upgrade serving, connection handling |
 | `handleConnection` | `server.go:271` | Per-conn read/write loops |
-| `RegisterExecutor` / `UnregisterExecutor` | `server.go:405/421` | **self-registration** of executors by watch_id (replaced stale) |
+| `RegisterExecutor` / `UnregisterExecutor` | `server.go:405/421` | **self-registration** of executors by executor_id (replaced stale) |
 | `GetExecutor` / `ExecutorEndpoints` / `ExecutorVersions` | `server.go:442/457/431` | Executor routing + version ledger |
 | `SendTo` / `Subscribe` / `BroadcastToSubscribers` | `server.go:360/372/657` | Message routing + file-event fan-out |
 | `SetUpgradeSwap` | `server.go:224` | Injected transit self-upgrade swap closure |
@@ -101,7 +101,7 @@ relay/
 
 | `RelayBackend` / `NewRelayBackend` | `internal/relay/backend/relay.go:29/89` | `backend.type=relay` file/exec interface |
 | `SetExecutorRole` | `relay.go:63` | `relay watch` sets executor role (CLI doesn't) |
-| `registerExecutor` | `relay.go:553` | Self-register watch_id on connect |
+| `registerExecutor` | `relay.go:553` | Self-register executor_id on connect |
 | `Exec` / `ExecStream` / `PushJob` / `PushNoJobs` / `Transport` | `relay.go:239-312` | Inbound exec/push on executor |
 | `ConfigSync` | `relay.go:336` | Stream config onto executor disk |
 | `UpgradeServer` | `relay.go:349` | Transit self-upgrade stream + verify + ACK |
@@ -113,10 +113,10 @@ relay/
 
 | `Config` struct | `internal/config/config.go:15` | `Backend` + `Workspaces[]` + `Server` + `Interval` |
 | `WorkspaceConfig` | `config.go:47` | `ID/WatchDir/LocalDir/Paths/Jobs/AutoCleanup/TTL/Executor` |
-| `Executor` binding | `config.go:55` | binds a workspace's jobs to one executor by its `watch_id`; empty = single-root |
+| `Executor` binding | `config.go:55` | binds a workspace's jobs to one executor by its `executor_id`; empty = single-root |
 | `ServerConfig` | `config.go:26` | `Addr/WatchRoot/Auth/TLS/TunnelEnabled/MaxTunnels` |
 | `GetWorkspaceByID` | `config.go:165` | lookup a single workspace |
-| `GetWorkspacesByExecutor` | `config.go:176` | all workspaces bound to an executor `watch_id` |
+| `GetWorkspacesByExecutor` | `config.go:176` | all workspaces bound to an executor `executor_id` |
 | `ApplyConfigFile` | `config.go:138` | validate + backup + **atomic tmp/rename** config write |
 | `Load`/`LoadFromBytes` | `config.go:89/105` | YAML load with env expansion + home expand |
 | `NormalizeWindowsPath` (MSYS→`D:\`) | `config.go:186` | Windows path normalization |
@@ -169,23 +169,23 @@ CLI usage (key forms):
 ```bash
 relay watch [run|start|stop|status|restart|upgrade]   # executor (daemon actions)
 relay server [run|start|stop|status|restart|upgrade]  # transit (daemon actions)
-relay push [-w <id>] <file> [--no-jobs] [--dest <abs>]
-relay exec  [-w <id>] <cmd...>
+relay push [-w <workspace> | -e <executor-id>] <file> [--no-jobs] [--dest <abs>]
+relay exec  [-w <workspace> | -e <executor-id>] <cmd...>     # -e = direct node addressing
 relay job run [-w <id>] <jobid> [file]
-relay sync  [-e <executor-watch-id>]
-relay ws [-v] [--json] [--name <id>]                   # alias: relay workspaces
-relay status [--json]                                  # whole deployment health + versions
-relay version [--json]                                 # local build (remote ledger via `status`)
+relay sync  [-e <executor-id>]
+relay ws [-v] [--name <id>]                   # alias: relay workspaces
+relay status [--json]                         # whole deployment health + versions
+relay version [--json]                        # local build (remote ledger via `status`)
 relay server-remote [--binary <path>] [--expect <ver+commit>]  # one-command transit self-upgrade
-relay tunnel [--listen 127.0.0.1:1080] -w <egress-executor-watch>  # SOCKS5
-relay pull [<filename>] [-d]    relay push ...   relay list [-w]   relay cleanup -w <id>
+relay tunnel [--listen 127.0.0.1:1080] -w <egress-executor-id>  # SOCKS5 (egress executor_id)
+relay pull [-w <workspace>] <filename> [-dl]    relay list [-w]    relay cleanup [-w <workspace>]
 ```
 
 Pass `-c <config>` (default `~/.relay/config.yaml`) to share one config across ends; `relay sync` ships it to the executor.
 
 ## IMPLEMENTATION NOTES (current)
 
-- **Executor self-registration + per-workspace binding.** An executor (`relay watch` with `backend.type=relay`) starts by calling `Client.RegisterExecutor(watchID)` to register on the transit (server's `RegisterExecutor` overwrites stale entries → one active instance per watch). `workspaces[].executor` binds a workspace's jobs to the executor whose `watch_id` matches that value; empty = single-root fallback. `Config.GetWorkspacesByExecutor` maps an executor to the workspaces it owns.
+- **Node addressing ⊥ job routing.** Layering split: `executor_id` = an executor's node identity (its `backend.config.executor_id`), used for registration and as the routing key for exec/push/sync/tunnel/status; `watch`/`watch_dir` = a transit storage directory (id = a workspace id). `relay exec`/`push`/`tunnel` accept either `-w <workspace>` (route to that workspace's bound executor) or `-e/--executor <executor_id>` (address a specific node directly, no workspace binding needed). A running executor with no bound workspace (e.g. extranet) is still addressable via `--executor`, which is what the deploy script uses.
 - **Push direct + fallback.** On `relay push`, the relay backend uses `PushJobSender` to fan the file directly to the target executor through the transit (never the shared-dir → staged by the transit), and the executor runs its workspace jobs locally, streaming the job output back. `--no-jobs`/`--dest` uses `PushNoJobsSender` (transport-only). If no online executor is registered for that workspace (`executor: none`), the push **falls back** to staging the file on the transit watch dir (watch-pull) — this fallback is verified in `TestEndToEnd_PushJobNoExecutorFallback`.
 - **Tunnel `network_allow` fail-closed.** Local `relay tunnel -w <egress-watch>` opens a SOCKS5 listener and forwards each CONNECT to the chosen executor via the transit. The **executor** validates the destination against its `backend.config.network_allow` (host/IP/CIDR + optional `@port` list/range). Unlisted targets are rejected by default (fail-closed); an empty/absent `network_allow` denies all. Server gates the channel behind `server.tunnel_enabled` + `max_tunnels` (default 256). Non-loopback listen prints a warning (no auth on the tunnel itself).
 - **`status` 3-segment latency.** `relay status` (replaces legacy `ping`/`version -r`) reports a whole-deployment health/version ledger: Seg1 = local→transit latency; the transit -- CLI requests a status that probes each online executor (Seg2 = transit→executor) and returns transit + executor build identities; `Total = Seg1 + Seg2`. Executors offline are marked N/A, and non-relay backends give only the single-hop segment. `--json` mirrors the text fields.

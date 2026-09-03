@@ -29,7 +29,7 @@ import (
 type RelayBackend struct {
 	client     *client.Client
 	watchDir   string
-	watchID    string
+	executorID string
 	commandDir string
 	execDir    string // push 落地根目录(执行方);空则用进程当前目录
 	configPath string // config-sync 落盘目标(执行方)
@@ -76,7 +76,7 @@ func executorRoleOn() bool {
 type Config struct {
 	URL          string            `mapstructure:"url" yaml:"url"`
 	Token        string            `mapstructure:"token" yaml:"token"`
-	WatchID      string            `mapstructure:"watch_id" yaml:"watch_id"`
+	ExecutorID   string            `mapstructure:"executor_id" yaml:"executor_id"`
 	WatchDir     string            `mapstructure:"watch_dir" yaml:"watch_dir"`
 	CommandDir   string            `mapstructure:"command_dir" yaml:"command_dir"`
 	ExecutorDir  string            `mapstructure:"executor_dir" yaml:"executor_dir"`
@@ -95,8 +95,10 @@ func NewRelayBackend(params map[string]interface{}) (backend.FileTransferBackend
 	if token, ok := params["token"].(string); ok {
 		cfg.Token = token
 	}
-	if watchID, ok := params["watch_id"].(string); ok {
-		cfg.WatchID = watchID
+	if executorID, ok := params["executor_id"].(string); ok {
+		cfg.ExecutorID = executorID
+	} else if legacy, ok := params["watch_id"].(string); ok { // 过渡期内兼容旧配置键
+		cfg.ExecutorID = legacy
 	}
 	if watchDir, ok := params["watch_dir"].(string); ok {
 		cfg.WatchDir = watchDir
@@ -135,8 +137,8 @@ func NewRelayBackend(params map[string]interface{}) (backend.FileTransferBackend
 	if cfg.CommandDir == "" {
 		cfg.CommandDir = "/tmp/relay-commands"
 	}
-	if cfg.WatchID == "" {
-		cfg.WatchID = "default"
+	if cfg.ExecutorID == "" {
+		cfg.ExecutorID = "default"
 	}
 	if cfg.ConfigPath == "" {
 		// 执行方 config-sync 的默认落盘目标(与 relay watch 的 ~/.relay/config.yaml 一致)。
@@ -154,7 +156,7 @@ func NewRelayBackend(params map[string]interface{}) (backend.FileTransferBackend
 		opts = append(opts, client.WithHeaders(h))
 	}
 
-	c, err := client.GetOrConnect(context.Background(), cfg.URL, cfg.Token, cfg.WatchID, opts...)
+	c, err := client.GetOrConnect(context.Background(), cfg.URL, cfg.Token, cfg.ExecutorID, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("create client: %w", err)
 	}
@@ -162,7 +164,7 @@ func NewRelayBackend(params map[string]interface{}) (backend.FileTransferBackend
 	b := &RelayBackend{
 		client:     c,
 		watchDir:   cfg.WatchDir,
-		watchID:    cfg.WatchID,
+		executorID: cfg.ExecutorID,
 		commandDir: cfg.CommandDir,
 		execDir:    cfg.ExecutorDir,
 		configPath: cfg.ConfigPath,
@@ -249,16 +251,16 @@ func (b *RelayBackend) Exec(ctx context.Context, cmd string, cwd string, timeout
 }
 
 // ExecStream 流式执行:本地 CLI 作为请求方时,经中转把命令转发给远端 executor 并实时回调输出。
-// targetWatch 若非空即目标 executor 的注册 watch_id(workspace 绑定到该 executor 时);空=单根回退。
-func (b *RelayBackend) ExecStream(ctx context.Context, targetWatch, cmd string, cwd string, timeout int, onChunk func(backend.ExecChunk)) (int, error) {
+// targetExecutor 若非空即目标 executor 的节点身份(executor_id);空=单根回退到自身。
+func (b *RelayBackend) ExecStream(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, onChunk func(backend.ExecChunk)) (int, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return 0, err
 	}
-	if targetWatch == "" {
-		targetWatch = b.watchID
+	if targetExecutor == "" {
+		targetExecutor = b.executorID
 	}
 
-	resp, err := b.client.ExecStream(ctx, targetWatch, cmd, cwd, timeout, func(chunk protocol.ExecChunk) {
+	resp, err := b.client.ExecStream(ctx, targetExecutor, cmd, cwd, timeout, func(chunk protocol.ExecChunk) {
 		if onChunk != nil {
 			onChunk(backend.ExecChunk{Stdout: chunk.Stdout, Data: chunk.Data})
 		}
@@ -270,12 +272,12 @@ func (b *RelayBackend) ExecStream(ctx context.Context, targetWatch, cmd string, 
 }
 
 // Transport 将文件内容纯下发写到达远端执行方的目标路径(Jobs=false,不触发 workspace job)。
-// 用于部署二进制等场景;targetWatch 指向执行方注册的 watch(通常是根 watch)。
-func (b *RelayBackend) Transport(ctx context.Context, targetWatch, dest string, content []byte) error {
+// 用于部署二进制等场景;targetExecutor 指向执行方注册的 watch(通常是根 watch)。
+func (b *RelayBackend) Transport(ctx context.Context, targetExecutor, dest string, content []byte) error {
 	if err := b.ensureConnected(ctx); err != nil {
 		return err
 	}
-	resp, err := b.client.Transport(ctx, targetWatch, dest, content)
+	resp, err := b.client.Transport(ctx, targetExecutor, dest, content)
 	if err != nil {
 		return err
 	}
@@ -286,14 +288,14 @@ func (b *RelayBackend) Transport(ctx context.Context, targetWatch, dest string, 
 }
 
 // PushJob 将文件直达发到远端执行器并触发其本地 jobs;输出流式回调。无在线执行器时由中转兜底落地。
-func (b *RelayBackend) PushJob(ctx context.Context, targetWatch, relPath string, content []byte, on func(backend.ExecChunk)) (int, error) {
+func (b *RelayBackend) PushJob(ctx context.Context, targetExecutor, relPath string, content []byte, on func(backend.ExecChunk)) (int, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return 0, err
 	}
-	if targetWatch == "" {
-		targetWatch = b.watchID
+	if targetExecutor == "" {
+		targetExecutor = b.executorID
 	}
-	resp, err := b.client.PushJob(ctx, targetWatch, relPath, content, func(ch protocol.ExecChunk) {
+	resp, err := b.client.PushJob(ctx, targetExecutor, relPath, content, func(ch protocol.ExecChunk) {
 		if on != nil {
 			on(backend.ExecChunk{Stdout: ch.Stdout, Data: ch.Data})
 		}
@@ -306,38 +308,37 @@ func (b *RelayBackend) PushJob(ctx context.Context, targetWatch, relPath string,
 
 // PushNoJobs 把内容纯下发到执行器的 dest 绝对路径(Jobs=false 的 transport 通道),
 // 不触发任何 workspace job。对应 `relay push --no-jobs --dest <abs>`。
-// targetWatch 为空时回退到本 watch(根)执行器。
-func (b *RelayBackend) PushNoJobs(ctx context.Context, targetWatch, dest string, content []byte) (int, error) {
+// targetExecutor 为空时回退到本 watch(根)执行器。
+func (b *RelayBackend) PushNoJobs(ctx context.Context, targetExecutor, dest string, content []byte) (int, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return 0, err
 	}
-	if targetWatch == "" {
-		targetWatch = b.watchID
+	if targetExecutor == "" {
+		targetExecutor = b.executorID
 	}
-	resp, err := b.client.Transport(ctx, targetWatch, dest, content)
+	resp, err := b.client.Transport(ctx, targetExecutor, dest, content)
 	if err != nil {
 		return 0, err
 	}
 	return resp.ExitCode, nil
 }
 
-// TunnelOpen 打开一条到远端 exec 出网的隧道(本地 SOCKS5 端点按需调用)。`watchID` 声明选用
-// 哪台 executor 的出口(与 exec/push/status 的工作区寻址一致);命中 watch 无在线执行方时,
-// TunnelOpen 在建连确认即失败并返回可读错误(无可用执行方)。
-func (b *RelayBackend) TunnelOpen(ctx context.Context, watchID, target string, port uint16) (*client.TunnelStream, error) {
+// TunnelOpen 打开一条到远端 executor 出网的隧道(本地 SOCKS5 端点按需调用)。executorID 声明
+// 选用的出口;命中的 executor 无在线执行方时,建连确认即失败并返回可读错误(无可用执行方)。
+func (b *RelayBackend) TunnelOpen(ctx context.Context, executorID, target string, port uint16) (*client.TunnelStream, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return nil, err
 	}
-	return b.client.TunnelOpen(ctx, watchID, target, port)
+	return b.client.TunnelOpen(ctx, executorID, target, port)
 }
 
 // ConfigSync 请求方把新配置经中转流式直达执行方落盘(WS 流式通道,不写 command 文件)。
-// ConfigSync 经中转把配置流式直达指定执行方落盘(targetWatch 为其注册 watch_id;空=单根回退)。
-func (b *RelayBackend) ConfigSync(ctx context.Context, targetWatch string, payload []byte) (int, error) {
+// ConfigSync 经中转把配置流式直达指定执行方落盘(targetExecutor 为其节点身份 executor_id;空=单根回退)。
+func (b *RelayBackend) ConfigSync(ctx context.Context, targetExecutor string, payload []byte) (int, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return 1, err
 	}
-	resp, err := b.client.ConfigSync(ctx, targetWatch, payload)
+	resp, err := b.client.ConfigSync(ctx, targetExecutor, payload)
 	if err != nil {
 		return 1, err
 	}
@@ -367,13 +368,13 @@ func (b *RelayBackend) enableExecutor() {
 // handleInboundConfigSync 执行方收到流式 config-sync:解码、校验、原子落盘到自身
 // config_path,随后回执给请求方。复用 config.ApplyConfigFile 与文件命令交换同一份逻辑。
 func (b *RelayBackend) handleInboundConfigSync(sess *client.ConfigSyncSession) {
-	log.Printf("[config-sync] received config for watch %s", sess.WatchID())
+	log.Printf("[config-sync] received config for watch %s", sess.ExecutorID())
 	payload, err := base64.StdEncoding.DecodeString(sess.Payload())
 	if err != nil {
 		_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: "config-sync: bad base64: " + err.Error()})
 		return
 	}
-	// 保留执行方自身身份字段(watch_id/executor/... 见 config.ExecutorOwnedKeys):
+	// 保留执行方自身身份字段(executor_id/executor/... 见 config.ExecutorOwnedKeys):
 	// 本地协调方配置通常没有这些,整体覆写会把执行方身份清掉导致注册失败。
 	merged, err := config.MergeConfigPreservingIdentity(payload, b.configPath)
 	if err != nil {
@@ -400,7 +401,7 @@ const tunnelDialTimeout = 10 * time.Second
 func (b *RelayBackend) handleInboundTunnelConnect(sess *client.TunnelSession) {
 	ip, ok := config.CheckTunnelTarget(b.tunnelAllow, sess.Target(), int(sess.Port()))
 	if !ok {
-		log.Printf("[tunnel] deny target %s:%d (watch=%s) not in network_allow", sess.Target(), sess.Port(), sess.WatchID())
+		log.Printf("[tunnel] deny target %s:%d (watch=%s) not in network_allow", sess.Target(), sess.Port(), sess.ExecutorID())
 		sess.Reject(fmt.Sprintf("target %s:%d not allowed by network_allow", sess.Target(), sess.Port()))
 		return
 	}
@@ -413,7 +414,7 @@ func (b *RelayBackend) handleInboundTunnelConnect(sess *client.TunnelSession) {
 		sess.Reject("dial " + addr + ": " + err.Error())
 		return
 	}
-	log.Printf("[tunnel] conn %s:%d via %s (watch=%s)", sess.Target(), sess.Port(), addr, sess.WatchID())
+	log.Printf("[tunnel] conn %s:%d via %s (watch=%s)", sess.Target(), sess.Port(), addr, sess.ExecutorID())
 	sess.Accept(conn)
 }
 
@@ -433,7 +434,7 @@ func currentPushJobsHandler() backend.PushJobHandler {
 // handleInboundPushJob 收到转发来的流式 push-job:把临时落盘内容搬进本地 executor 目录,
 // 再调用已注册的回调在远端跑该工作区的 jobs,并逐一 job 输出回流向请求方。
 func (b *RelayBackend) handleInboundPushJob(sess *client.PushJobSession) {
-	log.Printf("[push] receiving %s (watch=%s, jobs=%v)", sess.RelPath, sess.WatchID, sess.Jobs)
+	log.Printf("[push] receiving %s (watch=%s, jobs=%v)", sess.RelPath, sess.ExecutorID, sess.Jobs)
 	src := sess.Temp.Name()
 
 	// Jobs=false:纯传输下发,内容写到目标路径(可为绝对路径)即完成,不跑 workspace job。
@@ -470,7 +471,7 @@ func (b *RelayBackend) handleInboundPushJob(sess *client.PushJobSession) {
 	}
 
 	out := func(ch backend.ExecChunk) { _ = sess.Write(ch.Stdout, ch.Data) }
-	exit := h(sess.WatchID, sess.AbsPath, out)
+	exit := h(sess.ExecutorID, sess.AbsPath, out)
 	log.Printf("[push] done %s -> %s (exit=%d)", sess.RelPath, absPath, exit)
 	_ = sess.Done(protocol.ExecResponse{ExitCode: exit})
 }
@@ -561,8 +562,8 @@ func (b *RelayBackend) writePushedFile(relPath, srcPath string) (string, error) 
 func (b *RelayBackend) registerExecutor() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := b.client.RegisterExecutor(ctx, b.watchID, "add", version.String()); err != nil {
-		log.Printf("[relay] register executor for %s: %v", b.watchID, err)
+	if err := b.client.RegisterExecutor(ctx, b.executorID, "add", version.String()); err != nil {
+		log.Printf("[relay] register executor for %s: %v", b.executorID, err)
 		return
 	}
 
@@ -572,21 +573,21 @@ func (b *RelayBackend) registerExecutor() {
 	b.regLogged = true
 	b.regMu.Unlock()
 	if first {
-		log.Printf("[relay] registered as executor for watch %s", b.watchID)
+		log.Printf("[relay] registered as executor for watch %s", b.executorID)
 	} else {
-		logx.Debugf("[relay] re-registered as executor for watch %s", b.watchID)
+		logx.Debugf("[relay] re-registered as executor for watch %s", b.executorID)
 	}
 }
 
 // handleInboundExec 执行中转转发来的命令,并把输出流式写回,最后回 exit code。
 func (b *RelayBackend) handleInboundExec(sess *client.ExecSession) {
-	log.Printf("[exec] receiving cmd=%q cwd=%q timeout=%ds (watch=%s)", sess.Cmd(), sess.Cwd(), sess.Timeout(), sess.WatchID())
+	log.Printf("[exec] receiving cmd=%q cwd=%q timeout=%ds (watch=%s)", sess.Cmd(), sess.Cwd(), sess.Timeout(), sess.ExecutorID())
 	start := time.Now()
 	exit := runStream(sess.Cmd(), sess.Cwd(), sess.Timeout(), func(stdout bool, data string) {
 		_ = sess.Write(stdout, data)
 	})
 	dur := time.Since(start)
-	log.Printf("[exec] done exit=%d duration=%s (watch=%s)", exit, dur.Round(time.Millisecond), sess.WatchID())
+	log.Printf("[exec] done exit=%d duration=%s (watch=%s)", exit, dur.Round(time.Millisecond), sess.ExecutorID())
 	_ = sess.Done(protocol.ExecResponse{
 		ExitCode: exit,
 		Duration: dur.Milliseconds(),
@@ -749,7 +750,7 @@ func (b *RelayBackend) SubscribeEvents(ctx context.Context) error {
 		return err
 	}
 
-	if err := b.client.Subscribe(ctx, b.watchID); err != nil {
+	if err := b.client.Subscribe(ctx, b.executorID); err != nil {
 		return err
 	}
 

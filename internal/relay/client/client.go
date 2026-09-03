@@ -17,7 +17,7 @@ import (
 type Client struct {
 	url       string
 	token     string
-	watchID   string
+	id        string
 	headers   http.Header // WebSocket 握手携带的自定义头(中转前置鉴权)
 	conn      *websocket.Conn
 	connMu    sync.RWMutex // 保护 conn:持久的写循环在重连后会写新 conn
@@ -69,11 +69,11 @@ func WithHeaders(h http.Header) Option {
 	return func(c *Client) { c.headers = h }
 }
 
-func New(url, token, watchID string, opts ...Option) (*Client, error) {
+func New(url, token, id string, opts ...Option) (*Client, error) {
 	c := &Client{
 		url:           url,
 		token:         token,
-		watchID:       watchID,
+		id:            id,
 		sendCh:        make(chan sendMsg, 100),
 		recvCh:        make(chan *protocol.Message, 100),
 		eventCh:       make(chan protocol.FileEvent, 100),
@@ -121,7 +121,7 @@ func (c *Client) dial(ctx context.Context) error {
 			ClientID:  uuid.New().String(),
 			Token:     c.token,
 			Version:   1,
-			Subscribe: []string{c.watchID},
+			Subscribe: []string{c.id},
 		},
 	}
 
@@ -437,12 +437,13 @@ func (c *Client) failAllPending(reason string) {
 	}
 }
 
-// RegisterExecutor 向服务端注册(或注销,action="remove")本客户端为某 watch 的执行方。
-func (c *Client) RegisterExecutor(ctx context.Context, watchID, action, buildVersion string) error {
+// RegisterExecutor 向服务端注册(或注销,action="remove")本客户端为某执行方。
+// executorID 即执行方节点身份(backend.config.executor_id)。
+func (c *Client) RegisterExecutor(ctx context.Context, executorID, action, buildVersion string) error {
 	resp, err := c.Request(ctx, protocol.MsgRegisterExecutor, protocol.RegisterExecutorRequest{
-		WatchID: watchID,
-		Action:  action,
-		Version: buildVersion,
+		ExecutorID: executorID,
+		Action:     action,
+		Version:    buildVersion,
 	})
 	if err != nil {
 		return err
@@ -505,7 +506,7 @@ func (c *Client) Subscribe(ctx context.Context, watchID string) error {
 
 func (c *Client) List(ctx context.Context, path string) ([]protocol.FileEntry, error) {
 	resp, err := c.Request(ctx, protocol.MsgList, protocol.ListRequest{
-		WatchID: c.watchID,
+		WatchID: c.id,
 		Path:    path,
 	})
 	if err != nil {
@@ -540,7 +541,7 @@ func (c *Client) List(ctx context.Context, path string) ([]protocol.FileEntry, e
 
 func (c *Client) Delete(ctx context.Context, path string) error {
 	_, err := c.Request(ctx, protocol.MsgDelete, protocol.DeleteRequest{
-		WatchID: c.watchID,
+		WatchID: c.id,
 		Path:    path,
 	})
 	return err

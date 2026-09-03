@@ -343,7 +343,7 @@ func TestIntegration_Version(t *testing.T) {
 				t.Errorf("transit node missing version/goos: %+v", n)
 			}
 		case "executor":
-			if n.WatchID == "test-watch" && n.Version == "test-build-1" {
+			if n.ExecutorID == "test-watch" && n.Version == "test-build-1" {
 				hasExecutor = true
 			}
 		}
@@ -393,7 +393,7 @@ func TestIntegration_Status_Full(t *testing.T) {
 		t.Fatalf("executors: got %d, want 1: %+v", len(st.Executors), st.Executors)
 	}
 	e := st.Executors[0]
-	if e.WatchID != "test-watch" || e.Version != "test-build-1" {
+	if e.ExecutorID != "test-watch" || e.Version != "test-build-1" {
 		t.Errorf("executor headers: got %+v", e)
 	}
 	if e.Seg2.LatencyMS == nil || *e.Seg2.LatencyMS < 0 {
@@ -651,10 +651,10 @@ func upgradeOverWS(t *testing.T, wsURL, token string, content []byte, digest str
 		ID:       "up-1",
 		StreamID: streamID,
 		Payload: protocol.ServerUpgradeRequest{
-			WatchID:  "test-watch",
-			Size:     int64(len(content)),
-			Digest:   digest,
-			StreamID: streamID,
+			ExecutorID: "test-watch",
+			Size:       int64(len(content)),
+			Digest:     digest,
+			StreamID:   streamID,
 		},
 	}
 	if err := conn.WriteJSON(header); err != nil {
@@ -1338,7 +1338,7 @@ func TestIntegration_ExecutorDynamicWatch(t *testing.T) {
 	st := decodeStatus(t, resp)
 	var found bool
 	for _, e := range st.Executors {
-		if e.WatchID == "extraneous" && e.Version == "dyn-build" {
+		if e.ExecutorID == "extraneous" && e.Version == "dyn-build" {
 			found = true
 		}
 	}
@@ -1347,7 +1347,7 @@ func TestIntegration_ExecutorDynamicWatch(t *testing.T) {
 	}
 
 	// exec 必须透明转发到动态 watch 的执行方并拿到回执。
-	exresp, err := c.Request(ctx, protocol.MsgExec, map[string]interface{}{"watch_id": "extraneous", "cmd": "echo hi"})
+	exresp, err := c.Request(ctx, protocol.MsgExec, map[string]interface{}{"executor_id": "extraneous", "cmd": "echo hi"})
 	if err != nil {
 		t.Fatalf("exec to dynamic watch: %v", err)
 	}

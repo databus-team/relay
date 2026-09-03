@@ -44,13 +44,13 @@ func runTunnel() {
 		os.Exit(1)
 	}
 
-	// 出口 executor 选择:`-w` 是「执行方注册所在的服务端 watch_id」(见 `relay status` 的
-	// `executor watch=...`),不是本地工作区名。因此不走 resolveWorkspaceID 的 cwd 推断、也
+	// 出口 executor 选择:`-w` 是「执行方注册的节点身份 executor_id」(见 `relay status` 的
+	// `executors[].executor_id`),不是本地工作区名。因此不走 resolveWorkspaceID 的 cwd 推断、也
 	// 不要求命中 cfg.Workspaces(那是 workspace,与执行方 watch 是两个命名空间)。中转按该
 	// watch 解析已注册 exec 的 executor;无在线执行方 → 建连即失败。
-	w := *tunnelWatch
+	w := *tunnelExecName
 	if w == "" {
-		fmt.Fprintf(os.Stderr, "Specify -w with the egress executor's server watch id (see `relay status` -> `executor watch=...`).\n")
+		fmt.Fprintf(os.Stderr, "Specify --executor with the egress executor's executor_id (see `relay status --json` -> `executors[].executor_id`).\n")
 		os.Exit(1)
 	}
 
