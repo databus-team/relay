@@ -109,9 +109,14 @@ var (
 	serverRemoteExpect = serverRemoteCmd.Flag("expect", "Expected transit version after swap (default: this relay's version.String())").String()
 
 	// Tunnel command - 本地 SOCKS5 出网隧道,经所选 executor 出口访问内网白名单目标。
+	// action 位置参数:默认/run=前台;start/stop/status/restart/upgrade 为 daemon 控制。
+	// executor 在 start/stop/restart/upgrade/前台 时必需;status 可不带以列出全部实例。
 	tunnelCmd      = kingpin.Command("tunnel", "本地 SOCKS5 出网隧道:经所选 executor 访问其内网白名单")
 	tunnelListen   = tunnelCmd.Flag("listen", "Local SOCKS5 listen address").Default("127.0.0.1:1080").String()
-	tunnelExecName = tunnelCmd.Flag("executor", "Egress executor's executor_id (see `relay status` -> executors[].executor_id); required").Short('w').Required().String()
+	tunnelExecName = tunnelCmd.Flag("executor", "Egress executor's executor_id (see `relay status` -> executors[].executor_id)").Short('w').String()
+	tunnelAction   = tunnelCmd.Arg("action", "run|start|stop|status|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "restart", "upgrade").String()
+	// upgrade 用的新二进制路径(仅 action=upgrade 时使用)。
+	tunnelUpgradePath = tunnelCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 )
 
 func main() {
@@ -198,7 +203,26 @@ func main() {
 	case jobRun.FullCommand():
 		runJobRun()
 	case tunnelCmd.FullCommand():
-		runTunnel()
+		switch normalizedAction(*tunnelAction) {
+		case "start":
+			if err := daemonStartTunnel(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		case "stop":
+			daemonStopTunnel()
+		case "status":
+			if err := daemonStatusTunnel(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		case "restart":
+			daemonRestartTunnel()
+		case "upgrade":
+			daemonUpgradeTunnel(*tunnelUpgradePath)
+		default:
+			runTunnel()
+		}
 	default:
 		app.Usage(os.Args)
 	}
@@ -218,20 +242,26 @@ func normalizedAction(a string) string {
 
 // daemonStart 已运行则提示,否则 detached 拉起 `relay <name> run -c <config>` 并记录 pid。
 func daemonStart(name string) error {
-	pidFile, logFile := daemon.PidFile(name), daemon.LogFile(name)
+	return daemonStartArgs(name, []string{name, "run", "-c", *configPath})
+}
+
+// daemonStartArgs 以 instance 为 pid/log 文件标识,用给定 args(含子命令,如 ["tunnel","run",...])
+// detached 启动一个 daemon。多实例(如隧道)与单实例(server/watch)共用此核心,仅文件标识不同。
+func daemonStartArgs(instance string, args []string) error {
+	pidFile, logFile := daemon.PidFile(instance), daemon.LogFile(instance)
 	st := daemon.Get(pidFile)
 	if st.Err != nil {
 		return st.Err
 	}
 	if st.Running {
-		fmt.Printf("%s already running (pid %d)\n", name, st.Pid)
+		fmt.Printf("%s already running (pid %d)\n", instance, st.Pid)
 		return nil
 	}
-	pid, err := daemon.Start([]string{name, "run", "-c", *configPath}, logFile, pidFile)
+	pid, err := daemon.Start(args, logFile, pidFile)
 	if err != nil {
-		return fmt.Errorf("daemon start %s: %w", name, err)
+		return fmt.Errorf("daemon start %s: %w", instance, err)
 	}
-	fmt.Printf("%s started (pid %d)\nlog: %s\n", name, pid, logFile)
+	fmt.Printf("%s started (pid %d)\nlog: %s\n", instance, pid, logFile)
 	return nil
 }
 
@@ -246,27 +276,37 @@ func daemonStop(name string) {
 
 // daemonRestart 先停再启。
 func daemonRestart(name string) {
-	pidFile, logFile := daemon.PidFile(name), daemon.LogFile(name)
+	daemonRestartArgs(name, []string{name, "run", "-c", *configPath})
+}
+
+// daemonRestartArgs 与 daemonRestart 相同,但按实例标识 + 自定义 args 重启(供多实例隧道复用)。
+func daemonRestartArgs(instance string, args []string) {
+	pidFile, logFile := daemon.PidFile(instance), daemon.LogFile(instance)
 	st := daemon.Get(pidFile)
 	if st.Err == nil && st.Running {
 		_ = daemon.Stop(pidFile)
 	}
-	pid, err := daemon.Start([]string{name, "run", "-c", *configPath}, logFile, pidFile)
+	pid, err := daemon.Start(args, logFile, pidFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}
-	fmt.Printf("%s restarted (pid %d)\nlog: %s\n", name, pid, logFile)
+	fmt.Printf("%s restarted (pid %d)\nlog: %s\n", instance, pid, logFile)
 }
 
 // daemonUpgrade 按需升级:停 daemon → 原子替换自身二进制 → 用新二进制重启。
 // 这是中转/执行方"self-update + reboot"的入口,仅在被调用时动作(非常驻)。
 func daemonUpgrade(name, newBin string) {
+	daemonUpgradeArgs(name, newBin, []string{name, "run", "-c", *configPath})
+}
+
+// daemonUpgradeArgs 按实例标识 + 自定义 args 升级重启(供多实例隧道复用)。
+func daemonUpgradeArgs(instance, newBin string, args []string) {
 	if newBin == "" {
 		fmt.Fprintf(os.Stderr, "Error: action 'upgrade' requires a binary path argument\n")
 		return
 	}
-	pidFile, logFile := daemon.PidFile(name), daemon.LogFile(name)
+	pidFile, logFile := daemon.PidFile(instance), daemon.LogFile(instance)
 	_ = daemon.Stop(pidFile) // 若在跑先停(释放占用,尤其 Windows)
 
 	exe, err := os.Executable()
@@ -278,12 +318,12 @@ func daemonUpgrade(name, newBin string) {
 		fmt.Fprintf(os.Stderr, "Error: replace binary: %v\n", err)
 		return
 	}
-	pid, err := daemon.Start([]string{name, "run", "-c", *configPath}, logFile, pidFile)
+	pid, err := daemon.Start(args, logFile, pidFile)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: restart %s: %v\n", name, err)
+		fmt.Fprintf(os.Stderr, "Error: restart %s: %v\n", instance, err)
 		return
 	}
-	fmt.Printf("%s upgraded & restarted (pid %d, binary=%s)\nlog: %s\n", name, pid, newBin, logFile)
+	fmt.Printf("%s upgraded & restarted (pid %d, binary=%s)\nlog: %s\n", instance, pid, newBin, logFile)
 }
 
 // daemonStatus 报告 pid 状态与日志路径。
@@ -300,6 +340,97 @@ func daemonStatus(name string) error {
 	}
 	return nil
 }
+
+// tunnelInstanceName 由 executor 派生隧道 daemon 的实例名(pid/log 文件名用,形如
+// `tunnel-<executor>`)。executor 是执行方注册的身份,可能含非法文件名字符,做净化后作后缀,
+// 保证每条隧道一个独立 pid/log 文件、可多开;status 按 `ListInstances("tunnel")` 枚举它们。
+func tunnelInstanceName(executor string) string {
+	var b strings.Builder
+	b.WriteString("tunnel-")
+	for _, r := range executor {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
+}
+
+// tunnelDaemonArgs 构造隧道 daemon 子进程的启动参数:`tunnel run` 后透传 -w/--listen/-c,
+// 使子进程与前台 `relay tunnel -w <executor> --listen <addr>` 行为一致。
+// 注意 --listen 未定义 `-l` 短旗标,须用长旗标全名。
+func tunnelDaemonArgs() []string {
+	return []string{"tunnel", "run", "-w", *tunnelExecName, "--listen", *tunnelListen, "-c", *configPath}
+}
+
+// tunnelRequireExecutor 校验隧道控制类操作(启动/停止/重启/升级)必须携带 executor。
+func tunnelRequireExecutor() error {
+	if *tunnelExecName == "" {
+		return fmt.Errorf("Specify --executor with the egress executor's executor_id (see `relay status` -> `executors[].executor_id`)")
+	}
+	return nil
+}
+
+// daemonStartTunnel 以 executor 命名的实例 detached 启动隧道 daemon。
+func daemonStartTunnel() error {
+	if err := tunnelRequireExecutor(); err != nil {
+		return err
+	}
+	return daemonStartArgs(tunnelInstanceName(*tunnelExecName), tunnelDaemonArgs())
+}
+
+// daemonStopTunnel 停止指定 executor 的隧道实例。
+func daemonStopTunnel() {
+	if err := tunnelRequireExecutor(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	daemonStop(tunnelInstanceName(*tunnelExecName))
+}
+
+// daemonStatusTunnel 带 executor 查单实例;不带则列出全部隧道实例状态。
+func daemonStatusTunnel() error {
+	if *tunnelExecName != "" {
+		return daemonStatus(tunnelInstanceName(*tunnelExecName))
+	}
+	insts, err := daemon.ListInstances("tunnel")
+	if err != nil {
+		return err
+	}
+	if len(insts) == 0 {
+		fmt.Println("no tunnel instances")
+		return nil
+	}
+	for _, in := range insts {
+		if in.Status.Running {
+			fmt.Printf("tunnel-%s: running (pid %d)\nlog: %s\n", in.Name, in.Status.Pid, in.LogFile)
+		} else {
+			fmt.Printf("tunnel-%s: stopped\nlog: %s\n", in.Name, in.LogFile)
+		}
+	}
+	return nil
+}
+
+// daemonRestartTunnel 重启指定 executor 的隧道实例。
+func daemonRestartTunnel() {
+	if err := tunnelRequireExecutor(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	daemonRestartArgs(tunnelInstanceName(*tunnelExecName), tunnelDaemonArgs())
+}
+
+// daemonUpgradeTunnel 升级重启指定 executor 的隧道实例。
+func daemonUpgradeTunnel(newBin string) {
+	if err := tunnelRequireExecutor(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	daemonUpgradeArgs(tunnelInstanceName(*tunnelExecName), newBin, tunnelDaemonArgs())
+}
+
 func runWatch() {
 	// Resolve a leading ~ so the path stored on the watcher (used later for
 	// config backup during sync) is an absolute filesystem path, not a literal

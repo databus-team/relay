@@ -3,8 +3,37 @@ package main
 import (
 	"bufio"
 	"net"
+	"reflect"
 	"testing"
 )
+
+// tunnelInstanceName 应把 executor 映射为 `<prefix>-<executor>` 实例名,并净化非法文件名字符。
+func TestTunnelInstanceName(t *testing.T) {
+	cases := []struct {
+		executor, want string
+	}{
+		{"node-a", "tunnel-node-a"},
+		{"a/b:c d", "tunnel-a_b_c_d"}, // 路径分隔/冒号/空格 → 下划线
+		{"中文字符", "tunnel-____"}, // 4 个非 [A-Za-z0-9._-] 全净化(前缀连字符保留)
+	}
+	for _, c := range cases {
+		if got := tunnelInstanceName(c.executor); got != c.want {
+			t.Errorf("tunnelInstanceName(%q) = %q, want %q", c.executor, got, c.want)
+		}
+	}
+}
+
+// tunnelDaemonArgs 应产出 `tunnel run` 的子进程参数,透传 executor/--listen/config,
+// 与前台用法对齐(--listen 用长旗标,因未定义 `-l` 短旗标)。
+func TestTunnelDaemonArgs(t *testing.T) {
+	*tunnelExecName = "node-a"
+	*tunnelListen = "127.0.0.1:9999"
+	*configPath = "~/.relay/config.yaml"
+	want := []string{"tunnel", "run", "-w", "node-a", "--listen", "127.0.0.1:9999", "-c", "~/.relay/config.yaml"}
+	if got := tunnelDaemonArgs(); !reflect.DeepEqual(got, want) {
+		t.Errorf("tunnelDaemonArgs() = %v, want %v", got, want)
+	}
+}
 
 // handshakeOverTCP 用真实 TCP 连接跑一次 SOCKS5 握手(SOCKS 客户端在服务端侧),
 // 返回解析出的目标。TCP 全双工避免 net.Pipe 的同步阻塞问题。

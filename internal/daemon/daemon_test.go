@@ -124,3 +124,41 @@ func TestReplaceBinaryWithKeep_Failed_KeepsPrev(t *testing.T) {
 		t.Fatalf("dst corrupted after failed swap: %q", got)
 	}
 }
+
+// listInstancesIn 应只匹配 `<prefix>-<name>.pid`,忽略无关文件/无连字符前缀的 pid,
+// 且 Name 取 `<prefix>-` 与 `.pid` 之间的部分并按名排序。
+func TestListInstances(t *testing.T) {
+	dir := t.TempDir()
+	// 无关文件与裸名 pid(单实例 server/watch 风格)不应被当成 tunnel 实例。
+	for _, f := range []string{"README", "server.pid", "tunnel.pid"} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 两个真实实例:写入自身 pid 以让其探测为 running。
+	for _, f := range []string{"tunnel-alpha.pid", "tunnel-beta.pid"} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := listInstancesIn(dir, "tunnel")
+	if err != nil {
+		t.Fatalf("listInstancesIn: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 instances, got %d: %+v", len(got), got)
+	}
+	// 字典序:alpha 先于 beta。
+	if got[0].Name != "alpha" || got[1].Name != "beta" {
+		t.Fatalf("order/name wrong: %+v", got)
+	}
+	for _, in := range got {
+		if !in.Status.Running {
+			t.Errorf("instance %q should be running (self pid)", in.Name)
+		}
+		if !strings.HasSuffix(in.LogFile, "tunnel-"+in.Name+".log") {
+			t.Errorf("log file %q does not carry instance prefix+name", in.LogFile)
+		}
+	}
+}

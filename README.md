@@ -347,6 +347,23 @@ relay tunnel --listen 127.0.0.1:1080 --executor site-a   # egress via executor s
 curl --socks5-hostname 127.0.0.1:1080 http://intra.a.internal/ping
 ```
 
+**Daemon mode (like `relay server`/`relay watch`):** run the tunnel as a detached background process so it
+survives the launching shell/SSH session, managed per-executor. Foreground (`relay tunnel -w site-a`, the
+default) stays unchanged. Control actions:
+
+```sh
+relay tunnel -w site-a start      # detached daemon, log ~/.relay/tunnel-site-a.log
+relay tunnel -w site-a status     # one instance's status
+relay tunnel status               # list ALL tunnel instances (multi-executor) + their pid/log
+relay tunnel -w site-a restart    # reboot one
+relay tunnel -w site-a stop       # stop one
+relay tunnel -w site-a upgrade <bin>   # swap binary & restart one
+```
+
+Each executor maps to its own daemon instance (`tunnel-<executor>`, independent pid/log under `~/.relay`),
+so tunnels for different egress executors run side-by-side and `relay tunnel status` (no `--executor`)
+reports them all at once.
+
 - `--executor` (`-w` alias) selects the egress executor by its node identity **executor_id** (the
   `executors[].executor_id` shown by `relay status --json`) — required. It is passed straight through to the
   transit and routed to the target executor by executor_id (no workspace mapping).

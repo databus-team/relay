@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -26,6 +27,52 @@ func PidFile(name string) string { return filepath.Join(baseDir(), name+".pid") 
 
 // LogFile 返回 <name>.log 的路径。
 func LogFile(name string) string { return filepath.Join(baseDir(), name+".log") }
+
+// Instance 描述一个多实例 daemon 的单个实例,供 `ListInstances` 返回。
+type Instance struct {
+	Name    string     // 实例标识,如 `tunnel-<executor>`
+	PidFile string     // pid 文件路径
+	LogFile string     // 日志文件路径
+	Status  StatusInfo // 存活探测结果
+}
+
+// ListInstances 枚举 baseDir 下形如 `<prefix>-<name>.pid` 的 daemon 实例(prefix 不含结尾
+// 连字符,如 "tunnel")。返回实例名取自文件名中 `<prefix>-` 之后、`.pid` 之前的部分,
+// 按 name 字典序排序。用于需要同时管理多个同类 daemon(如多条隧道)的场景。
+func ListInstances(prefix string) ([]Instance, error) {
+	return listInstancesIn(baseDir(), prefix)
+}
+
+// listInstancesIn 在指定目录下枚举 `<prefix>-<name>.pid` 实例,便于测试隔离(不污染 ~/.relay)。
+func listInstancesIn(dir, prefix string) ([]Instance, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	pre := prefix + "-"
+	var out []Instance
+	for _, e := range entries {
+		n := e.Name()
+		if !strings.HasPrefix(n, pre) || !strings.HasSuffix(n, ".pid") {
+			continue
+		}
+		name := strings.TrimSuffix(strings.TrimPrefix(n, pre), ".pid")
+		if name == "" {
+			continue
+		}
+		out = append(out, Instance{
+			Name:    name,
+			PidFile: filepath.Join(dir, n),
+			LogFile: filepath.Join(dir, n[:len(n)-len(".pid")]+".log"),
+			Status:  Get(filepath.Join(dir, n)),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
 
 // Status 读取 pid 文件并探测进程是否存活。
 type StatusInfo struct {
