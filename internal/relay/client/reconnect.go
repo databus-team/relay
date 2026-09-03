@@ -41,7 +41,7 @@ func (c *Client) reconnectLoop(ctx context.Context) {
 
 		log.Printf("[relay] reconnect attempt %d/%d", retries+1, c.reconnectCfg.MaxRetries)
 
-		if err := c.dial(ctx); err != nil {
+		if err := c.establish(ctx); err != nil {
 			log.Printf("[relay] reconnect failed: %v", err)
 			retries++
 			delay *= 2
@@ -52,12 +52,8 @@ func (c *Client) reconnectLoop(ctx context.Context) {
 		}
 
 		log.Printf("[relay] reconnected successfully")
-		c.connected.Store(true)
-		// 为每条新连接重启 readLoop。writeLoop 是单例(仅 Connect 启动一次,随 sendCh 常驻),
-		// 重连不复启——两个写 goroutine 并发写同一 conn 会 panic;而 heartbeat 可安全重启:
-		// 它只经 sendCh 投递(不直写 conn),startHeartbeat 内部按代际退出旧心跳,不会叠叠。
-		go c.readLoop()
-		go c.startHeartbeat(ctx)
+		// establish 已串行化承担 readLoop/heartbeat 的按连接重启,且 writeLoop 用 writeOnce
+		// 保证终身只一条(重复 Connect/重连绝不会叠起两个写者并发写同一 conn 导致 panic)。
 		c.fireOnReconnect()
 		return
 	}

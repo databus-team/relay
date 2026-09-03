@@ -21,6 +21,8 @@ type Client struct {
 	headers   http.Header // WebSocket 握手携带的自定义头(中转前置鉴权)
 	conn      *websocket.Conn
 	connMu    sync.RWMutex // 保护 conn:持久的写循环在重连后会写新 conn
+	connectMu sync.Mutex   // 串行化连接建立:Connect 与 reconnectLoop 互斥,避免并发 dial/叠起循环
+	writeOnce sync.Once    // 保证 writeLoop 终身仅一条:重复 Connect/重连不复启,杜绝并发写同一 conn
 	connected atomic.Bool
 
 	sendCh    chan sendMsg
@@ -94,12 +96,31 @@ func New(url, token, id string, opts ...Option) (*Client, error) {
 }
 
 func (c *Client) Connect(ctx context.Context) error {
+	if err := c.establish(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// establish 完成一次拨号并把连接接入收发循环。Connect 与 reconnectLoop 都经它建立连接,
+// 靠 connectMu 互斥:同一时刻只进行一次建立,避免并发 Connect/重连产生两条 readLoop 读
+// 同一 conn、或重叠拨号。writeLoop 用 writeOnce 终身只启一条——重复 Connect/重连绝不叠起
+// 写者(两个 goroutine 并发 WriteJSON 到同一 *websocket.Conn 会 panic)。
+func (c *Client) establish(ctx context.Context) error {
+	c.connectMu.Lock()
+	defer c.connectMu.Unlock()
+
+	if c.IsConnected() {
+		return nil // 已在线(可能刚由并发重连建立),无需重复拨号
+	}
+
 	if err := c.dial(ctx); err != nil {
 		return err
 	}
+
 	c.connected.Store(true)
+	c.writeOnce.Do(func() { go c.writeLoop() })
 	go c.readLoop()
-	go c.writeLoop()
 	go c.startHeartbeat(ctx)
 	return nil
 }
