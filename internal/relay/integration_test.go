@@ -1247,7 +1247,10 @@ func TestTunnel_MaxTunnelsCap(t *testing.T) {
 	}
 	defer sa.Close()
 
-	if _, err := c.TunnelOpen(ctx, "test-watch", host, port); err == nil {
+	// 第二路带短超时:打满上限会触发客户端退避重试(共用建连预算),定界后不拖慢整个测试。
+	retryCtx, retryCancel := context.WithTimeout(ctx, 800*time.Millisecond)
+	defer retryCancel()
+	if _, err := c.TunnelOpen(retryCtx, "test-watch", host, port); err == nil {
 		t.Fatal("expected second concurrent tunnel to be rejected by the cap, got nil")
 	} else if !strings.Contains(err.Error(), "too many concurrent") {
 		t.Errorf("unexpected error: %v", err)

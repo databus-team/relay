@@ -15,9 +15,21 @@ import (
 	"github.com/user/relay/internal/relay/protocol"
 )
 
-// tunnelConnectTimeout 等待隧道建连确认(executor 白名单校验 + 真实连接)的上限。
-// 超时即放弃并把该 stream 的注册表条目拆除,避免请求方无界挂起或泄漏中转槽位(与 status 探针的分析同构)。
+// tunnelConnectTimeout 是等待隧道建连确认的总预算:单次尝试(executor 白名单校验 + 真实连接)
+// 与「并发已满被拒后的退避重试」共用这一个上限。超时即放弃并把该 stream 的注册表条目拆除,
+// 避免请求方无界挂起或泄漏中转槽位(与 status 探针的分析同构)。
 const tunnelConnectTimeout = 15 * time.Second
+
+// tunnelRetryBase / tunnelRetryMaxBackoff 控制「隧道并发打满(max_tunnels)被拒」后的退避节奏:
+// 指数退避、封顶,避免请求方对一个已饱和的槽位反复 fail-fast 空转。其它建连错误不重试。
+const (
+	tunnelRetryBase       = 50 * time.Millisecond
+	tunnelRetryMaxBackoff = 1 * time.Second
+)
+
+// tunnelErrTooManyConcurrent 是服务器在并发隧道打满时的拒建文案,客户端据此触发退避重试。
+// 与 server/client.go 的 SendError 文案保持一致。
+const tunnelErrTooManyConcurrent = "tunnel: too many concurrent tunnels"
 
 // tunnelWriteTimeout 是 executor 向真实目标写数据时的单次写上限,防止慢/停读目标把处理方读循环无限阻塞。
 const tunnelWriteTimeout = 60 * time.Second
@@ -294,45 +306,67 @@ type TunnelStream struct {
 // TunnelOpen 打开一条离站的 SOCKS5 隧道(requester 视角):发 MsgTunnelConnect 并等待建连确认。
 // 成功返回 *TunnelStream;失败(执行方不可达/白名单拒/无在线执行方/超时)返回错误,并把该 stream
 // 的中转注册表条目拆除(发 MsgTunnelEnd),避免被拒/超时建连泄漏中转槽位(耗尽 maxTunnels)。
+// 「并发隧道打满」属可恢复的瞬时缺槽,在此做指数退避重试(共用 tunnelConnectTimeout 预算);
+// 其余建连错误直接失败,不重复尝试。
 func (c *Client) TunnelOpen(ctx context.Context, executorID, target string, port uint16) (*TunnelStream, error) {
-	id := uuid.New().String()
-	msg := &protocol.Message{
-		Type:     protocol.MsgTunnelConnect,
-		ID:       id,
-		StreamID: id,
-		Payload: protocol.TunnelConnectRequest{
-			ExecutorID: executorID,
-			Target:     target,
-			Port:       port,
-			StreamID:   id,
-		},
-	}
-
-	// 建连确认只在等待期内有效;超时视为失败并拆除该 stream(复用 sendAndWait 的 pending/send 语义,
-	// 但就建连这一等待单独加上限,防止对黑洞目标无界挂起)。
+	// 建连确认只在总预算内有效;超时视为失败并拆除该 stream(复用 sendAndWait 的 pending/send
+	// 语义,但就建连这一等待单独加上限,防止对黑洞目标无界挂起)。
 	waitCtx, cancel := context.WithTimeout(ctx, tunnelConnectTimeout)
 	defer cancel()
-	resp, err := c.sendAndWait(waitCtx, msg)
-	if err != nil {
-		c.sendAbortTunnel(id, "connect wait: "+err.Error())
-		return nil, fmt.Errorf("tunnel connect: %w", err)
-	}
-	if !resp.OK {
-		c.sendAbortTunnel(id, tunnelAckError(resp))
-		return nil, fmt.Errorf("tunnel connect failed: %s", tunnelAckError(resp))
-	}
 
-	ts := &TunnelStream{
-		client:  c,
-		ID:      id,
-		dataCh:  make(chan []byte, 64),
-		errCh:   make(chan error, 1),
-		closeCh: make(chan struct{}),
+	backoff := tunnelRetryBase
+	for {
+		id := uuid.New().String()
+		msg := &protocol.Message{
+			Type:     protocol.MsgTunnelConnect,
+			ID:       id,
+			StreamID: id,
+			Payload: protocol.TunnelConnectRequest{
+				ExecutorID: executorID,
+				Target:     target,
+				Port:       port,
+				StreamID:   id,
+			},
+		}
+
+		resp, err := c.sendAndWait(waitCtx, msg)
+		if err != nil {
+			c.sendAbortTunnel(id, "connect wait: "+err.Error())
+			return nil, fmt.Errorf("tunnel connect: %w", err)
+		}
+		if resp.OK {
+			ts := &TunnelStream{
+				client:  c,
+				ID:      id,
+				dataCh:  make(chan []byte, 64),
+				errCh:   make(chan error, 1),
+				closeCh: make(chan struct{}),
+			}
+			c.tunnelMu.Lock()
+			c.tunnelStreams[id] = ts
+			c.tunnelMu.Unlock()
+			return ts, nil
+		}
+
+		reason := tunnelAckError(resp)
+		c.sendAbortTunnel(id, reason)
+		tooMany := fmt.Errorf("tunnel connect failed: %s", reason)
+
+		// 并发已满属瞬时缺槽:指数退避等槽位让位再试,超总预算则以最后一次拒答返回。
+		// 不是打满的其它建连错误(无在线执行方/白名单拒/拨号不可达等)不透明重试,直接失败。
+		if reason != tunnelErrTooManyConcurrent {
+			return nil, tooMany
+		}
+		select {
+		case <-waitCtx.Done():
+			return nil, tooMany
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > tunnelRetryMaxBackoff {
+			backoff = tunnelRetryMaxBackoff
+		}
 	}
-	c.tunnelMu.Lock()
-	c.tunnelStreams[id] = ts
-	c.tunnelMu.Unlock()
-	return ts, nil
 }
 
 func (c *Client) getTunnelStream(streamID string) *TunnelStream {
