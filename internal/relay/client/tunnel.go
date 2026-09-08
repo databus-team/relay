@@ -317,6 +317,21 @@ func (c *Client) TunnelOpen(ctx context.Context, executorID, target string, port
 	backoff := tunnelRetryBase
 	for {
 		id := uuid.New().String()
+		// 预注册:发出 MsgTunnelConnect 前先登记出站 stream,保证「等待建连 OK 的窗口期」内已到达
+		// 的本流远端首帧(连接成功后 SSH/GitLab 服务端会立即主动推送 SSH-2.0 banner)能安全进
+		// dataCh 待领,而不是被 handleInboundTunnelData 当作未知 stream 静默丢弃——否则握手初期
+		// 偶发丢掉首个数据包,表现为 SSH banner exchange invalid format / 卡死,重试才恢复。
+		ts := &TunnelStream{
+			client:  c,
+			ID:      id,
+			dataCh:  make(chan []byte, 64),
+			errCh:   make(chan error, 1),
+			closeCh: make(chan struct{}),
+		}
+		c.tunnelMu.Lock()
+		c.tunnelStreams[id] = ts
+		c.tunnelMu.Unlock()
+
 		msg := &protocol.Message{
 			Type:     protocol.MsgTunnelConnect,
 			ID:       id,
@@ -331,24 +346,16 @@ func (c *Client) TunnelOpen(ctx context.Context, executorID, target string, port
 
 		resp, err := c.sendAndWait(waitCtx, msg)
 		if err != nil {
+			c.takeTunnelStream(id)
 			c.sendAbortTunnel(id, "connect wait: "+err.Error())
 			return nil, fmt.Errorf("tunnel connect: %w", err)
 		}
 		if resp.OK {
-			ts := &TunnelStream{
-				client:  c,
-				ID:      id,
-				dataCh:  make(chan []byte, 64),
-				errCh:   make(chan error, 1),
-				closeCh: make(chan struct{}),
-			}
-			c.tunnelMu.Lock()
-			c.tunnelStreams[id] = ts
-			c.tunnelMu.Unlock()
 			return ts, nil
 		}
 
 		reason := tunnelAckError(resp)
+		c.takeTunnelStream(id)
 		c.sendAbortTunnel(id, reason)
 		tooMany := fmt.Errorf("tunnel connect failed: %s", reason)
 
