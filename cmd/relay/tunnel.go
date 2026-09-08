@@ -137,7 +137,12 @@ func handleTunnelConn(ctx context.Context, rb *relaybackend.RelayBackend, watchI
 		for {
 			n, rerr := br.Read(buf)
 			if n > 0 {
-				if serr := stream.Send(buf[:n]); serr != nil {
+				// TunnelStream.Send 是异步入队(writeLoop 在另一 goroutine marshal/写出),
+				// 若把读到的 buf[:n] 引用直接传入,下一轮 br.Read 复用同一 buffer 会在写队列
+				// 消化前覆盖它——大流量(如 SSH)会被静默破坏。故每块拷贝一份再投递。
+				piece := make([]byte, n)
+				copy(piece, buf[:n])
+				if serr := stream.Send(piece); serr != nil {
 					break
 				}
 			}
