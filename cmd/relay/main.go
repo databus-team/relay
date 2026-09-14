@@ -1158,6 +1158,7 @@ func printStatus(backendName string, st protocol.StatusResponse, jsonOut bool) {
 	if jsonOut {
 		rep := map[string]interface{}{
 			"backend":   backendName,
+			"local":     protocol.VersionInfo{Version: version.Version, Commit: version.Commit},
 			"seg1":      st.Seg1,
 			"transit":   st.Transit,
 			"executors": st.Executors,
@@ -1168,6 +1169,7 @@ func printStatus(backendName string, st protocol.StatusResponse, jsonOut bool) {
 	}
 
 	fmt.Printf("status (%s backend)\n", backendName)
+	fmt.Printf("  local         %s (%s/%s)\n", ident(protocol.VersionInfo{Version: version.Version, Commit: version.Commit}), runtime.GOOS, runtime.GOARCH)
 	fmt.Printf("  local→transit  %s\n", segmentText(st.Seg1))
 	fmt.Printf("  transit        %s (%s/%s)\n", ident(st.Transit), st.Transit.GOOS, st.Transit.GOARCH)
 	if len(st.Executors) == 0 {
