@@ -405,6 +405,16 @@ func (ts *TunnelStream) Send(p []byte) error {
 
 // Recv 阻塞读取远端字节;隧道被中止置错误返回具体错误,正常/半关闭返回 io.EOF。
 func (ts *TunnelStream) Recv() ([]byte, error) {
+	// 优先排空已就绪的数据缓冲,避免与 closeCh 发生伪随机竞争导致数据包被丢弃
+	select {
+	case d := <-ts.dataCh:
+		if d == nil {
+			return nil, io.EOF
+		}
+		return d, nil
+	default:
+	}
+
 	select {
 	case d := <-ts.dataCh:
 		if d == nil {
@@ -414,6 +424,14 @@ func (ts *TunnelStream) Recv() ([]byte, error) {
 	case err := <-ts.errCh:
 		return nil, err
 	case <-ts.closeCh:
+		// close 触发后再做一次非阻塞排空,确保 close 前到达 dataCh 的数据全部送达
+		select {
+		case d := <-ts.dataCh:
+			if d != nil {
+				return d, nil
+			}
+		default:
+		}
 		return nil, io.EOF
 	}
 }

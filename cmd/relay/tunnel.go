@@ -127,6 +127,14 @@ func handleTunnelConn(ctx context.Context, rb *relaybackend.RelayBackend, watchI
 
 	socks5Reply(soc, socksRepSuccess)
 
+	// 握手包与应用层首包间歇:当目标是 SSH 等「服务端连通即抢先推流 Banner」的协议时,
+	// 远端首帧已在 TunnelOpen 窗口被预存就绪。如果紧接着立刻写入 soc,本地 loopback TCP 协议栈
+	// 会将 10 字节的 SOCKS5 REP 与随后的 SSH Banner 粘在同一数据段发送。本地某些透明代理/TUN 工具
+	// 在 SOCKS 状态机尚未切入透传时读到混合包,会把前置握手控制字符透传给 OpenSSH,触发
+	// "kex_exchange_identification: banner line contains invalid characters" / invalid format。
+	// 此处让步 15ms,确保 SOCKS5 握手应答被客户端单独消费并完成状态机切换。
+	time.Sleep(15 * time.Millisecond)
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	// 本地 SOCKS → 远端:从与握手共享的 bufio.Reader 读,确保客户端随 CONNECT 管道化的首段
@@ -238,6 +246,9 @@ func socks5Handshake(conn net.Conn, br *bufio.Reader) (string, uint16, *bufio.Re
 
 // socks5Reply 回写 SOCKS5 连接结果帧(REP)。
 func socks5Reply(conn net.Conn, rep byte) {
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
 	// VER REP RSV ATYP BND.ADDR BND.PORT(全部 0)
 	_, _ = conn.Write([]byte{socksVer5, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 }
