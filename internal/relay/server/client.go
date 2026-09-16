@@ -71,6 +71,10 @@ func (c *Client) readLoop() {
 		}
 
 		if msgType == websocket.BinaryMessage {
+			if streamID, _, ok := protocol.DecodeTunnelBinary(data); ok {
+				c.handleTunnelBinary(streamID, data)
+				continue
+			}
 			continue
 		}
 
@@ -485,6 +489,22 @@ func (c *Client) handleTunnelData(msg protocol.Message) {
 	_ = c.server.SendTo(target, msg)
 }
 
+// handleTunnelBinary 纯二进制隧道数据帧零拷贝路由(高速通道)。
+func (c *Client) handleTunnelBinary(streamID string, raw []byte) {
+	if streamID == "" {
+		return
+	}
+	entry, ok := c.server.getTunnel(streamID)
+	if !ok {
+		return
+	}
+	target, ok := c.tunnelPeer(entry)
+	if !ok {
+		return
+	}
+	_ = c.server.SendToRawBinary(target, raw)
+}
+
 // handleTunnelEnd 隧道关闭。拆除注册表并向另一端转发关闭,让另一端关停本地连接。
 func (c *Client) handleTunnelEnd(msg protocol.Message) {
 	streamID := msg.StreamID
@@ -894,6 +914,13 @@ func (c *Client) SendBinary(msg protocol.Message, raw []byte) error {
 	if err := c.conn.WriteJSON(msg); err != nil {
 		return err
 	}
+	return c.conn.WriteMessage(websocket.BinaryMessage, raw)
+}
+
+// SendRawBinary 直接发送一个纯二进制帧(无前置 JSON)。
+func (c *Client) SendRawBinary(raw []byte) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	return c.conn.WriteMessage(websocket.BinaryMessage, raw)
 }
 

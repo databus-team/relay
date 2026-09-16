@@ -460,3 +460,58 @@ func TestConstants(t *testing.T) {
 		t.Errorf("DefaultMaxInflight = %d, want 16", DefaultMaxInflight)
 	}
 }
+
+func TestTunnelBinaryRoundTrip(t *testing.T) {
+	streamID := "550e8400-e29b-41d4-a716-446655440000"
+	payload := []byte("hello-tunnel-raw-binary-data\x00\xff\xfe")
+
+	encoded := EncodeTunnelBinary(streamID, payload)
+	if encoded[0] != TunnelBinaryMagic {
+		t.Fatalf("expected magic %x, got %x", TunnelBinaryMagic, encoded[0])
+	}
+	if int(encoded[1]) != len(streamID) {
+		t.Fatalf("expected streamID len %d, got %d", len(streamID), encoded[1])
+	}
+
+	gotID, gotPayload, ok := DecodeTunnelBinary(encoded)
+	if !ok {
+		t.Fatalf("DecodeTunnelBinary returned ok=false")
+	}
+	if gotID != streamID {
+		t.Errorf("streamID mismatch: got %q, want %q", gotID, streamID)
+	}
+	if string(gotPayload) != string(payload) {
+		t.Errorf("payload mismatch: got %v, want %v", gotPayload, payload)
+	}
+}
+
+func TestTunnelBinaryEmptyPayload(t *testing.T) {
+	streamID := "test-id"
+	encoded := EncodeTunnelBinary(streamID, nil)
+	gotID, gotPayload, ok := DecodeTunnelBinary(encoded)
+	if !ok {
+		t.Fatalf("DecodeTunnelBinary returned ok=false")
+	}
+	if gotID != streamID {
+		t.Errorf("streamID mismatch: got %q, want %q", gotID, streamID)
+	}
+	if len(gotPayload) != 0 {
+		t.Errorf("expected empty payload, got %d bytes", len(gotPayload))
+	}
+}
+
+func TestTunnelBinaryCorrupt(t *testing.T) {
+	// 长度不足 2
+	if _, _, ok := DecodeTunnelBinary([]byte{TunnelBinaryMagic}); ok {
+		t.Errorf("expected ok=false for 1-byte data")
+	}
+	// 错误的 magic
+	if _, _, ok := DecodeTunnelBinary([]byte{0x00, 0x01, 'a'}); ok {
+		t.Errorf("expected ok=false for wrong magic")
+	}
+	// 长度字段大于剩余数据
+	if _, _, ok := DecodeTunnelBinary([]byte{TunnelBinaryMagic, 10, 'a'}); ok {
+		t.Errorf("expected ok=false for truncated streamID")
+	}
+}
+

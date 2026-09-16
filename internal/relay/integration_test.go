@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -1073,6 +1074,112 @@ func TestTunnel_EndToEnd_Allowed(t *testing.T) {
 	}
 	if string(got) != "ping-echo" {
 		t.Errorf("echo mismatch: got %q, want %q", got, "ping-echo")
+	}
+}
+
+// TestTunnel_BinaryHighThroughput:验证大流量分块在纯二进制隧道帧下的完整性与零丢失。
+func TestTunnel_BinaryHighThroughput(t *testing.T) {
+	watchDir := t.TempDir()
+	ts, wsURL := setupTunnelServer(t, watchDir)
+	defer ts.Close()
+
+	exec := registerTunnelExecutor(t, wsURL, "test-watch", true)
+	defer exec.Disconnect()
+
+	es, target := newEchoServer(t)
+	defer es.ln.Close()
+	host, port := func() (string, uint16) {
+		h, p, _ := net.SplitHostPort(target)
+		var pu uint16
+		fmt.Sscanf(p, "%d", &pu)
+		return h, pu
+	}()
+
+	ctx := context.Background()
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	stream, err := c.TunnelOpen(ctx, "test-watch", host, port)
+	if err != nil {
+		t.Fatalf("tunnel open: %v", err)
+	}
+	defer stream.Close()
+
+	// 发送 32 个 16KB 块 (共 512KB)
+	chunkSize := 16 * 1024
+	numChunks := 32
+	var expected []byte
+	for i := 0; i < numChunks; i++ {
+		chunk := make([]byte, chunkSize)
+		for j := range chunk {
+			chunk[j] = byte((i*13 + j*7) & 0xff)
+		}
+		expected = append(expected, chunk...)
+		if err := stream.Send(chunk); err != nil {
+			t.Fatalf("send chunk %d: %v", i, err)
+		}
+	}
+
+	var received []byte
+	for len(received) < len(expected) {
+		got, err := stream.Recv()
+		if err != nil {
+			t.Fatalf("recv after %d bytes: %v", len(received), err)
+		}
+		received = append(received, got...)
+	}
+
+	if !bytes.Equal(received, expected) {
+		t.Fatalf("data mismatch: received %d bytes, expected %d bytes", len(received), len(expected))
+	}
+}
+
+// TestTunnel_LegacyJSONCompatibility:验证旧版本客户端发送的 JSON MsgTunnelData 仍可被正常转发与消费。
+func TestTunnel_LegacyJSONCompatibility(t *testing.T) {
+	watchDir := t.TempDir()
+	ts, wsURL := setupTunnelServer(t, watchDir)
+	defer ts.Close()
+
+	exec := registerTunnelExecutor(t, wsURL, "test-watch", true)
+	defer exec.Disconnect()
+
+	es, target := newEchoServer(t)
+	defer es.ln.Close()
+	host, port := func() (string, uint16) {
+		h, p, _ := net.SplitHostPort(target)
+		var pu uint16
+		fmt.Sscanf(p, "%d", &pu)
+		return h, pu
+	}()
+
+	ctx := context.Background()
+	c := connectTestClient(t, wsURL)
+	defer c.Disconnect()
+
+	stream, err := c.TunnelOpen(ctx, "test-watch", host, port)
+	if err != nil {
+		t.Fatalf("tunnel open: %v", err)
+	}
+	defer stream.Close()
+
+	// 手动以旧版 JSON 格式发送 MsgTunnelData
+	legacyPayload := []byte("hello-from-legacy-json-tunnel")
+	legacyMsg := &protocol.Message{
+		Type:     protocol.MsgTunnelData,
+		ID:       uuid.New().String(),
+		StreamID: stream.ID,
+		Payload:  protocol.TunnelData{StreamID: stream.ID, Data: legacyPayload},
+	}
+	if err := c.SendMessageForTest(legacyMsg); err != nil {
+		t.Fatalf("send legacy message: %v", err)
+	}
+
+	got, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("recv: %v", err)
+	}
+	if !bytes.Equal(got, legacyPayload) {
+		t.Errorf("legacy echo mismatch: got %q, want %q", string(got), string(legacyPayload))
 	}
 }
 

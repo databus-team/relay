@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -177,20 +178,14 @@ func (s *TunnelSession) Reject(errMsg string) {
 	})
 }
 
-// pumpConnToRelay 读真实连接,把字节作为 MsgTunnelData 发出;EOF/错误 → 发 MsgTunnelEnd 并退盘。
+// pumpConnToRelay 读真实连接,把字节作为二进制隧道数据帧发出;EOF/错误 → 发 MsgTunnelEnd 并退盘。
 func (s *TunnelSession) pumpConnToRelay(conn net.Conn) {
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := conn.Read(buf)
 		if n > 0 {
-			piece := make([]byte, n)
-			copy(piece, buf[:n])
-			_ = s.client.sendMessage(&protocol.Message{
-				Type:     protocol.MsgTunnelData,
-				ID:       uuid.New().String(),
-				StreamID: s.streamID,
-				Payload:  protocol.TunnelData{StreamID: s.streamID, Data: piece},
-			})
+			bin := protocol.EncodeTunnelBinary(s.streamID, buf[:n])
+			_ = s.client.sendRawBinary(bin)
 		}
 		if err != nil {
 			break
@@ -244,30 +239,46 @@ func (c *Client) handleInboundTunnelConnect(msg protocol.Message) {
 	go h(sess)
 }
 
-// handleInboundTunnelData 入站数据帧:命中入站隧道 → 写真实连接;否则投递给出站(requester)流。
-func (c *Client) handleInboundTunnelData(msg protocol.Message) {
-	streamID := msg.StreamID
-	if streamID == "" {
+// handleTunnelBinaryData 处理收到的纯二进制隧道数据帧(高速零拷贝通道)。
+func (c *Client) handleTunnelBinaryData(streamID string, payload []byte) {
+	if len(payload) == 0 {
 		return
 	}
 	c.tunnelMu.RLock()
 	tc := c.tunnelConns[streamID]
 	c.tunnelMu.RUnlock()
 	if tc != nil {
-		var td protocol.TunnelData
-		raw, _ := json.Marshal(msg.Payload)
-		_ = json.Unmarshal(raw, &td)
-		if len(td.Data) > 0 {
-			// 只入队到专属 writer;队列满/写失败由 enqueue/winner 幂等 fail-closed 拆隧道并告知远端。
-			tc.enqueue(td.Data)
-		}
+		tc.enqueue(payload)
 		return
 	}
 	if ts := c.getTunnelStream(streamID); ts != nil {
+		ts.deliver(payload)
+	}
+}
+
+// handleInboundTunnelData 入站数据帧:兼容处理旧版 JSON 隧道帧。
+func (c *Client) handleInboundTunnelData(msg protocol.Message) {
+	streamID := msg.StreamID
+	if streamID == "" {
+		return
+	}
+	var payload []byte
+	if td, ok := msg.Payload.(protocol.TunnelData); ok {
+		payload = td.Data
+	} else if m, ok := msg.Payload.(map[string]interface{}); ok {
+		if b, ok := m["data"].([]byte); ok {
+			payload = b
+		} else if s, ok := m["data"].(string); ok {
+			payload, _ = base64.StdEncoding.DecodeString(s)
+		}
+	} else {
 		var td protocol.TunnelData
 		raw, _ := json.Marshal(msg.Payload)
 		_ = json.Unmarshal(raw, &td)
-		ts.deliver(td.Data)
+		payload = td.Data
+	}
+	if len(payload) > 0 {
+		c.handleTunnelBinaryData(streamID, payload)
 	}
 }
 
@@ -395,12 +406,8 @@ func (ts *TunnelStream) Send(p []byte) error {
 	if ts.closed.Load() {
 		return io.EOF
 	}
-	return ts.client.sendMessage(&protocol.Message{
-		Type:     protocol.MsgTunnelData,
-		ID:       uuid.New().String(),
-		StreamID: ts.ID,
-		Payload:  protocol.TunnelData{StreamID: ts.ID, Data: p},
-	})
+	bin := protocol.EncodeTunnelBinary(ts.ID, p)
+	return ts.client.sendRawBinary(bin)
 }
 
 // Recv 阻塞读取远端字节;隧道被中止置错误返回具体错误,正常/半关闭返回 io.EOF。

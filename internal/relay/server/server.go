@@ -626,6 +626,17 @@ func (s *Server) SendToBinary(clientID string, msg protocol.Message, raw []byte)
 	return client.SendBinary(msg, raw)
 }
 
+// SendToRawBinary 向某客户端直接发送一个纯二进制帧(供隧道数据零拷贝透传)。
+func (s *Server) SendToRawBinary(clientID string, raw []byte) error {
+	s.clientMu.RLock()
+	client, ok := s.clients[clientID]
+	s.clientMu.RUnlock()
+	if !ok {
+		return fmt.Errorf("client not found: %s", clientID)
+	}
+	return client.SendRawBinary(raw)
+}
+
 // cleanupClientState 断连时清理该 client 注册的执行方、待转发请求归属与流式 push 路由。
 func (s *Server) cleanupClientState(clientID string) {
 	s.executorMu.Lock()

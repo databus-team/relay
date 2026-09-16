@@ -213,6 +213,10 @@ func (c *Client) readLoop() {
 		_ = conn.SetReadDeadline(time.Now().Add(readDeadline))
 
 		if msgType == websocket.BinaryMessage {
+			if streamID, payload, ok := protocol.DecodeTunnelBinary(data); ok {
+				c.handleTunnelBinaryData(streamID, payload)
+				continue
+			}
 			continue
 		}
 
@@ -251,8 +255,10 @@ func (c *Client) writeLoop() {
 		if conn == nil {
 			continue
 		}
-		if err := conn.WriteJSON(sm.Message); err != nil {
-			continue
+		if sm.Message != nil {
+			if err := conn.WriteJSON(sm.Message); err != nil {
+				continue
+			}
 		}
 		if len(sm.Raw) > 0 {
 			if err := conn.WriteMessage(websocket.BinaryMessage, sm.Raw); err != nil {
@@ -282,6 +288,17 @@ func (c *Client) fireOnReconnect() {
 // sendMessage 将一条消息入队（供入站 exec 会话回包使用）。
 func (c *Client) sendMessage(msg *protocol.Message) error {
 	c.sendCh <- sendMsg{Message: msg}
+	return nil
+}
+
+// SendMessageForTest 供外部集成测试发送原始 JSON 协议消息(如旧版兼容性测试)。
+func (c *Client) SendMessageForTest(msg *protocol.Message) error {
+	return c.sendMessage(msg)
+}
+
+// sendRawBinary 发送一个纯二进制帧(无前置 JSON)。
+func (c *Client) sendRawBinary(raw []byte) error {
+	c.sendCh <- sendMsg{Raw: raw}
 	return nil
 }
 

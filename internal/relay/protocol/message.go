@@ -239,10 +239,43 @@ type TunnelConnectRequest struct {
 	StreamID   string `json:"stream_id"` // 隧道 ID(全局唯一)
 }
 
-// TunnelData 双向隧道数据帧。Data 经 JSON base64 承载(与 ws 流式帧同风味,不走二进制帧)。
+// TunnelData 双向隧道数据帧。兼容旧版本 JSON base64 承载。
 type TunnelData struct {
 	StreamID string `json:"stream_id"`
 	Data     []byte `json:"data,omitempty"`
+}
+
+const (
+	// TunnelBinaryMagic 是二进制隧道数据帧的前导魔数 (0x54 = 'T')
+	TunnelBinaryMagic byte = 0x54
+)
+
+// EncodeTunnelBinary 将 streamID 与隧道 payload 编码为紧凑的二进制帧:
+// [1B Magic(0x54)] + [1B StreamID 长度 N] + [N 字节 StreamID 字符串] + [Payload 原始字节]
+// 避免 JSON 与 Base64 编解码的 33% 膨胀与 CPU 开销。
+func EncodeTunnelBinary(streamID string, payload []byte) []byte {
+	idLen := len(streamID)
+	buf := make([]byte, 2+idLen+len(payload))
+	buf[0] = TunnelBinaryMagic
+	buf[1] = byte(idLen)
+	copy(buf[2:], streamID)
+	copy(buf[2+idLen:], payload)
+	return buf
+}
+
+// DecodeTunnelBinary 解析二进制隧道数据帧。
+// 若格式不合法或非隧道魔数,返回 ok = false。
+func DecodeTunnelBinary(data []byte) (streamID string, payload []byte, ok bool) {
+	if len(data) < 2 || data[0] != TunnelBinaryMagic {
+		return "", nil, false
+	}
+	idLen := int(data[1])
+	if len(data) < 2+idLen {
+		return "", nil, false
+	}
+	streamID = string(data[2 : 2+idLen])
+	payload = data[2+idLen:]
+	return streamID, payload, true
 }
 
 // TunnelEnd 隧道关闭:任一端断开即发,告知/关停另一端。
