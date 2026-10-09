@@ -413,6 +413,8 @@ func (b *RelayBackend) enableExecutor() {
 	b.client.SetTaskListHandler(func(sess *client.TaskListSession) { b.handleInboundTaskList(sess) })
 	b.client.SetTaskStopHandler(func(sess *client.TaskStopSession) { b.handleInboundTaskStop(sess) })
 	b.client.SetTaskLogsHandler(func(sess *client.TaskLogsSession) { b.handleInboundTaskLogs(sess) })
+	b.client.SetGitStatusHandler(func(sess *client.GitStatusSession) { b.handleInboundGitStatus(sess) })
+	b.client.SetGitUndoHandler(func(sess *client.GitUndoSession) { b.handleInboundGitUndo(sess) })
 	b.client.SetOnReconnect(b.registerExecutor)
 	b.registerExecutor()
 }
@@ -757,6 +759,54 @@ func (b *RelayBackend) handleInboundTaskLogs(sess *client.TaskLogsSession) {
 	_ = sess.Done(err)
 }
 
+func (b *RelayBackend) handleInboundGitStatus(sess *client.GitStatusSession) {
+	targetDir := sess.Dir()
+	if targetDir == "" {
+		targetDir = b.execDir
+	}
+	if targetDir == "" {
+		targetDir = "."
+	}
+	targetDir = normalizeExecDir(targetDir)
+
+	info, err := git.InspectRepo(targetDir)
+	if err != nil {
+		_ = sess.Done(&protocol.GitStatusResponse{OK: false, Error: err.Error()}, nil)
+		return
+	}
+
+	snapshots, _ := git.ListSnapshots(targetDir)
+
+	_ = sess.Done(&protocol.GitStatusResponse{
+		OK:             true,
+		IsGitRepo:      info.IsGitRepo,
+		CurrentBranch:  info.CurrentBranch,
+		BaseCommit:     info.BaseCommit,
+		IsDirty:        info.IsDirty,
+		DirtyFiles:     info.DirtyFiles,
+		UntrackedFiles: info.UntrackedFiles,
+		Snapshots:      snapshots,
+	}, nil)
+}
+
+func (b *RelayBackend) handleInboundGitUndo(sess *client.GitUndoSession) {
+	targetDir := sess.Dir()
+	if targetDir == "" {
+		targetDir = b.execDir
+	}
+	if targetDir == "" {
+		targetDir = "."
+	}
+	targetDir = normalizeExecDir(targetDir)
+
+	resp, err := git.RestoreSnapshot(targetDir, sess.TargetRef())
+	if err != nil {
+		_ = sess.Done(nil, err)
+		return
+	}
+	_ = sess.Done(resp, nil)
+}
+
 // TaskList 向中转或目标执行方查询任务列表 (实现 backend.TaskSupervisorBackend)
 func (b *RelayBackend) TaskList(ctx context.Context, targetExecutor string, all bool) ([]backend.TaskInfo, error) {
 	if err := b.ensureConnected(ctx); err != nil {
@@ -801,6 +851,22 @@ func (b *RelayBackend) TaskLogs(ctx context.Context, targetExecutor, taskID stri
 			onChunk(backend.ExecChunk{Stdout: c.Stdout, Data: c.Data})
 		}
 	})
+}
+
+// GitStatus 向目标节点请求查询 Git 状态
+func (b *RelayBackend) GitStatus(ctx context.Context, targetExecutor, workspace string) (*protocol.GitStatusResponse, error) {
+	if err := b.ensureConnected(ctx); err != nil {
+		return nil, err
+	}
+	return b.client.GitStatus(ctx, targetExecutor, workspace)
+}
+
+// GitUndo 向目标节点请求恢复影子快照
+func (b *RelayBackend) GitUndo(ctx context.Context, targetExecutor, workspace, targetRef string) (*protocol.GitUndoResponse, error) {
+	if err := b.ensureConnected(ctx); err != nil {
+		return nil, err
+	}
+	return b.client.GitUndo(ctx, targetExecutor, workspace, targetRef)
 }
 
 // normalizeExecDir 把路径在转换成为原生存档形式供 chdir:

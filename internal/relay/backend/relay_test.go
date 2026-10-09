@@ -943,3 +943,151 @@ func TestEndToEnd_PortForward(t *testing.T) {
 		t.Fatalf("expected error for non-existent node, got nil")
 	}
 }
+
+// 端到端:通过 GitStatus 和 GitUndo 实现远端工作区影子快照查询与一键恢复。
+func TestEndToEnd_GitUndoAndStatus(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
+	defer client.CloseAll()
+
+	// 1. 准备本地与远端 Git 仓库并保持基准提交对齐
+	localDir := t.TempDir()
+	remoteDir := t.TempDir()
+
+	testRunGit(t, localDir, "init")
+	testRunGit(t, localDir, "config", "user.name", "TestUser")
+	testRunGit(t, localDir, "config", "user.email", "test@test.com")
+	if err := os.WriteFile(filepath.Join(localDir, "app.go"), []byte("package main // initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testRunGit(t, localDir, "add", "app.go")
+	testRunGit(t, localDir, "commit", "-m", "initial commit")
+
+	testRunGit(t, remoteDir, "clone", localDir, ".")
+	testRunGit(t, remoteDir, "config", "user.name", "TestUser")
+	testRunGit(t, remoteDir, "config", "user.email", "test@test.com")
+
+	// 2. 启动中转服务器
+	watchDir := t.TempDir()
+	ts, wsURL := newTestHub(t, watchDir)
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 3. 执行方(node-git)接入，工作目录指向 remoteDir
+	_, err := NewRelayBackend(map[string]interface{}{
+		"url":          wsURL,
+		"token":        "tok-exe",
+		"executor_id":  "node-git",
+		"watch_dir":    ".",
+		"executor":     true,
+		"executor_dir": remoteDir,
+	})
+	if err != nil {
+		t.Fatalf("executor backend: %v", err)
+	}
+
+	// 4. 请求方接入
+	reqRaw, err := NewRelayBackend(map[string]interface{}{
+		"url":         wsURL,
+		"token":       "tok-req",
+		"executor_id": "req-client",
+		"watch_dir":   ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+	rb := reqRaw.(*RelayBackend)
+
+	// 5. 初始查询远端 Git 状态
+	statusResp, err := rb.GitStatus(ctx, "node-git", "")
+	if err != nil {
+		t.Fatalf("git status: %v", err)
+	}
+	if !statusResp.IsGitRepo {
+		t.Fatalf("expected remote to be git repo")
+	}
+	if statusResp.BaseCommit == "" {
+		t.Fatalf("expected remote to have base commit")
+	}
+	if len(statusResp.Snapshots) != 0 {
+		t.Fatalf("expected 0 snapshots initially, got %d", len(statusResp.Snapshots))
+	}
+
+	// 6. 远端在本地开发过程中产生修改
+	if err := os.WriteFile(filepath.Join(remoteDir, "app.go"), []byte("package main // important remote edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(remoteDir, "scratch.txt"), []byte("remote scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 7. 发起一次 ExecStreamWithGitSync 模拟从请求方执行命令覆盖同步
+	// 本地做出修改
+	if err := os.WriteFile(filepath.Join(localDir, "app.go"), []byte("package main // local overwritten version\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	localPayload, err := git.CreateDiffPayload(localDir, false)
+	if err != nil {
+		t.Fatalf("create local diff: %v", err)
+	}
+
+	var outBuf bytes.Buffer
+	_, err = rb.ExecStreamWithGitSync(ctx, "node-git", "echo sync_done", remoteDir, 5, &bk.GitSyncPayload{
+		BaseCommit:       localPayload.BaseCommit,
+		Patch:            localPayload.Patch,
+		UntrackedArchive: localPayload.UntrackedArchive,
+		Force:            localPayload.Force,
+	}, func(c bk.ExecChunk) {
+		outBuf.WriteString(c.Data)
+	})
+	if err != nil {
+		t.Fatalf("exec with git sync: %v", err)
+	}
+
+	// 验证远端此时已经被本地覆盖
+	remoteContent, err := os.ReadFile(filepath.Join(remoteDir, "app.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(remoteContent), "local overwritten version") {
+		t.Fatalf("expected local overwritten version, got %s", string(remoteContent))
+	}
+
+	// 8. 查询快照列表，断言自动创建了影子快照
+	statusResp2, err := rb.GitStatus(ctx, "node-git", "")
+	if err != nil {
+		t.Fatalf("git status 2: %v", err)
+	}
+	if len(statusResp2.Snapshots) < 1 {
+		t.Fatalf("expected at least 1 snapshot after sync on dirty remote, got %d", len(statusResp2.Snapshots))
+	}
+
+	// 9. 执行 GitUndo 一键还原
+	undoResp, err := rb.GitUndo(ctx, "node-git", "", "")
+	if err != nil {
+		t.Fatalf("git undo: %v", err)
+	}
+	if !undoResp.OK {
+		t.Fatalf("git undo response not ok: %s", undoResp.Error)
+	}
+
+	// 10. 验证远端文件成功恢复为覆盖前的状态 (important remote edit)
+	restoredContent, err := os.ReadFile(filepath.Join(remoteDir, "app.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(restoredContent), "important remote edit") {
+		t.Errorf("expected restored remote edit, got: %s", string(restoredContent))
+	}
+
+	// 验证未跟踪的草稿文件也被恢复
+	scratchContent, err := os.ReadFile(filepath.Join(remoteDir, "scratch.txt"))
+	if err != nil {
+		t.Errorf("expected scratch.txt to be restored, got error: %v", err)
+	} else if string(scratchContent) != "remote scratch\n" {
+		t.Errorf("scratch.txt = %q, want 'remote scratch\\n'", string(scratchContent))
+	}
+}

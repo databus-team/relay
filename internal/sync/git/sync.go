@@ -33,10 +33,13 @@ type DiffPayload struct {
 
 // StatusInfo 描述当前工作区的 Git 状态简报
 type StatusInfo struct {
-	IsGitRepo    bool
-	BaseCommit   string
-	IsDirty      bool
-	UntrackedNum int
+	IsGitRepo      bool
+	CurrentBranch  string
+	BaseCommit     string
+	IsDirty        bool
+	UntrackedNum   int
+	DirtyFiles     []string
+	UntrackedFiles []string
 }
 
 // runGitBytes 在指定目录下执行 git 命令并返回原始 stdout 字节
@@ -74,22 +77,25 @@ func InspectRepo(dir string) (StatusInfo, error) {
 		return StatusInfo{IsGitRepo: false}, nil
 	}
 
-	// 2. 获取当前 HEAD commit SHA
+	// 2. 获取当前 HEAD commit SHA 与当前分支
 	commit, err := runGit(ctx, dir, "rev-parse", "HEAD")
 	if err != nil {
 		// 可能是全新的空仓库 (尚无 commit)
 		commit = ""
 	}
+	branch, _ := runGit(ctx, dir, "rev-parse", "--abbrev-ref", "HEAD")
 
 	// 3. 检查状态: porcelain 输出
 	statusOut, err := runGit(ctx, dir, "status", "--porcelain")
 	if err != nil {
-		return StatusInfo{IsGitRepo: true, BaseCommit: commit}, err
+		return StatusInfo{IsGitRepo: true, BaseCommit: commit, CurrentBranch: branch}, err
 	}
 
 	lines := strings.Split(statusOut, "\n")
 	untrackedCount := 0
 	dirty := false
+	var dirtyFiles []string
+	var untrackedFiles []string
 	for _, l := range lines {
 		l = strings.TrimSpace(l)
 		if l == "" {
@@ -98,14 +104,20 @@ func InspectRepo(dir string) (StatusInfo, error) {
 		dirty = true
 		if strings.HasPrefix(l, "??") {
 			untrackedCount++
+			untrackedFiles = append(untrackedFiles, strings.TrimSpace(strings.TrimPrefix(l, "??")))
+		} else if len(l) > 2 {
+			dirtyFiles = append(dirtyFiles, strings.TrimSpace(l[2:]))
 		}
 	}
 
 	return StatusInfo{
-		IsGitRepo:    true,
-		BaseCommit:   commit,
-		IsDirty:      dirty,
-		UntrackedNum: untrackedCount,
+		IsGitRepo:      true,
+		CurrentBranch:  branch,
+		BaseCommit:     commit,
+		IsDirty:        dirty,
+		UntrackedNum:   untrackedCount,
+		DirtyFiles:     dirtyFiles,
+		UntrackedFiles: untrackedFiles,
 	}, nil
 }
 

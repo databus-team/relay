@@ -187,6 +187,12 @@ func (c *Client) handleMessage(msg protocol.Message) {
 
 	case protocol.MsgTaskLogs:
 		c.handleTaskLogs(msg)
+
+	case protocol.MsgGitStatus:
+		c.handleGitStatus(msg)
+
+	case protocol.MsgGitUndo:
+		c.handleGitUndo(msg)
 	}
 }
 
@@ -344,6 +350,16 @@ func (c *Client) handleTaskStop(msg protocol.Message) {
 
 // handleTaskLogs 处理任务日志流请求
 func (c *Client) handleTaskLogs(msg protocol.Message) {
+	c.forwardToExecutor(msg)
+}
+
+// handleGitStatus 转发 Git 状态查询至目标 executor
+func (c *Client) handleGitStatus(msg protocol.Message) {
+	c.forwardToExecutor(msg)
+}
+
+// handleGitUndo 转发 Git 恢复快照请求至目标 executor
+func (c *Client) handleGitUndo(msg protocol.Message) {
 	c.forwardToExecutor(msg)
 }
 

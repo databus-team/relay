@@ -33,6 +33,8 @@ const (
 	MsgTaskList         MessageType = "task_list"
 	MsgTaskStop         MessageType = "task_stop"
 	MsgTaskLogs         MessageType = "task_logs"
+	MsgGitStatus        MessageType = "git_status"
+	MsgGitUndo          MessageType = "git_undo"
 )
 
 // Message 是所有消息的通用包装
@@ -429,3 +431,48 @@ const (
 	DefaultMaxInflight = 16
 	DefaultWindowSize  = 8
 )
+
+// GitStatusRequest 查询远端工作区 Git 状态
+type GitStatusRequest struct {
+	ExecutorID   string `json:"executor_id,omitempty"`
+	WorkspaceID  string `json:"workspace_id,omitempty"`
+	WorkspaceDir string `json:"workspace_dir,omitempty"`
+}
+
+// GitSnapshotInfo 影子快照元数据
+type GitSnapshotInfo struct {
+	Ref       string `json:"ref"`
+	Timestamp int64  `json:"timestamp"`
+	Message   string `json:"message"`
+	CommitSHA string `json:"commit_sha"`
+}
+
+// GitStatusResponse 远端工作区 Git 状态返回
+type GitStatusResponse struct {
+	OK             bool              `json:"ok"`
+	Error          string            `json:"error,omitempty"`
+	IsGitRepo      bool              `json:"is_git_repo"`
+	CurrentBranch  string            `json:"current_branch"`
+	BaseCommit     string            `json:"base_commit"`
+	IsDirty        bool              `json:"is_dirty"`
+	DirtyFiles     []string          `json:"dirty_files,omitempty"`
+	UntrackedFiles []string          `json:"untracked_files,omitempty"`
+	Snapshots      []GitSnapshotInfo `json:"snapshots,omitempty"`
+}
+
+// GitUndoRequest 恢复工作区影子快照请求
+type GitUndoRequest struct {
+	ExecutorID   string `json:"executor_id,omitempty"`
+	WorkspaceID  string `json:"workspace_id,omitempty"`
+	WorkspaceDir string `json:"workspace_dir,omitempty"`
+	TargetRef    string `json:"target_ref,omitempty"` // 为空则恢复最新快照
+}
+
+// GitUndoResponse 恢复结果
+type GitUndoResponse struct {
+	OK          bool   `json:"ok"`
+	RestoredRef string `json:"restored_ref,omitempty"`
+	SafetyRef   string `json:"safety_ref,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+

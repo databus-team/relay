@@ -141,6 +141,18 @@ var (
 	portForwardExec   = portForwardCmd.Flag("executor", "Target executor node").Short('e').String()
 	portForwardWatch  = portForwardCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').String()
 	portForwardBind   = portForwardCmd.Flag("bind", "Local IP to bind to").Default("127.0.0.1").String()
+
+	// Undo command - 一键恢复远端工作区影子快照 (防误操作与冲突覆盖)
+	undoCmd      = kingpin.Command("undo", "Restore remote workspace to a shadow snapshot")
+	undoExec     = undoCmd.Flag("executor", "Target executor node").Short('e').String()
+	undoWatch    = undoCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').String()
+	undoList     = undoCmd.Flag("list", "List available snapshots on remote node").Short('l').Bool()
+	undoSnapshot = undoCmd.Flag("snapshot", "Specific snapshot ref to restore (default: latest)").String()
+
+	// Diff command - 对比本地与远端 Git 状态及冲突预警
+	diffCmd   = kingpin.Command("diff", "Inspect and compare local and remote workspace Git status")
+	diffExec  = diffCmd.Flag("executor", "Target executor node").Short('e').String()
+	diffWatch = diffCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').String()
 )
 
 func main() {
@@ -275,6 +287,10 @@ func main() {
 		default:
 			runPortForward()
 		}
+	case undoCmd.FullCommand():
+		runUndo()
+	case diffCmd.FullCommand():
+		runDiff()
 	default:
 		app.Usage(os.Args)
 	}

@@ -337,6 +337,10 @@ func (c *Client) handleMessage(msg protocol.Message) {
 		c.handleInboundTaskStop(msg)
 	case protocol.MsgTaskLogs:
 		c.handleInboundTaskLogs(msg)
+	case protocol.MsgGitStatus:
+		c.handleInboundGitStatus(msg)
+	case protocol.MsgGitUndo:
+		c.handleInboundGitUndo(msg)
 	case protocol.MsgResponse, protocol.MsgError:
 		if msg.RequestID != "" {
 			c.pendingMu.RLock()
