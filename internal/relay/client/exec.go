@@ -78,6 +78,11 @@ func (c *Client) streamChunkedContent(ctx context.Context, streamID string, tota
 // 返回最终 ExecResponse(含聚合 stdout/stderr 与 exit code)。
 // targetExecutor 若非空则以它作为请求路由目标(目标执行方 executor_id);空则回退到本端身份。
 func (c *Client) ExecStream(ctx context.Context, targetExecutor, cmd, cwd string, timeout int, onChunk func(protocol.ExecChunk)) (*protocol.ExecResponse, error) {
+	return c.ExecStreamWithGitSync(ctx, targetExecutor, cmd, cwd, timeout, nil, onChunk)
+}
+
+// ExecStreamWithGitSync 发送带有 Git 增量同步载荷的命令请求并流式接收输出。
+func (c *Client) ExecStreamWithGitSync(ctx context.Context, targetExecutor, cmd, cwd string, timeout int, syncPayload *protocol.GitSyncPayload, onChunk func(protocol.ExecChunk)) (*protocol.ExecResponse, error) {
 	if timeout <= 0 {
 		timeout = 30
 	}
@@ -96,6 +101,7 @@ func (c *Client) ExecStream(ctx context.Context, targetExecutor, cmd, cwd string
 			Cmd:        cmd,
 			Cwd:        cwd,
 			Timeout:    timeout,
+			GitSync:    syncPayload,
 		},
 	}
 
@@ -487,10 +493,11 @@ type ExecSession struct {
 }
 
 // Cmd / Cwd / Timeout / ExecutorID 返回本次入站请求的命令、工作目录、超时秒数与目标执行方。
-func (e *ExecSession) Cmd() string        { return e.req.Cmd }
-func (e *ExecSession) Cwd() string        { return e.req.Cwd }
-func (e *ExecSession) Timeout() int       { return e.req.Timeout }
-func (e *ExecSession) ExecutorID() string { return e.req.ExecutorID }
+func (e *ExecSession) Cmd() string                      { return e.req.Cmd }
+func (e *ExecSession) Cwd() string                      { return e.req.Cwd }
+func (e *ExecSession) Timeout() int                     { return e.req.Timeout }
+func (e *ExecSession) ExecutorID() string               { return e.req.ExecutorID }
+func (e *ExecSession) GitSync() *protocol.GitSyncPayload { return e.req.GitSync }
 
 // SetExecHandler 设置入站 exec 处理回调。设置后,该客户端成为可被中转转发 exec 的执行方。
 func (c *Client) SetExecHandler(fn func(*ExecSession)) {
@@ -501,13 +508,10 @@ func (c *Client) SetExecHandler(fn func(*ExecSession)) {
 
 // handleInboundExec 处理从中转转发来的 exec 请求(执行方视角)。
 func (c *Client) handleInboundExec(msg protocol.Message) {
-	payload, _ := msg.Payload.(map[string]interface{})
-	req := protocol.ExecRequest{
-		ExecutorID: toString(payload["executor_id"]),
-		Cmd:        toString(payload["cmd"]),
-		Cwd:        toString(payload["cwd"]),
-		Timeout:    int(toFloat64(payload["timeout"])),
-	}
+	data, _ := json.Marshal(msg.Payload)
+	var req protocol.ExecRequest
+	_ = json.Unmarshal(data, &req)
+
 	if req.Timeout <= 0 {
 		req.Timeout = 30
 	}

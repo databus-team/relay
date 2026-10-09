@@ -23,6 +23,7 @@ import (
 	relaybackend "github.com/user/relay/internal/relay/backend"
 	"github.com/user/relay/internal/relay/protocol"
 	_ "github.com/user/relay/internal/relay/server"
+	"github.com/user/relay/internal/sync/git"
 	"github.com/user/relay/internal/version"
 	"github.com/user/relay/internal/watcher"
 )
@@ -69,9 +70,11 @@ var (
 	jobRunFile  = jobRun.Arg("file", "Local file to bind to {file_path} and friends").String()
 
 	// Exec command - command forwarding (requires watch running)
-	execCmd   = kingpin.Command("exec", "Forward command to remote executor")
-	execWatch = execCmd.Flag("watch", "Target workspace ID (defaults to current directory name); mutually exclusive with --executor").Short('w').String()
-	execExec  = execCmd.Flag("executor", "Route directly to this executor (executor_id) without a workspace binding").Short('e').String()
+	execCmd         = kingpin.Command("exec", "Forward command to remote executor")
+	execWatch       = execCmd.Flag("watch", "Target workspace ID (defaults to current directory name); mutually exclusive with --executor").Short('w').String()
+	execExec        = execCmd.Flag("executor", "Route directly to this executor (executor_id) without a workspace binding").Short('e').String()
+	execForceRemote = execCmd.Flag("force-remote", "Force overwrite remote state (creates shadow snapshot on remote first)").Short('f').Bool()
+	execNoSync      = execCmd.Flag("no-sync", "Skip git incremental sync before execution").Bool()
 	// 支持多词命令:relay exec git status 会收成 ["git","status"] 再空格 join。
 	// 含以 - 开头参数的命令(如 git log --oneline)仍须整体加引号,避免被当 flag。
 	execCmdStr = execCmd.Arg("command", "Command to execute (multiple words are joined)").Required().Strings()
@@ -1066,7 +1069,62 @@ func runExec() {
 		}
 	}
 
+	// 增量同步准备:当未指定 --no-sync 时,检测本地对应工作区目录是否为 git 仓库且有 dirty 改动
+	var gitSyncPayload *backend.GitSyncPayload
+	if !*execNoSync {
+		localSyncDir := execCwd
+		if localSyncDir == "" {
+			if curDir, err := os.Getwd(); err == nil {
+				localSyncDir = curDir
+			}
+		}
+		if localSyncDir != "" {
+			repoInfo, err := git.InspectRepo(localSyncDir)
+			if err == nil && repoInfo.IsGitRepo {
+				// 本地是有效的 Git 仓库
+				if repoInfo.IsDirty || *execForceRemote {
+					payload, err := git.CreateDiffPayload(localSyncDir, *execForceRemote)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Git sync prepare failed: %v\n", err)
+						os.Exit(1)
+					}
+					gitSyncPayload = &backend.GitSyncPayload{
+						BaseCommit:       payload.BaseCommit,
+						Patch:            payload.Patch,
+						UntrackedArchive: payload.UntrackedArchive,
+						Force:            payload.Force,
+					}
+					shortCommit := payload.BaseCommit
+					if len(shortCommit) > 7 {
+						shortCommit = shortCommit[:7]
+					}
+					fmt.Fprintf(os.Stderr, "➜ [git-sync] packaging dirty diff (base: %s, patch: %d B, untracked: %d B)\n",
+						shortCommit, len(payload.Patch), len(payload.UntrackedArchive))
+				}
+			}
+		}
+	}
+
 	cmd := strings.Join(*execCmdStr, " ")
+
+	// 支持 Git 增量同步的流式后端(relay)逐帧实时转发输出,并以 exit code 收尾
+	if eb, ok := b.(backend.GitSyncExecBackend); ok {
+		exit, err := eb.ExecStreamWithGitSync(ctx, targetExecutor, cmd, execCwd, 0, gitSyncPayload, func(chunk backend.ExecChunk) {
+			if chunk.Stdout {
+				os.Stdout.WriteString(chunk.Data)
+			} else {
+				os.Stderr.WriteString(chunk.Data)
+			}
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Exec error: %v\n", err)
+			os.Exit(1)
+		}
+		if exit != 0 {
+			os.Exit(exit)
+		}
+		return
+	}
 
 	// 支持流式的后端(relay)逐帧实时转发输出,并以 exit code 收尾
 	if eb, ok := b.(backend.ExecStreamBackend); ok {

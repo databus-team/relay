@@ -46,6 +46,19 @@ type ExecChunk struct {
 	Data   string
 }
 
+// GitSyncPayload Git 增量同步数据包 (Sync-on-Exec)
+type GitSyncPayload struct {
+	BaseCommit       string
+	Patch            []byte
+	UntrackedArchive []byte
+	Force            bool
+}
+
+// GitSyncExecBackend 网络层支持携带 Git 增量同步的流式远程执行。
+type GitSyncExecBackend interface {
+	ExecStreamWithGitSync(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, onChunk func(ExecChunk)) (int, error)
+}
+
 // ExecStreamBackend 网络层支持流式输出远程执行。
 type ExecStreamBackend interface {
 	// ExecStream 流式执行,onChunk 每次收到增量输出帧时回调(nil 可忽略);返回 exit code。

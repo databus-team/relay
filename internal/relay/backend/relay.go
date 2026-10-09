@@ -23,6 +23,7 @@ import (
 	"github.com/user/relay/internal/logx"
 	"github.com/user/relay/internal/relay/client"
 	"github.com/user/relay/internal/relay/protocol"
+	"github.com/user/relay/internal/sync/git"
 	"github.com/user/relay/internal/version"
 )
 
@@ -251,6 +252,11 @@ func (b *RelayBackend) Exec(ctx context.Context, cmd string, cwd string, timeout
 // ExecStream 流式执行:本地 CLI 作为请求方时,经中转把命令转发给远端 executor 并实时回调输出。
 // targetExecutor 若非空即目标 executor 的节点身份(executor_id);空=单根回退到自身。
 func (b *RelayBackend) ExecStream(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, onChunk func(backend.ExecChunk)) (int, error) {
+	return b.ExecStreamWithGitSync(ctx, targetExecutor, cmd, cwd, timeout, nil, onChunk)
+}
+
+// ExecStreamWithGitSync 携带 Git 增量同步载荷的流式执行。
+func (b *RelayBackend) ExecStreamWithGitSync(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, syncPayload *backend.GitSyncPayload, onChunk func(backend.ExecChunk)) (int, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return 0, err
 	}
@@ -258,7 +264,17 @@ func (b *RelayBackend) ExecStream(ctx context.Context, targetExecutor, cmd strin
 		targetExecutor = b.executorID
 	}
 
-	resp, err := b.client.ExecStream(ctx, targetExecutor, cmd, cwd, timeout, func(chunk protocol.ExecChunk) {
+	var protoSync *protocol.GitSyncPayload
+	if syncPayload != nil {
+		protoSync = &protocol.GitSyncPayload{
+			BaseCommit:       syncPayload.BaseCommit,
+			Patch:            syncPayload.Patch,
+			UntrackedArchive: syncPayload.UntrackedArchive,
+			Force:            syncPayload.Force,
+		}
+	}
+
+	resp, err := b.client.ExecStreamWithGitSync(ctx, targetExecutor, cmd, cwd, timeout, protoSync, func(chunk protocol.ExecChunk) {
 		if onChunk != nil {
 			onChunk(backend.ExecChunk{Stdout: chunk.Stdout, Data: chunk.Data})
 		}
@@ -580,8 +596,43 @@ func (b *RelayBackend) registerExecutor() {
 // handleInboundExec 执行中转转发来的命令,并把输出流式写回,最后回 exit code。
 func (b *RelayBackend) handleInboundExec(sess *client.ExecSession) {
 	log.Printf("[exec] receiving cmd=%q cwd=%q timeout=%ds (watch=%s)", sess.Cmd(), sess.Cwd(), sess.Timeout(), sess.ExecutorID())
+
+	targetDir := sess.Cwd()
+	if targetDir == "" {
+		targetDir = b.execDir
+	}
+	if targetDir == "" {
+		targetDir = "."
+	}
+	targetDir = normalizeExecDir(targetDir)
+
+	// 1. 若携带有 GitSync 增量同步载荷，先原子应用到目标工作区
+	if syncPayload := sess.GitSync(); syncPayload != nil {
+		diffPayload := &git.DiffPayload{
+			BaseCommit:       syncPayload.BaseCommit,
+			Patch:            syncPayload.Patch,
+			UntrackedArchive: syncPayload.UntrackedArchive,
+			Force:            syncPayload.Force,
+		}
+
+		res, err := git.ApplyDiffPayload(targetDir, diffPayload)
+		if err != nil {
+			log.Printf("[exec] git sync failed on %s: %v", targetDir, err)
+			_ = sess.Write(false, fmt.Sprintf("[git-sync error] %v\n", err))
+			_ = sess.Done(protocol.ExecResponse{
+				ExitCode: 1,
+				Stderr:   err.Error(),
+			})
+			return
+		}
+		if res != nil && res.ShadowSnapshot != "" {
+			_ = sess.Write(true, fmt.Sprintf("➜ [git-sync] shadow snapshot created: %s\n", res.ShadowSnapshot))
+		}
+		_ = sess.Write(true, fmt.Sprintf("➜ [git-sync] applied incremental diff on %s (base: %s)\n", targetDir, diffPayload.BaseCommit))
+	}
+
 	start := time.Now()
-	exit := runStream(sess.Cmd(), sess.Cwd(), sess.Timeout(), func(stdout bool, data string) {
+	exit := runStream(sess.Cmd(), targetDir, sess.Timeout(), func(stdout bool, data string) {
 		_ = sess.Write(stdout, data)
 	})
 	dur := time.Since(start)

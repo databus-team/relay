@@ -300,14 +300,23 @@ type PullRequest struct {
 	Offset  int64  `json:"offset"`
 }
 
+// GitSyncPayload 随命令执行一同下发的 Git 增量同步数据包 (Sync-on-Exec)
+type GitSyncPayload struct {
+	BaseCommit       string `json:"base_commit"`
+	Patch            []byte `json:"patch"`
+	UntrackedArchive []byte `json:"untracked_archive,omitempty"`
+	Force            bool   `json:"force,omitempty"`
+}
+
 // ExecRequest 远程执行请求。ExecutorID 指定在哪个执行方上运行。
 type ExecRequest struct {
-	ExecutorID string   `json:"executor_id"`
-	Cmd        string   `json:"cmd"`
-	Args       []string `json:"args,omitempty"`
-	Env        []string `json:"env,omitempty"`
-	Cwd        string   `json:"cwd,omitempty"`
-	Timeout    int      `json:"timeout"`
+	ExecutorID string          `json:"executor_id"`
+	Cmd        string          `json:"cmd"`
+	Args       []string        `json:"args,omitempty"`
+	Env        []string        `json:"env,omitempty"`
+	Cwd        string          `json:"cwd,omitempty"`
+	Timeout    int             `json:"timeout"`
+	GitSync    *GitSyncPayload `json:"git_sync,omitempty"`
 }
 
 // DeleteRequest 删除文件请求

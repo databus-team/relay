@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/user/relay/internal/config"
 	"github.com/user/relay/internal/relay/client"
 	"github.com/user/relay/internal/relay/server"
+	"github.com/user/relay/internal/sync/git"
 )
 
 func newTestHub(t *testing.T, watchDir string) (*httptest.Server, string) {
@@ -565,5 +567,127 @@ func TestMsysToWindowsPath(t *testing.T) {
 		if got := msysToWindowsPath(c.in); got != c.want {
 			t.Errorf("msysToWindowsPath(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+func testRunGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	c := exec.Command("git", args...)
+	c.Dir = dir
+	c.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+	if out, err := c.CombinedOutput(); err != nil {
+		t.Fatalf("git %s failed: %v (output: %s)", strings.Join(args, " "), err, string(out))
+	}
+}
+
+// 端到端:通过 ExecStreamWithGitSync 在执行命令前完成 Git 增量补丁同步与应用。
+func TestEndToEnd_ExecWithGitSync(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
+	defer client.CloseAll()
+
+	// 1. 准备本地与远端 Git 仓库目录
+	localDir := t.TempDir()
+	remoteDir := t.TempDir()
+
+	testRunGit(t, localDir, "init")
+	testRunGit(t, localDir, "config", "user.name", "TestUser")
+	testRunGit(t, localDir, "config", "user.email", "test@test.com")
+	if err := os.WriteFile(filepath.Join(localDir, "main.go"), []byte("package main // initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testRunGit(t, localDir, "add", "main.go")
+	testRunGit(t, localDir, "commit", "-m", "init commit")
+
+	// 克隆到远端工作区，保持基准 commit 完全一致
+	testRunGit(t, remoteDir, "clone", localDir, ".")
+	testRunGit(t, remoteDir, "config", "user.name", "TestUser")
+	testRunGit(t, remoteDir, "config", "user.email", "test@test.com")
+
+	// 2. 启动中转服务器
+	watchDir := t.TempDir()
+	ts, wsURL := newTestHub(t, watchDir)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// 3. 启动远端执行方 (executor_dir 指向 remoteDir)
+	if _, err := NewRelayBackend(map[string]interface{}{
+		"url":          wsURL,
+		"token":        "tok-exe",
+		"executor_id":  "test",
+		"watch_dir":    ".",
+		"executor_dir": remoteDir,
+		"executor":     true,
+	}); err != nil {
+		t.Fatalf("executor backend: %v", err)
+	}
+
+	// 4. 在本地修改代码并产生未跟踪新文件
+	if err := os.WriteFile(filepath.Join(localDir, "main.go"), []byte("package main // modified locally\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "untracked.txt"), []byte("untracked file content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 5. 本地提取 diff
+	diffPayload, err := git.CreateDiffPayload(localDir, false)
+	if err != nil {
+		t.Fatalf("create diff payload: %v", err)
+	}
+
+	// 6. 启动请求方后端
+	reqBackend, err := NewRelayBackend(map[string]interface{}{
+		"url":         wsURL,
+		"token":       "tok-req",
+		"executor_id": "test",
+		"watch_dir":   ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+
+	rb, ok := reqBackend.(bk.GitSyncExecBackend)
+	if !ok {
+		t.Fatalf("requester backend does not implement GitSyncExecBackend")
+	}
+
+	// 7. 发起带增量同步的远程命令执行
+	var output strings.Builder
+	exit, err := rb.ExecStreamWithGitSync(ctx, "", "cat main.go && cat untracked.txt", "", 10, &bk.GitSyncPayload{
+		BaseCommit:       diffPayload.BaseCommit,
+		Patch:            diffPayload.Patch,
+		UntrackedArchive: diffPayload.UntrackedArchive,
+		Force:            diffPayload.Force,
+	}, func(c bk.ExecChunk) {
+		output.WriteString(c.Data)
+	})
+
+	if err != nil {
+		t.Fatalf("exec with git sync failed: %v", err)
+	}
+	if exit != 0 {
+		t.Fatalf("unexpected exit code: %d, output: %s", exit, output.String())
+	}
+
+	outStr := output.String()
+	if !strings.Contains(outStr, "[git-sync] applied incremental diff") {
+		t.Errorf("output missing git-sync confirmation: %s", outStr)
+	}
+	if !strings.Contains(outStr, "package main // modified locally") {
+		t.Errorf("remote command did not see modified main.go: %s", outStr)
+	}
+	if !strings.Contains(outStr, "untracked file content") {
+		t.Errorf("remote command did not see untracked.txt: %s", outStr)
+	}
+
+	// 8. 检查远端工作区文件真实状态
+	remoteContent, err := os.ReadFile(filepath.Join(remoteDir, "main.go"))
+	if err != nil {
+		t.Fatalf("read remote main.go: %v", err)
+	}
+	if string(remoteContent) != "package main // modified locally\n" {
+		t.Errorf("remote file content mismatch: %s", string(remoteContent))
 	}
 }
