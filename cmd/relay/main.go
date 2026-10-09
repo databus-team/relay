@@ -75,9 +75,28 @@ var (
 	execExec        = execCmd.Flag("executor", "Route directly to this executor (executor_id) without a workspace binding").Short('e').String()
 	execForceRemote = execCmd.Flag("force-remote", "Force overwrite remote state (creates shadow snapshot on remote first)").Short('f').Bool()
 	execNoSync      = execCmd.Flag("no-sync", "Skip git incremental sync before execution").Bool()
+	execDetach      = execCmd.Flag("detach", "Run command in background as daemon task (returns TaskID)").Short('d').Bool()
 	// 支持多词命令:relay exec git status 会收成 ["git","status"] 再空格 join。
 	// 含以 - 开头参数的命令(如 git log --oneline)仍须整体加引号,避免被当 flag。
 	execCmdStr = execCmd.Arg("command", "Command to execute (multiple words are joined)").Required().Strings()
+
+	// ps command - 查询后台任务
+	psCmd  = kingpin.Command("ps", "List managed background tasks (similar to docker ps)")
+	psAll  = psCmd.Flag("all", "Show all tasks (default shows running only)").Short('a').Bool()
+	psExec = psCmd.Flag("executor", "Filter tasks by executor node").Short('e').String()
+	psJSON = psCmd.Flag("json", "Output as JSON").Bool()
+
+	// logs command - 查看任务日志
+	logsCmd    = kingpin.Command("logs", "Fetch logs of a background task (similar to docker logs)")
+	logsTaskID = logsCmd.Arg("task-id", "Task ID to view").Required().String()
+	logsFollow = logsCmd.Flag("follow", "Follow log output").Short('f').Bool()
+	logsTail   = logsCmd.Flag("tail", "Number of lines to show from the end").Default("100").Int()
+	logsExec   = logsCmd.Flag("executor", "Target executor node").Short('e').String()
+
+	// stop command - 终止后台任务
+	stopCmd    = kingpin.Command("stop", "Stop a running background task (similar to docker stop)")
+	stopTaskID = stopCmd.Arg("task-id", "Task ID to stop").Required().String()
+	stopExec   = stopCmd.Flag("executor", "Target executor node").Short('e').String()
 
 	// Status command - 整座部署连通性体检:本地→中转 一段 + 中转→每个执行方 的时延与版本。
 	// 不携带 -w(status 面向整座部署);继承原 `ping` 探活职责并把 `version -r` 台账归一到此。
@@ -106,19 +125,13 @@ var (
 	// server-remote command - 一键部署中转(受控自升级):上传新二进制 → 中转自检 → 换装 → 核验。
 	serverRemoteCmd = kingpin.Command("server-remote", "一键部署中转:上传新 relay 二进制并经中转受控自升级,断线重连后核验版本")
 	serverRemoteBin = serverRemoteCmd.Flag("binary", "Path to the new relay binary to send (default: current executable)").String()
-	// 期望换装后中转的构建标识(形如 "<Version>+<Commit>")。缺省用本进程 version.String(),但在
-	// 部署远程构建(如 cross-compile 的 relay-linux,或带 -dirty 的全新 build)时会与本地进程版本
-	// 不一致导致核验恒超时——部署脚本会显式传入它写入该二进制的 stamp 以保证对账正确。
 	serverRemoteExpect = serverRemoteCmd.Flag("expect", "Expected transit version after swap (default: this relay's version.String())").String()
 
 	// Tunnel command - 本地 SOCKS5 出网隧道,经所选 executor 出口访问内网白名单目标。
-	// action 位置参数:默认/run=前台;start/stop/status/restart/upgrade 为 daemon 控制。
-	// executor 在 start/stop/restart/upgrade/前台 时必需;status 可不带以列出全部实例。
 	tunnelCmd      = kingpin.Command("tunnel", "本地 SOCKS5 出网隧道:经所选 executor 访问其内网白名单")
 	tunnelListen   = tunnelCmd.Flag("listen", "Local SOCKS5 listen address").Default("127.0.0.1:1080").String()
 	tunnelExecName = tunnelCmd.Flag("executor", "Egress executor's executor_id (see `relay status` -> executors[].executor_id)").Short('w').String()
 	tunnelAction   = tunnelCmd.Arg("action", "run|start|stop|status|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "restart", "upgrade").String()
-	// upgrade 用的新二进制路径(仅 action=upgrade 时使用)。
 	tunnelUpgradePath = tunnelCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 )
 
@@ -201,6 +214,12 @@ func main() {
 		runWorkspaces()
 	case versionCmd.FullCommand():
 		runVersion()
+	case psCmd.FullCommand():
+		runPs()
+	case logsCmd.FullCommand():
+		runLogs()
+	case stopCmd.FullCommand():
+		runStop()
 	case serverRemoteCmd.FullCommand():
 		runServerRemote()
 	case jobRun.FullCommand():
@@ -1107,9 +1126,9 @@ func runExec() {
 
 	cmd := strings.Join(*execCmdStr, " ")
 
-	// 支持 Git 增量同步的流式后端(relay)逐帧实时转发输出,并以 exit code 收尾
+	// 支持 Git 增量同步与后台托管的流式后端(relay)逐帧实时转发输出,并以 exit code 收尾
 	if eb, ok := b.(backend.GitSyncExecBackend); ok {
-		exit, err := eb.ExecStreamWithGitSync(ctx, targetExecutor, cmd, execCwd, 0, gitSyncPayload, func(chunk backend.ExecChunk) {
+		exit, err := eb.ExecStreamWithOptions(ctx, targetExecutor, cmd, execCwd, 0, gitSyncPayload, *execDetach, func(chunk backend.ExecChunk) {
 			if chunk.Stdout {
 				os.Stdout.WriteString(chunk.Data)
 			} else {
@@ -1152,6 +1171,145 @@ func runExec() {
 	}
 
 	fmt.Print(result)
+}
+
+func runPs() {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
+		os.Exit(1)
+	}
+
+	tb, ok := b.(backend.TaskSupervisorBackend)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Backend %q does not support task supervisor\n", cfg.Backend.Type)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	tasks, err := tb.TaskList(ctx, *psExec, *psAll)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ps failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *psJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(tasks)
+		return
+	}
+
+	if len(tasks) == 0 {
+		if *psAll {
+			fmt.Println("No tasks found.")
+		} else {
+			fmt.Println("No running tasks found (use -a to show all).")
+		}
+		return
+	}
+
+	fmt.Printf("%-12s %-16s %-10s %-6s %-16s %s\n", "TASK ID", "NODE", "STATUS", "EXIT", "CREATED", "COMMAND")
+	for _, t := range tasks {
+		createdStr := formatRelativeTime(time.Unix(t.StartTime, 0))
+		exitStr := "-"
+		if t.Status != "running" {
+			exitStr = fmt.Sprintf("%d", t.ExitCode)
+		}
+		cmdDisp := t.Cmd
+		if len(cmdDisp) > 40 {
+			cmdDisp = cmdDisp[:37] + "..."
+		}
+		nodeDisp := t.Node
+		if nodeDisp == "" {
+			nodeDisp = "(unknown)"
+		}
+		fmt.Printf("%-12s %-16s %-10s %-6s %-16s %s\n", t.ID, nodeDisp, t.Status, exitStr, createdStr, cmdDisp)
+	}
+}
+
+func formatRelativeTime(t time.Time) string {
+	d := time.Since(t).Round(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	}
+	return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+}
+
+func runLogs() {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
+		os.Exit(1)
+	}
+
+	tb, ok := b.(backend.TaskSupervisorBackend)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Backend does not support task supervisor\n")
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
+	err = tb.TaskLogs(ctx, *logsExec, *logsTaskID, *logsFollow, *logsTail, func(chunk backend.ExecChunk) {
+		if chunk.Stdout {
+			os.Stdout.WriteString(chunk.Data)
+		} else {
+			os.Stderr.WriteString(chunk.Data)
+		}
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "logs failed: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runStop() {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
+		os.Exit(1)
+	}
+
+	tb, ok := b.(backend.TaskSupervisorBackend)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Backend does not support task supervisor\n")
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := tb.TaskStop(ctx, *stopExec, *stopTaskID); err != nil {
+		fmt.Fprintf(os.Stderr, "stop failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Stopped task %s\n", *stopTaskID)
 }
 
 // statusTimeout 是 `relay status` 单条命令的上限(含对中转 status 请求的等待)。

@@ -109,6 +109,10 @@ func (c *Client) handleMessage(msg protocol.Message) {
 		return
 	}
 
+	if c.maybeResolvePending(msg) {
+		return
+	}
+
 	// 被转发给执行方的流式 push 内容帧原样透传,不进入本地流处理。
 	if c.maybeRelayPushStream(&msg) {
 		return
@@ -174,6 +178,15 @@ func (c *Client) handleMessage(msg protocol.Message) {
 
 	case protocol.MsgTunnelEnd:
 		c.handleTunnelEnd(msg)
+
+	case protocol.MsgTaskList:
+		c.handleTaskList(msg)
+
+	case protocol.MsgTaskStop:
+		c.handleTaskStop(msg)
+
+	case protocol.MsgTaskLogs:
+		c.handleTaskLogs(msg)
 	}
 }
 
@@ -255,6 +268,82 @@ func (c *Client) forwardToExecutor(msg protocol.Message) {
 
 // handleExec 处理执行请求。纯透明转发给该 watch 的已注册执行方。
 func (c *Client) handleExec(msg protocol.Message) {
+	c.forwardToExecutor(msg)
+}
+
+// handleTaskList 处理任务列表查询 (单节点转发或整网聚合)
+func (c *Client) handleTaskList(msg protocol.Message) {
+	payload, _ := msg.Payload.(map[string]interface{})
+	data, _ := json.Marshal(payload)
+	var req protocol.TaskListRequest
+	_ = json.Unmarshal(data, &req)
+
+	if req.ExecutorID != "" {
+		c.forwardToExecutor(msg)
+		return
+	}
+
+	endpoints := c.server.ExecutorEndpoints()
+	if len(endpoints) == 0 {
+		c.SendResponse(msg.ID, protocol.TaskListResponse{OK: true, Tasks: []protocol.TaskInfo{}})
+		return
+	}
+
+	var allTasks []protocol.TaskInfo
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for eid, ep := range endpoints {
+		wg.Add(1)
+		go func(executorID, clientID string) {
+			defer wg.Done()
+			reqID := uuid.New().String()
+			pendingCh := c.server.registerPending(reqID)
+			defer c.server.deletePending(reqID)
+
+			reqMsg := protocol.Message{
+				Type:      protocol.MsgTaskList,
+				ID:        reqID,
+				RequestID: reqID,
+				Payload: protocol.TaskListRequest{
+					ExecutorID: executorID,
+					All:        req.All,
+				},
+			}
+			if err := c.server.SendTo(clientID, reqMsg); err != nil {
+				return
+			}
+
+			select {
+			case respMsg := <-pendingCh:
+				var resp protocol.TaskListResponse
+				b, _ := json.Marshal(respMsg.Payload)
+				if err := json.Unmarshal(b, &resp); err == nil && resp.OK {
+					mu.Lock()
+					for _, t := range resp.Tasks {
+						if t.Node == "" {
+							t.Node = executorID
+						}
+						allTasks = append(allTasks, t)
+					}
+					mu.Unlock()
+				}
+			case <-time.After(3 * time.Second):
+			}
+		}(eid, ep.ClientID)
+	}
+
+	wg.Wait()
+	c.SendResponse(msg.ID, protocol.TaskListResponse{OK: true, Tasks: allTasks})
+}
+
+// handleTaskStop 处理停止任务请求
+func (c *Client) handleTaskStop(msg protocol.Message) {
+	c.forwardToExecutor(msg)
+}
+
+// handleTaskLogs 处理任务日志流请求
+func (c *Client) handleTaskLogs(msg protocol.Message) {
 	c.forwardToExecutor(msg)
 }
 

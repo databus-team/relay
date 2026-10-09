@@ -23,6 +23,7 @@ import (
 	"github.com/user/relay/internal/logx"
 	"github.com/user/relay/internal/relay/client"
 	"github.com/user/relay/internal/relay/protocol"
+	"github.com/user/relay/internal/supervisor"
 	"github.com/user/relay/internal/sync/git"
 	"github.com/user/relay/internal/version"
 )
@@ -36,6 +37,10 @@ type RelayBackend struct {
 	configPath string // config-sync 落盘目标(执行方)
 	eventCh    chan backend.FileInfo
 	mu         sync.RWMutex
+
+	// supervisor 负责进程树生命周期与后台任务托管
+	sup   *supervisor.Supervisor
+	supMu sync.Mutex
 
 	// tunnelAllow 是执行方 network_allow 出网白名单(已解析)。空 = 默认拒绝一切隧道建连(fail-closed)。
 	tunnelAllow []config.TunnelRule
@@ -249,14 +254,33 @@ func (b *RelayBackend) Exec(ctx context.Context, cmd string, cwd string, timeout
 	return out.String(), nil
 }
 
+func (b *RelayBackend) getSupervisor() *supervisor.Supervisor {
+	b.supMu.Lock()
+	defer b.supMu.Unlock()
+	if b.sup == nil {
+		s, err := supervisor.New("")
+		if err != nil {
+			log.Printf("[supervisor] init failed: %v", err)
+			return nil
+		}
+		b.sup = s
+	}
+	return b.sup
+}
+
 // ExecStream 流式执行:本地 CLI 作为请求方时,经中转把命令转发给远端 executor 并实时回调输出。
 // targetExecutor 若非空即目标 executor 的节点身份(executor_id);空=单根回退到自身。
 func (b *RelayBackend) ExecStream(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, onChunk func(backend.ExecChunk)) (int, error) {
-	return b.ExecStreamWithGitSync(ctx, targetExecutor, cmd, cwd, timeout, nil, onChunk)
+	return b.ExecStreamWithOptions(ctx, targetExecutor, cmd, cwd, timeout, nil, false, onChunk)
 }
 
 // ExecStreamWithGitSync 携带 Git 增量同步载荷的流式执行。
 func (b *RelayBackend) ExecStreamWithGitSync(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, syncPayload *backend.GitSyncPayload, onChunk func(backend.ExecChunk)) (int, error) {
+	return b.ExecStreamWithOptions(ctx, targetExecutor, cmd, cwd, timeout, syncPayload, false, onChunk)
+}
+
+// ExecStreamWithOptions 携带完整选项(包括 detach)的流式执行。
+func (b *RelayBackend) ExecStreamWithOptions(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, syncPayload *backend.GitSyncPayload, detach bool, onChunk func(backend.ExecChunk)) (int, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return 0, err
 	}
@@ -274,7 +298,16 @@ func (b *RelayBackend) ExecStreamWithGitSync(ctx context.Context, targetExecutor
 		}
 	}
 
-	resp, err := b.client.ExecStreamWithGitSync(ctx, targetExecutor, cmd, cwd, timeout, protoSync, func(chunk protocol.ExecChunk) {
+	opts := client.ExecOptions{
+		TargetExecutor: targetExecutor,
+		Cmd:            cmd,
+		Cwd:            cwd,
+		Timeout:        timeout,
+		GitSync:        protoSync,
+		Detach:         detach,
+	}
+
+	resp, err := b.client.ExecStreamWithOptions(ctx, opts, func(chunk protocol.ExecChunk) {
 		if onChunk != nil {
 			onChunk(backend.ExecChunk{Stdout: chunk.Stdout, Data: chunk.Data})
 		}
@@ -375,6 +408,9 @@ func (b *RelayBackend) enableExecutor() {
 	b.client.SetPushJobHandler(func(sess *client.PushJobSession) { b.handleInboundPushJob(sess) })
 	b.client.SetConfigSyncHandler(func(sess *client.ConfigSyncSession) { b.handleInboundConfigSync(sess) })
 	b.client.SetTunnelHandler(func(sess *client.TunnelSession) { b.handleInboundTunnelConnect(sess) })
+	b.client.SetTaskListHandler(func(sess *client.TaskListSession) { b.handleInboundTaskList(sess) })
+	b.client.SetTaskStopHandler(func(sess *client.TaskStopSession) { b.handleInboundTaskStop(sess) })
+	b.client.SetTaskLogsHandler(func(sess *client.TaskLogsSession) { b.handleInboundTaskLogs(sess) })
 	b.client.SetOnReconnect(b.registerExecutor)
 	b.registerExecutor()
 }
@@ -631,6 +667,30 @@ func (b *RelayBackend) handleInboundExec(sess *client.ExecSession) {
 		_ = sess.Write(true, fmt.Sprintf("➜ [git-sync] applied incremental diff on %s (base: %s)\n", targetDir, diffPayload.BaseCommit))
 	}
 
+	// 2. 后台脱机运行分支 (-d / detach)
+	if sess.Detach() {
+		sup := b.getSupervisor()
+		if sup == nil {
+			_ = sess.Write(false, "supervisor not available on executor\n")
+			_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: "supervisor not available"})
+			return
+		}
+		task, err := sup.StartTask(sess.Cmd(), targetDir, nil)
+		if err != nil {
+			log.Printf("[exec -d] start task failed: %v", err)
+			_ = sess.Write(false, fmt.Sprintf("start background task failed: %v\n", err))
+			_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: err.Error()})
+			return
+		}
+		log.Printf("[exec -d] task started: id=%s pid=%d (watch=%s)", task.Meta().ID, task.Meta().PID, sess.ExecutorID())
+		_ = sess.Write(true, fmt.Sprintf("%s\n", task.Meta().ID))
+		_ = sess.Done(protocol.ExecResponse{
+			ExitCode: 0,
+			Stdout:   task.Meta().ID,
+		})
+		return
+	}
+
 	start := time.Now()
 	exit := runStream(sess.Cmd(), targetDir, sess.Timeout(), func(stdout bool, data string) {
 		_ = sess.Write(stdout, data)
@@ -640,6 +700,104 @@ func (b *RelayBackend) handleInboundExec(sess *client.ExecSession) {
 	_ = sess.Done(protocol.ExecResponse{
 		ExitCode: exit,
 		Duration: dur.Milliseconds(),
+	})
+}
+
+func (b *RelayBackend) handleInboundTaskList(sess *client.TaskListSession) {
+	sup := b.getSupervisor()
+	if sup == nil {
+		_ = sess.Done(protocol.TaskListResponse{OK: false, Error: "supervisor not enabled"})
+		return
+	}
+	tasks := sup.ListTasks(sess.All())
+	var list []protocol.TaskInfo
+	for _, t := range tasks {
+		info := protocol.TaskInfo{
+			ID:        t.ID,
+			Node:      b.executorID,
+			Cmd:       t.Cmd,
+			Cwd:       t.Cwd,
+			PID:       t.PID,
+			Status:    string(t.Status),
+			ExitCode:  t.ExitCode,
+			StartTime: t.StartTime.Unix(),
+		}
+		if t.EndTime != nil {
+			info.EndTime = t.EndTime.Unix()
+		}
+		list = append(list, info)
+	}
+	_ = sess.Done(protocol.TaskListResponse{OK: true, Tasks: list})
+}
+
+func (b *RelayBackend) handleInboundTaskStop(sess *client.TaskStopSession) {
+	sup := b.getSupervisor()
+	if sup == nil {
+		_ = sess.Done(fmt.Errorf("supervisor not enabled"))
+		return
+	}
+	err := sup.StopTask(sess.TaskID())
+	_ = sess.Done(err)
+}
+
+func (b *RelayBackend) handleInboundTaskLogs(sess *client.TaskLogsSession) {
+	sup := b.getSupervisor()
+	if sup == nil {
+		_ = sess.Done(fmt.Errorf("supervisor not enabled"))
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := sup.StreamLogs(ctx, sess.TaskID(), sess.Follow(), sess.TailLines(), func(chunk string) {
+		_ = sess.Write(chunk)
+	})
+	_ = sess.Done(err)
+}
+
+// TaskList 向中转或目标执行方查询任务列表 (实现 backend.TaskSupervisorBackend)
+func (b *RelayBackend) TaskList(ctx context.Context, targetExecutor string, all bool) ([]backend.TaskInfo, error) {
+	if err := b.ensureConnected(ctx); err != nil {
+		return nil, err
+	}
+	resp, err := b.client.TaskList(ctx, targetExecutor, all)
+	if err != nil {
+		return nil, err
+	}
+	var out []backend.TaskInfo
+	for _, t := range resp.Tasks {
+		out = append(out, backend.TaskInfo{
+			ID:        t.ID,
+			Node:      t.Node,
+			Cmd:       t.Cmd,
+			Cwd:       t.Cwd,
+			PID:       t.PID,
+			Status:    t.Status,
+			ExitCode:  t.ExitCode,
+			StartTime: t.StartTime,
+			EndTime:   t.EndTime,
+		})
+	}
+	return out, nil
+}
+
+// TaskStop 向目标执行方请求停止任务
+func (b *RelayBackend) TaskStop(ctx context.Context, targetExecutor, taskID string) error {
+	if err := b.ensureConnected(ctx); err != nil {
+		return err
+	}
+	return b.client.TaskStop(ctx, targetExecutor, taskID)
+}
+
+// TaskLogs 请求目标任务的日志流
+func (b *RelayBackend) TaskLogs(ctx context.Context, targetExecutor, taskID string, follow bool, tailLines int, onChunk func(backend.ExecChunk)) error {
+	if err := b.ensureConnected(ctx); err != nil {
+		return err
+	}
+	return b.client.TaskLogs(ctx, targetExecutor, taskID, follow, tailLines, func(c protocol.ExecChunk) {
+		if onChunk != nil {
+			onChunk(backend.ExecChunk{Stdout: c.Stdout, Data: c.Data})
+		}
 	})
 }
 

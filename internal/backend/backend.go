@@ -57,6 +57,27 @@ type GitSyncPayload struct {
 // GitSyncExecBackend 网络层支持携带 Git 增量同步的流式远程执行。
 type GitSyncExecBackend interface {
 	ExecStreamWithGitSync(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, onChunk func(ExecChunk)) (int, error)
+	ExecStreamWithOptions(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, detach bool, onChunk func(ExecChunk)) (int, error)
+}
+
+// TaskInfo 跨机任务简报
+type TaskInfo struct {
+	ID        string
+	Node      string
+	Cmd       string
+	Cwd       string
+	PID       int
+	Status    string
+	ExitCode  int
+	StartTime int64
+	EndTime   int64
+}
+
+// TaskSupervisorBackend 可选接口:支持类似 Docker 的后台服务生命周期管理
+type TaskSupervisorBackend interface {
+	TaskList(ctx context.Context, targetExecutor string, all bool) ([]TaskInfo, error)
+	TaskStop(ctx context.Context, targetExecutor, taskID string) error
+	TaskLogs(ctx context.Context, targetExecutor, taskID string, follow bool, tailLines int, onChunk func(ExecChunk)) error
 }
 
 // ExecStreamBackend 网络层支持流式输出远程执行。

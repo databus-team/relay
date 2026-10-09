@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	bk "github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/config"
@@ -689,5 +690,133 @@ func TestEndToEnd_ExecWithGitSync(t *testing.T) {
 	}
 	if string(remoteContent) != "package main // modified locally\n" {
 		t.Errorf("remote file content mismatch: %s", string(remoteContent))
+	}
+}
+
+// 端到端:测试 TaskSupervisor 的后台脱机执行 (-d)、任务列表查询 (ps)、日志跟随 (logs -f) 与停止 (stop)
+func TestEndToEnd_TaskSupervisor(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
+	defer client.CloseAll()
+
+	watchDir := t.TempDir()
+	ts, wsURL := newTestHub(t, watchDir)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// 1. 启动远端执行方
+	if _, err := NewRelayBackend(map[string]interface{}{
+		"url":         wsURL,
+		"token":       "tok-exe",
+		"executor_id": "node-1",
+		"watch_dir":   ".",
+		"executor":    true,
+	}); err != nil {
+		t.Fatalf("executor backend: %v", err)
+	}
+
+	// 2. 启动请求方
+	reqBackend, err := NewRelayBackend(map[string]interface{}{
+		"url":         wsURL,
+		"token":       "tok-req",
+		"executor_id": "node-1",
+		"watch_dir":   ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+
+	tb, ok := reqBackend.(bk.TaskSupervisorBackend)
+	if !ok {
+		t.Fatalf("requester does not implement TaskSupervisorBackend")
+	}
+
+	gb, ok := reqBackend.(bk.GitSyncExecBackend)
+	if !ok {
+		t.Fatalf("requester does not implement GitSyncExecBackend")
+	}
+
+	// 3. 后台脱机执行任务 (detach = true)
+	var taskIDOut strings.Builder
+	start := time.Now()
+	exit, err := gb.ExecStreamWithOptions(ctx, "node-1", "printf 'task_step_1\n'; sleep 0.3; printf 'task_step_2\n'; sleep 5", "", 10, nil, true, func(c bk.ExecChunk) {
+		taskIDOut.WriteString(c.Data)
+	})
+	dur := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("exec detach failed: %v", err)
+	}
+	if exit != 0 {
+		t.Fatalf("detach exit code: %d", exit)
+	}
+	if dur > 1*time.Second {
+		t.Errorf("detach command took too long: %s (expected non-blocking)", dur)
+	}
+
+	taskID := strings.TrimSpace(taskIDOut.String())
+	if !strings.HasPrefix(taskID, "t-") {
+		t.Fatalf("invalid taskID output: %q", taskID)
+	}
+
+	// 4. 查询任务列表 (ps)
+	tasks, err := tb.TaskList(ctx, "node-1", false)
+	if err != nil {
+		t.Fatalf("task list: %v", err)
+	}
+	var found bool
+	for _, tk := range tasks {
+		if tk.ID == taskID {
+			found = true
+			if tk.Status != "running" {
+				t.Errorf("expected running status, got: %s", tk.Status)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("task %s not found in active task list", taskID)
+	}
+
+	// 5. 日志流式抓取 (logs -f)
+	logCtx, cancelLog := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelLog()
+
+	var logs strings.Builder
+	_ = tb.TaskLogs(logCtx, "node-1", taskID, true, 10, func(c bk.ExecChunk) {
+		logs.WriteString(c.Data)
+		if strings.Contains(logs.String(), "task_step_2") {
+			cancelLog()
+		}
+	})
+
+	loggedStr := logs.String()
+	if !strings.Contains(loggedStr, "task_step_1") {
+		t.Errorf("logs missing step 1, got: %q", loggedStr)
+	}
+
+	// 6. 停止任务 (stop)
+	if err := tb.TaskStop(ctx, "node-1", taskID); err != nil {
+		t.Fatalf("task stop: %v", err)
+	}
+
+	// 7. 再次查询 (ps -a) 验证状态变为 stopped
+	allTasks, err := tb.TaskList(ctx, "node-1", true)
+	if err != nil {
+		t.Fatalf("task list all: %v", err)
+	}
+	var stoppedFound bool
+	for _, tk := range allTasks {
+		if tk.ID == taskID {
+			stoppedFound = true
+			if tk.Status != "stopped" {
+				t.Errorf("expected stopped status, got: %s", tk.Status)
+			}
+			break
+		}
+	}
+	if !stoppedFound {
+		t.Fatalf("task %s not found in all tasks list", taskID)
 	}
 }

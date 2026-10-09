@@ -59,6 +59,11 @@ type Client struct {
 	tunnelStreams  map[string]*TunnelStream // 出站隧道(requester):streamID -> 本地 SOCKS/SOCKS 通
 	tunnelMu       sync.RWMutex
 
+	taskListHandler func(*TaskListSession)
+	taskStopHandler func(*TaskStopSession)
+	taskLogsHandler func(*TaskLogsSession)
+	taskHandlerM    sync.RWMutex
+
 	onReconnect   func() // 重连成功后的回调(执行方用于重新注册)
 	onReconnectMu sync.Mutex
 }
@@ -326,6 +331,12 @@ func (c *Client) handleMessage(msg protocol.Message) {
 		c.handleInboundPushJob(msg)
 	case protocol.MsgConfigSync:
 		c.handleInboundConfigSync(msg)
+	case protocol.MsgTaskList:
+		c.handleInboundTaskList(msg)
+	case protocol.MsgTaskStop:
+		c.handleInboundTaskStop(msg)
+	case protocol.MsgTaskLogs:
+		c.handleInboundTaskLogs(msg)
 	case protocol.MsgResponse, protocol.MsgError:
 		if msg.RequestID != "" {
 			c.pendingMu.RLock()

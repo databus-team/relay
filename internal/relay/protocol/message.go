@@ -30,6 +30,9 @@ const (
 	MsgTunnelConnect    MessageType = "tunnel_connect"
 	MsgTunnelData       MessageType = "tunnel_data"
 	MsgTunnelEnd        MessageType = "tunnel_end"
+	MsgTaskList         MessageType = "task_list"
+	MsgTaskStop         MessageType = "task_stop"
+	MsgTaskLogs         MessageType = "task_logs"
 )
 
 // Message 是所有消息的通用包装
@@ -317,6 +320,47 @@ type ExecRequest struct {
 	Cwd        string          `json:"cwd,omitempty"`
 	Timeout    int             `json:"timeout"`
 	GitSync    *GitSyncPayload `json:"git_sync,omitempty"`
+	Detach     bool            `json:"detach,omitempty"` // true = 后台托管运行并立即返回 TaskID
+}
+
+// TaskInfo 描述跨机传输的任务简报
+type TaskInfo struct {
+	ID        string `json:"id"`
+	Node      string `json:"node,omitempty"` // 所属执行方 executor_id
+	Cmd       string `json:"cmd"`
+	Cwd       string `json:"cwd"`
+	PID       int    `json:"pid"`
+	Status    string `json:"status"`
+	ExitCode  int    `json:"exit_code"`
+	StartTime int64  `json:"start_time"`
+	EndTime   int64  `json:"end_time,omitempty"`
+}
+
+// TaskListRequest 查询任务列表
+type TaskListRequest struct {
+	ExecutorID string `json:"executor_id,omitempty"` // 为空表示查询所有在线节点
+	All        bool   `json:"all"`                   // true 包含已退出的历史任务
+}
+
+// TaskListResponse 任务列表响应
+type TaskListResponse struct {
+	OK    bool       `json:"ok"`
+	Error string     `json:"error,omitempty"`
+	Tasks []TaskInfo `json:"tasks"`
+}
+
+// TaskStopRequest 停止任务请求
+type TaskStopRequest struct {
+	ExecutorID string `json:"executor_id,omitempty"`
+	TaskID     string `json:"task_id"`
+}
+
+// TaskLogsRequest 获取任务日志请求
+type TaskLogsRequest struct {
+	ExecutorID string `json:"executor_id,omitempty"`
+	TaskID     string `json:"task_id"`
+	Follow     bool   `json:"follow"`
+	TailLines  int    `json:"tail_lines"`
 }
 
 // DeleteRequest 删除文件请求

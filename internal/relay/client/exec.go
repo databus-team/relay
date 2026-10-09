@@ -74,6 +74,16 @@ func (c *Client) streamChunkedContent(ctx context.Context, streamID string, tota
 	return nil
 }
 
+// ExecOptions 执行参数配置
+type ExecOptions struct {
+	TargetExecutor string
+	Cmd            string
+	Cwd            string
+	Timeout        int
+	GitSync        *protocol.GitSyncPayload
+	Detach         bool
+}
+
 // ExecStream 发送命令请求并流式接收输出。onChunk 每次收到增量输出帧时回调(nil 可忽略)。
 // 返回最终 ExecResponse(含聚合 stdout/stderr 与 exit code)。
 // targetExecutor 若非空则以它作为请求路由目标(目标执行方 executor_id);空则回退到本端身份。
@@ -83,11 +93,22 @@ func (c *Client) ExecStream(ctx context.Context, targetExecutor, cmd, cwd string
 
 // ExecStreamWithGitSync 发送带有 Git 增量同步载荷的命令请求并流式接收输出。
 func (c *Client) ExecStreamWithGitSync(ctx context.Context, targetExecutor, cmd, cwd string, timeout int, syncPayload *protocol.GitSyncPayload, onChunk func(protocol.ExecChunk)) (*protocol.ExecResponse, error) {
-	if timeout <= 0 {
-		timeout = 30
+	return c.ExecStreamWithOptions(ctx, ExecOptions{
+		TargetExecutor: targetExecutor,
+		Cmd:            cmd,
+		Cwd:            cwd,
+		Timeout:        timeout,
+		GitSync:        syncPayload,
+	}, onChunk)
+}
+
+// ExecStreamWithOptions 携带完整选项的流式执行请求
+func (c *Client) ExecStreamWithOptions(ctx context.Context, opts ExecOptions, onChunk func(protocol.ExecChunk)) (*protocol.ExecResponse, error) {
+	if opts.Timeout <= 0 {
+		opts.Timeout = 30
 	}
-	if targetExecutor == "" {
-		targetExecutor = c.id
+	if opts.TargetExecutor == "" {
+		opts.TargetExecutor = c.id
 	}
 
 	reqID, ch := c.registerInStream()
@@ -97,11 +118,12 @@ func (c *Client) ExecStreamWithGitSync(ctx context.Context, targetExecutor, cmd,
 		Type: protocol.MsgExec,
 		ID:   reqID,
 		Payload: protocol.ExecRequest{
-			ExecutorID: targetExecutor,
-			Cmd:        cmd,
-			Cwd:        cwd,
-			Timeout:    timeout,
-			GitSync:    syncPayload,
+			ExecutorID: opts.TargetExecutor,
+			Cmd:        opts.Cmd,
+			Cwd:        opts.Cwd,
+			Timeout:    opts.Timeout,
+			GitSync:    opts.GitSync,
+			Detach:     opts.Detach,
 		},
 	}
 
@@ -498,6 +520,7 @@ func (e *ExecSession) Cwd() string                      { return e.req.Cwd }
 func (e *ExecSession) Timeout() int                     { return e.req.Timeout }
 func (e *ExecSession) ExecutorID() string               { return e.req.ExecutorID }
 func (e *ExecSession) GitSync() *protocol.GitSyncPayload { return e.req.GitSync }
+func (e *ExecSession) Detach() bool                     { return e.req.Detach }
 
 // SetExecHandler 设置入站 exec 处理回调。设置后,该客户端成为可被中转转发 exec 的执行方。
 func (c *Client) SetExecHandler(fn func(*ExecSession)) {
@@ -605,4 +628,221 @@ func (c *Client) routeExecStream(msg *protocol.Message) bool {
 	default:
 	}
 	return true
+}
+
+// TaskListSession 是一次入站 task-list(执行方视角)的写回句柄
+type TaskListSession struct {
+	client    *Client
+	requestID string
+	req       protocol.TaskListRequest
+}
+
+func (s *TaskListSession) ExecutorID() string { return s.req.ExecutorID }
+func (s *TaskListSession) All() bool          { return s.req.All }
+
+func (s *TaskListSession) Done(resp protocol.TaskListResponse) error {
+	return s.client.sendMessage(&protocol.Message{
+		Type:      protocol.MsgResponse,
+		RequestID: s.requestID,
+		ID:        uuid.New().String(),
+		Payload:   resp,
+	})
+}
+
+// SetTaskListHandler 设置入站 task-list 回调 (执行方视角)
+func (c *Client) SetTaskListHandler(fn func(*TaskListSession)) {
+	c.taskHandlerM.Lock()
+	c.taskListHandler = fn
+	c.taskHandlerM.Unlock()
+}
+
+func (c *Client) handleInboundTaskList(msg protocol.Message) {
+	data, _ := json.Marshal(msg.Payload)
+	var req protocol.TaskListRequest
+	_ = json.Unmarshal(data, &req)
+
+	c.taskHandlerM.RLock()
+	h := c.taskListHandler
+	c.taskHandlerM.RUnlock()
+
+	sess := &TaskListSession{client: c, requestID: msg.ID, req: req}
+	if h == nil {
+		_ = sess.Done(protocol.TaskListResponse{OK: false, Error: "task list handler not set"})
+		return
+	}
+	go h(sess)
+}
+
+// TaskStopSession 是一次入站 task-stop(执行方视角)的写回句柄
+type TaskStopSession struct {
+	client    *Client
+	requestID string
+	req       protocol.TaskStopRequest
+}
+
+func (s *TaskStopSession) TaskID() string { return s.req.TaskID }
+
+func (s *TaskStopSession) Done(err error) error {
+	if err != nil {
+		return s.client.sendMessage(&protocol.Message{
+			Type:      protocol.MsgError,
+			RequestID: s.requestID,
+			Payload:   err.Error(),
+		})
+	}
+	return s.client.sendMessage(&protocol.Message{
+		Type:      protocol.MsgResponse,
+		RequestID: s.requestID,
+		ID:        uuid.New().String(),
+		Payload:   map[string]interface{}{"ok": true},
+	})
+}
+
+// SetTaskStopHandler 设置入站 task-stop 回调 (执行方视角)
+func (c *Client) SetTaskStopHandler(fn func(*TaskStopSession)) {
+	c.taskHandlerM.Lock()
+	c.taskStopHandler = fn
+	c.taskHandlerM.Unlock()
+}
+
+func (c *Client) handleInboundTaskStop(msg protocol.Message) {
+	data, _ := json.Marshal(msg.Payload)
+	var req protocol.TaskStopRequest
+	_ = json.Unmarshal(data, &req)
+
+	c.taskHandlerM.RLock()
+	h := c.taskStopHandler
+	c.taskHandlerM.RUnlock()
+
+	sess := &TaskStopSession{client: c, requestID: msg.ID, req: req}
+	if h == nil {
+		_ = sess.Done(fmt.Errorf("task stop handler not set"))
+		return
+	}
+	go h(sess)
+}
+
+// TaskLogsSession 是一次入站 task-logs(执行方视角)的写回句柄
+type TaskLogsSession struct {
+	client    *Client
+	requestID string
+	req       protocol.TaskLogsRequest
+	seq       atomic.Int64
+}
+
+func (s *TaskLogsSession) TaskID() string    { return s.req.TaskID }
+func (s *TaskLogsSession) Follow() bool      { return s.req.Follow }
+func (s *TaskLogsSession) TailLines() int    { return s.req.TailLines }
+
+func (s *TaskLogsSession) Write(chunk string) error {
+	msg := &protocol.Message{
+		Type:      protocol.MsgExecOutput,
+		RequestID: s.requestID,
+		Payload: protocol.ExecChunk{
+			Seq:    int(s.seq.Add(1)),
+			Stdout: true,
+			Data:   chunk,
+		},
+	}
+	return s.client.sendMessage(msg)
+}
+
+func (s *TaskLogsSession) Done(err error) error {
+	if err != nil {
+		return s.client.sendMessage(&protocol.Message{
+			Type:      protocol.MsgError,
+			RequestID: s.requestID,
+			Payload:   err.Error(),
+		})
+	}
+	return s.client.sendMessage(&protocol.Message{
+		Type:      protocol.MsgResponse,
+		RequestID: s.requestID,
+		ID:        uuid.New().String(),
+		Payload:   protocol.ExecResponse{ExitCode: 0},
+	})
+}
+
+// SetTaskLogsHandler 设置入站 task-logs 回调 (执行方视角)
+func (c *Client) SetTaskLogsHandler(fn func(*TaskLogsSession)) {
+	c.taskHandlerM.Lock()
+	c.taskLogsHandler = fn
+	c.taskHandlerM.Unlock()
+}
+
+func (c *Client) handleInboundTaskLogs(msg protocol.Message) {
+	data, _ := json.Marshal(msg.Payload)
+	var req protocol.TaskLogsRequest
+	_ = json.Unmarshal(data, &req)
+
+	c.taskHandlerM.RLock()
+	h := c.taskLogsHandler
+	c.taskHandlerM.RUnlock()
+
+	sess := &TaskLogsSession{client: c, requestID: msg.ID, req: req}
+	if h == nil {
+		_ = sess.Done(fmt.Errorf("task logs handler not set"))
+		return
+	}
+	go h(sess)
+}
+
+// TaskList 向中转查询任务列表
+func (c *Client) TaskList(ctx context.Context, targetExecutor string, all bool) (*protocol.TaskListResponse, error) {
+	resp, err := c.Request(ctx, protocol.MsgTaskList, protocol.TaskListRequest{
+		ExecutorID: targetExecutor,
+		All:        all,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !resp.OK {
+		return nil, fmt.Errorf("task list failed: %s", resp.Error)
+	}
+	data, _ := json.Marshal(resp.Payload)
+	var tlResp protocol.TaskListResponse
+	if err := json.Unmarshal(data, &tlResp); err != nil {
+		return nil, err
+	}
+	return &tlResp, nil
+}
+
+// TaskStop 向目标执行方请求停止任务
+func (c *Client) TaskStop(ctx context.Context, targetExecutor, taskID string) error {
+	resp, err := c.Request(ctx, protocol.MsgTaskStop, protocol.TaskStopRequest{
+		ExecutorID: targetExecutor,
+		TaskID:     taskID,
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("task stop failed: %s", resp.Error)
+	}
+	return nil
+}
+
+// TaskLogs 请求目标任务的日志流
+func (c *Client) TaskLogs(ctx context.Context, targetExecutor, taskID string, follow bool, tailLines int, onChunk func(protocol.ExecChunk)) error {
+	reqID, ch := c.registerInStream()
+	defer c.unregisterInStream(reqID)
+
+	msg := &protocol.Message{
+		Type: protocol.MsgTaskLogs,
+		ID:   reqID,
+		Payload: protocol.TaskLogsRequest{
+			ExecutorID: targetExecutor,
+			TaskID:     taskID,
+			Follow:     follow,
+			TailLines:  tailLines,
+		},
+	}
+	select {
+	case c.sendCh <- sendMsg{Message: msg}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	_, err := c.execRoundTrip(ctx, ch, onChunk)
+	return err
 }
