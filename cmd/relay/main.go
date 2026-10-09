@@ -133,6 +133,14 @@ var (
 	tunnelExecName = tunnelCmd.Flag("executor", "Egress executor's executor_id (see `relay status` -> executors[].executor_id)").Short('w').String()
 	tunnelAction   = tunnelCmd.Arg("action", "run|start|stop|status|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "restart", "upgrade").String()
 	tunnelUpgradePath = tunnelCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
+
+	// Port-forward command - 本地端口映射到远端服务 (类似 kubectl port-forward / docker -p)
+	portForwardCmd    = kingpin.Command("port-forward", "Forward local port to remote executor (similar to kubectl port-forward)").Alias("pf")
+	portForwardPorts  = portForwardCmd.Arg("port", "[local:]remote port (e.g. 8080:8080 or 8080)").String()
+	portForwardAction = portForwardCmd.Arg("action", "run|start|stop|status|restart (default: run)").HintOptions("run", "start", "stop", "status", "restart").String()
+	portForwardExec   = portForwardCmd.Flag("executor", "Target executor node").Short('e').String()
+	portForwardWatch  = portForwardCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').String()
+	portForwardBind   = portForwardCmd.Flag("bind", "Local IP to bind to").Default("127.0.0.1").String()
 )
 
 func main() {
@@ -244,6 +252,28 @@ func main() {
 			daemonUpgradeTunnel(*tunnelUpgradePath)
 		default:
 			runTunnel()
+		}
+	case portForwardCmd.FullCommand():
+		act := normalizedAction(*portForwardAction)
+		if act == "" && (*portForwardPorts == "status" || *portForwardPorts == "list") {
+			act = "status"
+			*portForwardPorts = ""
+		}
+		switch act {
+		case "start":
+			if err := daemonStartPortForward(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		case "stop":
+			daemonStopPortForward()
+		case "status":
+			if err := daemonStatusPortForward(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		default:
+			runPortForward()
 		}
 	default:
 		app.Usage(os.Args)

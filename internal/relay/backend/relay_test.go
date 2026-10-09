@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"math/rand"
+	"net"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -33,6 +34,26 @@ func newTestHub(t *testing.T, watchDir string) (*httptest.Server, string) {
 	})
 	if err != nil {
 		t.Fatalf("create server: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	return ts, "ws" + strings.TrimPrefix(ts.URL, "http") + "/relay"
+}
+
+func newTestHubWithTunnel(t *testing.T, watchDir string) (*httptest.Server, string) {
+	t.Helper()
+	srv, err := server.New(server.Config{
+		Addr: ":0",
+		WatchDirs: []server.WatchDirConfig{
+			{ID: "test", Dir: watchDir},
+		},
+		Auth: server.AuthConfig{
+			Type:   "token",
+			Tokens: []string{"tok-exe", "tok-req"},
+		},
+		TunnelEnabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create server with tunnel: %v", err)
 	}
 	ts := httptest.NewServer(srv)
 	return ts, "ws" + strings.TrimPrefix(ts.URL, "http") + "/relay"
@@ -818,5 +839,107 @@ func TestEndToEnd_TaskSupervisor(t *testing.T) {
 	}
 	if !stoppedFound {
 		t.Fatalf("task %s not found in all tasks list", taskID)
+	}
+}
+
+// 端到端:通过 TunnelOpen 实现端口映射直通远端内部服务,并验证白名单防护。
+func TestEndToEnd_PortForward(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
+	defer client.CloseAll()
+
+	// 1. 模拟远端本地 TCP Echo 服务
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen echo: %v", err)
+	}
+	defer ln.Close()
+	echoPort := ln.Addr().(*net.TCPAddr).Port
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				buf := make([]byte, 1024)
+				for {
+					n, err := conn.Read(buf)
+					if n > 0 {
+						_, _ = conn.Write(buf[:n])
+					}
+					if err != nil {
+						return
+					}
+				}
+			}(c)
+		}
+	}()
+
+	// 2. 启动具备隧道功能的中转服务器
+	watchDir := t.TempDir()
+	ts, wsURL := newTestHubWithTunnel(t, watchDir)
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 3. 执行方(node-1)接入并注册白名单:放行 127.0.0.1
+	_, err = NewRelayBackend(map[string]interface{}{
+		"url":           wsURL,
+		"token":         "tok-exe",
+		"executor_id":   "node-1",
+		"watch_dir":     ".",
+		"executor":      true,
+		"network_allow": []string{"127.0.0.1"},
+	})
+	if err != nil {
+		t.Fatalf("executor backend: %v", err)
+	}
+
+	// 4. 请求方接入
+	reqRaw, err := NewRelayBackend(map[string]interface{}{
+		"url":         wsURL,
+		"token":       "tok-req",
+		"executor_id": "req-client",
+		"watch_dir":   ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+	rb := reqRaw.(*RelayBackend)
+
+	// 5. 开启到远端服务的端口转发隧道并测试数据透传
+	stream, err := rb.TunnelOpen(ctx, "node-1", "127.0.0.1", uint16(echoPort))
+	if err != nil {
+		t.Fatalf("tunnel open: %v", err)
+	}
+
+	payload := []byte("hello-relay-port-forward\n")
+	if err := stream.Send(payload); err != nil {
+		t.Fatalf("stream send: %v", err)
+	}
+
+	reply, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("stream recv: %v", err)
+	}
+	if string(reply) != string(payload) {
+		t.Fatalf("expected %q, got %q", string(payload), string(reply))
+	}
+	stream.Close()
+
+	// 6. 验证白名单拦截机制:未放行目标(10.0.0.1)必须被拒绝
+	_, err = rb.TunnelOpen(ctx, "node-1", "10.0.0.1", 80)
+	if err == nil {
+		t.Fatalf("expected network_allow reject error, got nil")
+	}
+
+	// 7. 验证不存在的目标节点错误
+	_, err = rb.TunnelOpen(ctx, "non-existent-node", "127.0.0.1", uint16(echoPort))
+	if err == nil {
+		t.Fatalf("expected error for non-existent node, got nil")
 	}
 }

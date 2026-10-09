@@ -125,6 +125,8 @@ func NewRelayBackend(params map[string]interface{}) (backend.FileTransferBackend
 				cfg.NetworkAllow = append(cfg.NetworkAllow, s)
 			}
 		}
+	} else if rawStr, ok := params["network_allow"].([]string); ok {
+		cfg.NetworkAllow = append(cfg.NetworkAllow, rawStr...)
 	}
 	if raw, ok := params["headers"].(map[string]interface{}); ok {
 		cfg.Headers = make(map[string]string, len(raw))
