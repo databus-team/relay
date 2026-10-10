@@ -280,8 +280,7 @@ func (c *Client) handleExec(msg protocol.Message) {
 
 // handleTaskList 处理任务列表查询 (单节点转发或整网聚合)
 func (c *Client) handleTaskList(msg protocol.Message) {
-	payload, _ := msg.Payload.(map[string]interface{})
-	data, _ := json.Marshal(payload)
+	data, _ := json.Marshal(msg.Payload)
 	var req protocol.TaskListRequest
 	_ = json.Unmarshal(data, &req)
 

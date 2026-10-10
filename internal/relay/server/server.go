@@ -36,9 +36,7 @@ type Server struct {
 	subMu sync.RWMutex
 
 	// executors 记录每个 executor_id 上注册的执行方客户端(远端 watcher)。
-	executors map[string]string
-	// executorVers 记录每个 executor 执行方的 relay 构建版本,供 relay version 对比。
-	executorVers      map[string]string
+	executors         map[string]string
 	executorEndpoints map[string]ExecutorEndpoint
 	executorMu        sync.RWMutex
 	// reqOwner 记录被转发的 exec 请求(reqID)归属的请求方客户端,用于把执行方回流帧转回去。
@@ -129,11 +127,10 @@ func New(cfg Config) (*Server, error) {
 		serverID:      "relay-" + uuid.New().String()[:8],
 		auth:          cfg.Auth,
 		tls:           cfg.TLS,
-		subs:          make(map[string]map[string]bool),
+		subs:              make(map[string]map[string]bool),
 		executors:         make(map[string]string),
-		executorVers:      make(map[string]string),
 		executorEndpoints: make(map[string]ExecutorEndpoint),
-		reqOwner:      make(map[string]string),
+		reqOwner:          make(map[string]string),
 		pending:       make(map[string]chan protocol.Message),
 		pushRelay:     make(map[string]pushRelayInfo),
 		tunnels:       make(map[string]*tunnelEntry),
@@ -429,7 +426,6 @@ func (s *Server) RegisterExecutor(executorID, clientID, version, goos, goarch st
 	replaced = prev != "" && prev != clientID
 	s.executors[executorID] = clientID
 	if version != "" || goos != "" {
-		s.executorVers[executorID] = version
 		s.executorEndpoints[executorID] = ExecutorEndpoint{
 			ClientID: clientID,
 			Version:  version,
@@ -438,7 +434,6 @@ func (s *Server) RegisterExecutor(executorID, clientID, version, goos, goarch st
 			Resource: res,
 		}
 	} else {
-		delete(s.executorVers, executorID)
 		delete(s.executorEndpoints, executorID)
 	}
 	return prev, replaced
@@ -450,7 +445,6 @@ func (s *Server) UnregisterExecutor(executorID, clientID string) {
 	defer s.executorMu.Unlock()
 	if s.executors[executorID] == clientID {
 		delete(s.executors, executorID)
-		delete(s.executorVers, executorID)
 		delete(s.executorEndpoints, executorID)
 	}
 }
@@ -459,9 +453,9 @@ func (s *Server) UnregisterExecutor(executorID, clientID string) {
 func (s *Server) ExecutorVersions() map[string]string {
 	s.executorMu.RLock()
 	defer s.executorMu.RUnlock()
-	out := make(map[string]string, len(s.executorVers))
-	for k, v := range s.executorVers {
-		out[k] = v
+	out := make(map[string]string, len(s.executorEndpoints))
+	for k, ep := range s.executorEndpoints {
+		out[k] = ep.Version
 	}
 	return out
 }
@@ -493,7 +487,6 @@ func (s *Server) ExecutorEndpoints() map[string]ExecutorEndpoint {
 		ep := s.executorEndpoints[eid]
 		if ep.ClientID == "" {
 			ep.ClientID = cid
-			ep.Version = s.executorVers[eid]
 		}
 		out[eid] = ep
 	}
@@ -679,7 +672,7 @@ func (s *Server) cleanupClientState(clientID string) {
 	for eid, e := range s.executors {
 		if e == clientID {
 			delete(s.executors, eid)
-			delete(s.executorVers, eid)
+			delete(s.executorEndpoints, eid)
 		}
 	}
 	s.executorMu.Unlock()

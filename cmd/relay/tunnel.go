@@ -53,14 +53,9 @@ func runTunnel() {
 		os.Exit(1)
 	}
 
-	b, err := getBackendWithAdaptiveLoopback(cfg)
+	rb, err := getRelayBackend(cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
-		os.Exit(1)
-	}
-	rb, ok := b.(*relaybackend.RelayBackend)
-	if !ok {
-		fmt.Fprintf(os.Stderr, "Error: tunnel requires a relay backend (got %T)\n", b)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 

@@ -40,7 +40,6 @@ func getRepoLock(dir string) *sync.Mutex {
 type ApplyResult struct {
 	Applied        bool
 	ShadowSnapshot string // 若触发了影子快照，记录其 ref 名字
-	FilesModified  int
 }
 
 // ApplyDiffPayload 远端安全接收并应用 DiffPayload
@@ -68,7 +67,7 @@ func ApplyDiffPayload(dir string, payload *DiffPayload) (*ApplyResult, error) {
 	if payload.BaseCommit != "" && info.BaseCommit != "" && payload.BaseCommit != info.BaseCommit {
 		if !payload.Force {
 			return nil, fmt.Errorf("base commit drift detected: remote is at %s, but local expects %s. Align commits or use --force-remote",
-				shortSHA(info.BaseCommit), shortSHA(payload.BaseCommit))
+				ShortSHA(info.BaseCommit), ShortSHA(payload.BaseCommit))
 		}
 	}
 
@@ -221,9 +220,13 @@ func runGitWithStdin(ctx context.Context, dir string, stdinData []byte, args ...
 	return nil
 }
 
-func shortSHA(sha string) string {
+// ShortSHA 截取 commit SHA 前 8 位作为简短标识
+func ShortSHA(sha string) string {
 	if len(sha) > 8 {
 		return sha[:8]
+	}
+	if sha == "" {
+		return "(empty)"
 	}
 	return sha
 }

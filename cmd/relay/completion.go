@@ -143,8 +143,8 @@ var commandSpecs = map[string]cmdSpec{
 		flags:   []string{"-w", "--watch"},
 	},
 	"tunnel": {
-		subcmds: []string{"run", "start", "stop", "status", "restart", "upgrade"},
-		flags:   []string{"--listen", "-w", "--executor", "--node"},
+		subcmds: []string{"run", "start", "stop", "status", "logs", "restart", "upgrade"},
+		flags:   []string{"--listen", "-w", "--executor", "--node", "--json", "-f", "--follow", "--tail"},
 	},
 	"port-forward": {
 		subcmds: []string{"run", "start", "stop", "status", "restart"},
@@ -205,13 +205,19 @@ func handleComplete(args []string) {
 		return // 交给 shell 走文件补全
 	}
 
-	// 2. 查找第一个命令名
+	// 2. 查找第一个命令名 (正确跳过带参数的全局 Flag)
 	cmd := ""
 	for i := 0; i < len(args)-1; i++ {
-		if !strings.HasPrefix(args[i], "-") {
-			cmd = args[i]
-			break
+		arg := args[i]
+		if strings.HasPrefix(arg, "-") {
+			// 跳过带单独参数值的选项，如 -c /path 或 --config /path
+			if (arg == "-c" || arg == "--config") && i+1 < len(args)-1 {
+				i++
+			}
+			continue
 		}
+		cmd = arg
+		break
 	}
 
 	// 若尚未输入确定的一级命令

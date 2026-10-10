@@ -182,8 +182,8 @@ func runDiff() {
 	fmt.Println("================================================================================")
 
 	// 基准提交比对
-	localBaseShort := shortSHA(localInfo.BaseCommit)
-	remoteBaseShort := shortSHA(remoteResp.BaseCommit)
+	localBaseShort := git.ShortSHA(localInfo.BaseCommit)
+	remoteBaseShort := git.ShortSHA(remoteResp.BaseCommit)
 	if localInfo.BaseCommit == remoteResp.BaseCommit {
 		fmt.Printf("✓ Base Commit:       Aligned at %s\n", localBaseShort)
 	} else {
@@ -256,14 +256,4 @@ func runDiff() {
 		fmt.Printf("✓ %d shadow snapshot(s) available on remote for recovery (relay undo --list)\n", len(remoteResp.Snapshots))
 	}
 	fmt.Println("================================================================================")
-}
-
-func shortSHA(sha string) string {
-	if len(sha) > 8 {
-		return sha[:8]
-	}
-	if sha == "" {
-		return "(empty)"
-	}
-	return sha
 }

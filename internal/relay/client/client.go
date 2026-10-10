@@ -68,6 +68,10 @@ type Client struct {
 	taskLogsHandler func(*TaskLogsSession)
 	taskHandlerM    sync.RWMutex
 
+	gitStatusHandler func(*GitStatusSession)
+	gitUndoHandler   func(*GitUndoSession)
+	gitHandlerM      sync.RWMutex
+
 	onReconnect   func() // 重连成功后的回调(执行方用于重新注册)
 	onReconnectMu sync.Mutex
 }

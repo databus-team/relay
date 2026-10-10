@@ -40,10 +40,14 @@ var (
 	// Watch command - continuous monitoring (legacy)
 	watchCmd = kingpin.Command("watch", "Workspace watcher daemon (deprecated, use node instead)")
 
-	// 位置参数 action:默认前台;run=前台;start/stop/status/restart/upgrade 为 daemon 控制。
-	watchAction = watchCmd.Arg("action", "run|start|stop|status|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "restart", "upgrade").String()
-	// upgrade 用的新二进制路径(仅 action=upgrade 时使用)。
-	watchUpgradePath = watchCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
+	// 子命令定义
+	_ = watchCmd.Command("run", "Run watcher in foreground")
+	_ = watchCmd.Command("start", "Start watcher daemon in background")
+	_ = watchCmd.Command("stop", "Stop running watcher daemon")
+	_ = watchCmd.Command("status", "Show status of watcher daemon")
+	_ = watchCmd.Command("restart", "Restart watcher daemon")
+	watchUpgradeCmd = watchCmd.Command("upgrade", "Upgrade watcher daemon binary")
+	watchUpgradePath = watchUpgradeCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 
 	// Pull command - download single file (requires filename)
 	pullCmd    = kingpin.Command("pull", "Pull file from remote workspace")
@@ -138,20 +142,43 @@ var (
 	tunnelListen   = tunnelCmd.Flag("listen", "Local SOCKS5 listen address").Default("127.0.0.1:1080").String()
 	tunnelExecName = tunnelCmd.Flag("executor", "Egress executor's executor_id (see `relay status` -> executors[].executor_id)").Short('w').HintAction(getNodeHints).String()
 	tunnelNodeName = tunnelCmd.Flag("node", "Egress node ID (alias for --executor)").HintAction(getNodeHints).String()
-	tunnelJSON     = tunnelCmd.Flag("json", "Output as JSON").Bool()
-	tunnelFollow   = tunnelCmd.Flag("follow", "Follow log output (with action=logs)").Short('f').Bool()
-	tunnelTail     = tunnelCmd.Flag("tail", "Number of lines to show from the end (with action=logs)").Default("100").Int()
-	tunnelAction   = tunnelCmd.Arg("action", "run|start|stop|status|logs|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "logs", "restart", "upgrade").String()
-	tunnelTargetArg = tunnelCmd.Arg("target-or-path", "Target node ID (with action=logs) or new binary path (with action=upgrade)").String()
+
+	// tunnel 子命令
+	_ = tunnelCmd.Command("run", "Run SOCKS5 egress tunnel in foreground")
+	_ = tunnelCmd.Command("start", "Start tunnel daemon in background")
+	_ = tunnelCmd.Command("stop", "Stop running tunnel daemon")
+	tunnelStatusCmd = tunnelCmd.Command("status", "Show status of tunnel daemon and egress readiness")
+	tunnelJSON      = tunnelStatusCmd.Flag("json", "Output as JSON").Bool()
+	tunnelLogsCmd   = tunnelCmd.Command("logs", "Tail or stream tunnel daemon logs")
+	tunnelFollow    = tunnelLogsCmd.Flag("follow", "Follow log output").Short('f').Bool()
+	tunnelTail      = tunnelLogsCmd.Flag("tail", "Number of lines to show from the end").Default("100").Int()
+	tunnelLogsTarget = tunnelLogsCmd.Arg("target", "Target node ID").HintAction(getNodeHints).String()
+	_ = tunnelCmd.Command("restart", "Restart tunnel daemon")
+	tunnelUpgradeCmd = tunnelCmd.Command("upgrade", "Upgrade tunnel daemon binary")
+	tunnelUpgradePath = tunnelUpgradeCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 
 	// Port-forward command - 本地端口映射到远端服务 (类似 kubectl port-forward / docker -p)
 	portForwardCmd    = kingpin.Command("port-forward", "Forward local port to remote node (alias: pf)").Alias("pf")
-	portForwardPorts  = portForwardCmd.Arg("port", "[local:]remote port (e.g. 8080:8080 or 8080)").String()
-	portForwardAction = portForwardCmd.Arg("action", "run|start|stop|status|restart (default: run)").HintOptions("run", "start", "stop", "status", "restart").String()
 	portForwardExec   = portForwardCmd.Flag("executor", "Target executor node").Short('e').HintAction(getNodeHints).String()
 	portForwardNode   = portForwardCmd.Flag("node", "Target node ID (alias for --executor)").HintAction(getNodeHints).String()
 	portForwardWatch  = portForwardCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').HintAction(getWorkspaceHints).String()
 	portForwardBind   = portForwardCmd.Flag("bind", "Local IP to bind to").Default("127.0.0.1").String()
+
+	// port-forward 子命令
+	pfRunCmd = portForwardCmd.Command("run", "Run port forwarding in foreground")
+	pfRunPorts = pfRunCmd.Arg("port", "[local:]remote port (e.g. 8080:8080 or 8080)").String()
+
+	pfStartCmd = portForwardCmd.Command("start", "Start port forwarding daemon in background")
+	pfStartPorts = pfStartCmd.Arg("port", "[local:]remote port (e.g. 8080:8080 or 8080)").Required().String()
+
+	pfStopCmd = portForwardCmd.Command("stop", "Stop running port forwarding daemon")
+	pfStopPorts = pfStopCmd.Arg("port", "[local:]remote port (e.g. 8080:8080 or 8080)").String()
+
+	pfStatusCmd = portForwardCmd.Command("status", "Show status of port forwarding instances")
+	pfStatusPorts = pfStatusCmd.Arg("port", "[local:]remote port (e.g. 8080:8080 or 8080)").String()
+
+	pfRestartCmd = portForwardCmd.Command("restart", "Restart port forwarding daemon")
+	pfRestartPorts = pfRestartCmd.Arg("port", "[local:]remote port (e.g. 8080:8080 or 8080)").Required().String()
 
 	// Undo command - 一键恢复远端工作区影子快照 (防误操作与冲突覆盖)
 	undoCmd      = kingpin.Command("undo", "Restore remote workspace shadow snapshot")
@@ -185,11 +212,21 @@ func main() {
 		logx.SetDebug(true)
 	}
 
-	switch kingpin.Parse() {
-	case serverCmd.FullCommand():
-		// action 位置参数:默认/run=前台;start/stop/status/restart=daemon。裸 `relay server`
-		// (无 action)即为前台,保留原有用法。
-		switch normalizedAction(*serverAction) {
+	os.Args = rewritePfArgs(os.Args)
+
+	parseCtx, parseErr := kingpin.CommandLine.ParseContext(os.Args[1:])
+	if parseErr == nil && parseCtx != nil {
+		if parseCtx.SelectedCommand == nil || len(parseCtx.SelectedCommand.Model().Commands) > 0 {
+			kingpin.CommandLine.UsageForContext(parseCtx)
+			return
+		}
+	}
+
+	selectedCmd := kingpin.Parse()
+	switch {
+	case selectedCmd == "server" || strings.HasPrefix(selectedCmd, "server "):
+		sub := strings.TrimSpace(strings.TrimPrefix(selectedCmd, "server"))
+		switch sub {
 		case "start":
 			if err := daemonStart("server"); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -206,14 +243,17 @@ func main() {
 			daemonRestart("server")
 		case "upgrade":
 			daemonUpgrade("server", *serverUpgradePath)
-		default:
+		case "run":
 			if err := runServer(); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
+		default:
+			app.Usage(os.Args[1:])
 		}
-	case nodeCmd.FullCommand():
-		switch normalizedAction(*nodeAction) {
+	case selectedCmd == "node" || strings.HasPrefix(selectedCmd, "node "):
+		sub := strings.TrimSpace(strings.TrimPrefix(selectedCmd, "node"))
+		switch sub {
 		case "start":
 			if err := daemonStart("node"); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -230,14 +270,17 @@ func main() {
 			daemonRestart("node")
 		case "upgrade":
 			daemonUpgrade("node", *nodeUpgradePath)
-		default:
+		case "run":
 			if err := runNode(); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
+		default:
+			app.Usage(os.Args[1:])
 		}
-	case watchCmd.FullCommand():
-		switch normalizedAction(*watchAction) {
+	case selectedCmd == "watch" || strings.HasPrefix(selectedCmd, "watch "):
+		sub := strings.TrimSpace(strings.TrimPrefix(selectedCmd, "watch"))
+		switch sub {
 		case "start":
 			if err := daemonStart("watch"); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -254,43 +297,14 @@ func main() {
 			daemonRestart("watch")
 		case "upgrade":
 			daemonUpgrade("watch", *watchUpgradePath)
-		default:
+		case "run":
 			runWatch()
+		default:
+			app.Usage(os.Args[1:])
 		}
-	case pullCmd.FullCommand():
-		runPull()
-	case pushCmd.FullCommand():
-		runPush()
-	case execCmd.FullCommand():
-		runExec()
-	case nodesCmd.FullCommand():
-		runNodes()
-	case listCmd.FullCommand():
-		runList()
-	case cleanupCmd.FullCommand():
-		runCleanup()
-	case "help":
-		app.Usage(os.Args)
-	case syncCmd.FullCommand():
-		runSync()
-	case wsCmd.FullCommand():
-		runWorkspaces()
-	case versionCmd.FullCommand():
-		runVersion()
-	case psCmd.FullCommand():
-		runPs()
-	case logsCmd.FullCommand():
-		runLogs()
-	case stopCmd.FullCommand():
-		runStop()
-	case serverRemoteCmd.FullCommand():
-		runServerRemote()
-	case completionCmd.FullCommand():
-		runCompletion()
-	case jobRun.FullCommand():
-		runJobRun()
-	case tunnelCmd.FullCommand():
-		switch normalizedAction(*tunnelAction) {
+	case selectedCmd == "tunnel" || strings.HasPrefix(selectedCmd, "tunnel "):
+		sub := strings.TrimSpace(strings.TrimPrefix(selectedCmd, "tunnel"))
+		switch sub {
 		case "start":
 			if err := daemonStartTunnel(); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -311,17 +325,15 @@ func main() {
 		case "restart":
 			daemonRestartTunnel()
 		case "upgrade":
-			daemonUpgradeTunnel(*tunnelTargetArg)
-		default:
+			daemonUpgradeTunnel(*tunnelUpgradePath)
+		case "run":
 			runTunnel()
+		default:
+			app.Usage(os.Args[1:])
 		}
-	case portForwardCmd.FullCommand():
-		act := normalizedAction(*portForwardAction)
-		if act == "" && (*portForwardPorts == "status" || *portForwardPorts == "list") {
-			act = "status"
-			*portForwardPorts = ""
-		}
-		switch act {
+	case selectedCmd == "port-forward" || strings.HasPrefix(selectedCmd, "port-forward "):
+		sub := strings.TrimSpace(strings.TrimPrefix(selectedCmd, "port-forward"))
+		switch sub {
 		case "start":
 			if err := daemonStartPortForward(); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -334,28 +346,98 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
-		default:
+		case "restart":
+			daemonRestartPortForward()
+		case "run":
 			runPortForward()
+		default:
+			app.Usage(os.Args[1:])
 		}
-	case undoCmd.FullCommand():
+	case selectedCmd == pullCmd.FullCommand():
+		runPull()
+	case selectedCmd == pushCmd.FullCommand():
+		runPush()
+	case selectedCmd == execCmd.FullCommand():
+		runExec()
+	case selectedCmd == nodesCmd.FullCommand():
+		runNodes()
+	case selectedCmd == listCmd.FullCommand():
+		runList()
+	case selectedCmd == cleanupCmd.FullCommand():
+		runCleanup()
+	case selectedCmd == "help":
+		app.Usage(os.Args[1:])
+	case selectedCmd == syncCmd.FullCommand():
+		runSync()
+	case selectedCmd == wsCmd.FullCommand():
+		runWorkspaces()
+	case selectedCmd == versionCmd.FullCommand():
+		runVersion()
+	case selectedCmd == psCmd.FullCommand():
+		runPs()
+	case selectedCmd == logsCmd.FullCommand():
+		runLogs()
+	case selectedCmd == stopCmd.FullCommand():
+		runStop()
+	case selectedCmd == serverRemoteCmd.FullCommand():
+		runServerRemote()
+	case selectedCmd == completionCmd.FullCommand():
+		runCompletion()
+	case selectedCmd == jobRun.FullCommand():
+		runJobRun()
+	case selectedCmd == undoCmd.FullCommand():
 		runUndo()
-	case diffCmd.FullCommand():
+	case selectedCmd == diffCmd.FullCommand():
 		runDiff()
 	default:
-		app.Usage(os.Args)
+		app.Usage(os.Args[1:])
 	}
 }
 
-// normalizedAction 把 action 位置参数归一:run 或空视为前台(返回 ""),其余 daemon 动作原样返回。
-func normalizedAction(a string) string {
-	switch a {
-	case "run", "":
-		return ""
-	case "start", "stop", "status", "logs", "restart", "upgrade":
-		return a
-	default:
-		return ""
+// rewritePfArgs 兼容旧用法：如果用户输入 `relay pf 8080 start` 或 `relay pf -e node 8080 start`，
+// 自动转换为 `relay pf start 8080` 供标准子命令解析
+func rewritePfArgs(args []string) []string {
+	if len(args) < 2 {
+		return args
 	}
+	cmdIdx := -1
+	for i, a := range args {
+		if a == "port-forward" || a == "pf" {
+			cmdIdx = i
+			break
+		}
+	}
+	if cmdIdx == -1 {
+		return args
+	}
+
+	actions := map[string]bool{"start": true, "stop": true, "status": true, "restart": true, "run": true}
+	subArgs := args[cmdIdx+1:]
+	var nonFlags []int
+	for i := 0; i < len(subArgs); i++ {
+		a := subArgs[i]
+		if strings.HasPrefix(a, "-") {
+			if a == "-e" || a == "--executor" || a == "--node" || a == "-w" || a == "--watch" || a == "--bind" || a == "-c" || a == "--config" {
+				i++
+			}
+			continue
+		}
+		nonFlags = append(nonFlags, i)
+	}
+	if len(nonFlags) >= 2 {
+		first := subArgs[nonFlags[0]]
+		second := subArgs[nonFlags[1]]
+		if !actions[first] && actions[second] {
+			idx1 := cmdIdx + 1 + nonFlags[0]
+			idx2 := cmdIdx + 1 + nonFlags[1]
+			newArgs := make([]string, len(args))
+			copy(newArgs, args)
+			newArgs[idx1] = second
+			newArgs[idx2] = first
+			return newArgs
+		}
+	}
+	return args
 }
 
 // daemonStart 已运行则提示,否则 detached 拉起 `relay <name> run -c <config>` 并记录 pid。
@@ -484,51 +566,51 @@ func tunnelDaemonArgs() []string {
 	return []string{"tunnel", "run", "-w", target, "--listen", *tunnelListen, "-c", *configPath}
 }
 
-// tunnelRequireExecutor 校验隧道控制类操作(启动/停止/重启/升级)必须携带 node/executor。
-func tunnelRequireExecutor() error {
+// tunnelRequireExecutor 校验隧道控制类操作(启动/停止/重启/升级)必须携带 node/executor 并返回目标节点 ID。
+func tunnelRequireExecutor() (string, error) {
 	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
 	if target == "" {
-		return fmt.Errorf("Specify --node or --executor with the egress node ID (see `relay status` -> `executors[].executor_id`)")
+		return "", fmt.Errorf("Specify --node or --executor with the egress node ID (see `relay status` -> `executors[].executor_id`)")
 	}
-	return nil
+	return target, nil
 }
 
 // daemonStartTunnel 以 executor 命名的实例 detached 启动隧道 daemon。
 func daemonStartTunnel() error {
-	if err := tunnelRequireExecutor(); err != nil {
+	target, err := tunnelRequireExecutor()
+	if err != nil {
 		return err
 	}
-	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
 	return daemonStartArgs(tunnelInstanceName(target), tunnelDaemonArgs())
 }
 
 // daemonStopTunnel 停止指定 executor 的隧道实例。
 func daemonStopTunnel() {
-	if err := tunnelRequireExecutor(); err != nil {
+	target, err := tunnelRequireExecutor()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}
-	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
 	daemonStop(tunnelInstanceName(target))
 }
 
 // daemonRestartTunnel 重启指定 executor 的隧道实例。
 func daemonRestartTunnel() {
-	if err := tunnelRequireExecutor(); err != nil {
+	target, err := tunnelRequireExecutor()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}
-	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
 	daemonRestartArgs(tunnelInstanceName(target), tunnelDaemonArgs())
 }
 
 // daemonUpgradeTunnel 升级重启指定 executor 的隧道实例。
 func daemonUpgradeTunnel(newBin string) {
-	if err := tunnelRequireExecutor(); err != nil {
+	target, err := tunnelRequireExecutor()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}
-	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
 	daemonUpgradeArgs(tunnelInstanceName(target), newBin, tunnelDaemonArgs())
 }
 
@@ -1507,12 +1589,7 @@ func runNodes() {
 	}
 
 	localRes := sysinfo.CollectResourceInfo(withUsage)
-	localCPU := localRes.FormatCPUSummary()
-	localMem := localRes.FormatMemSummary()
-	if withUsage {
-		localCPU = localRes.FormatCPUUsage()
-		localMem = localRes.FormatMemUsage()
-	}
+	localCPU, localMem := formatNodeResource(localRes, withUsage)
 
 	nodes = append(nodes, PeerNodeItem{
 		ID:       cfg.NodeID() + " (local)",
@@ -1537,12 +1614,7 @@ func runNodes() {
 		MemUsedMB:   st.Resource.MemUsedMB,
 		IsContainer: st.Resource.IsContainer,
 	}
-	transitCPU := transitSysRes.FormatCPUSummary()
-	transitMem := transitSysRes.FormatMemSummary()
-	if withUsage {
-		transitCPU = transitSysRes.FormatCPUUsage()
-		transitMem = transitSysRes.FormatMemUsage()
-	}
+	transitCPU, transitMem := formatNodeResource(transitSysRes, withUsage)
 
 	transitRole := "hub"
 	hasHubAgent := false
@@ -1590,12 +1662,7 @@ func runNodes() {
 			MemUsedMB:   e.Resource.MemUsedMB,
 			IsContainer: e.Resource.IsContainer,
 		}
-		execCPU := execSysRes.FormatCPUSummary()
-		execMem := execSysRes.FormatMemSummary()
-		if withUsage {
-			execCPU = execSysRes.FormatCPUUsage()
-			execMem = execSysRes.FormatMemUsage()
-		}
+		execCPU, execMem := formatNodeResource(execSysRes, withUsage)
 
 		nodes = append(nodes, PeerNodeItem{
 			ID:       e.ExecutorID,
@@ -1655,6 +1722,13 @@ func segmentText(s protocol.StatusSegment) string {
 		return "N/A (" + s.Unavailable + ")"
 	}
 	return "N/A"
+}
+
+func formatNodeResource(res sysinfo.ResourceInfo, withUsage bool) (cpu, mem string) {
+	if withUsage {
+		return res.FormatCPUUsage(), res.FormatMemUsage()
+	}
+	return res.FormatCPUSummary(), res.FormatMemSummary()
 }
 
 // runVersion 打印纯本机构建信息。跨机版本台账职责已归一到 `relay status`;`--json` 仍保留。

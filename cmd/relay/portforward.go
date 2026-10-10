@@ -130,25 +130,21 @@ func runPortForward() {
 		os.Exit(1)
 	}
 
-	if *portForwardPorts == "" {
-		fmt.Fprintf(os.Stderr, "Error: port mapping is required (e.g. relay pf 8080 or relay pf 8080:8080)\n")
+	ports := getPortForwardPorts()
+	if ports == "" {
+		fmt.Fprintf(os.Stderr, "Error: port mapping is required (e.g. relay pf 8080 or relay pf run 8080)\n")
 		os.Exit(1)
 	}
 
-	spec, err := parsePortForwardSpec(*portForwardPorts, *portForwardBind)
+	spec, err := parsePortForwardSpec(ports, *portForwardBind)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	b, err := getBackendWithAdaptiveLoopback(cfg)
+	rb, err := getRelayBackend(cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
-		os.Exit(1)
-	}
-	rb, ok := b.(*relaybackend.RelayBackend)
-	if !ok {
-		fmt.Fprintf(os.Stderr, "Error: backend does not support relay tunnel\n")
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -257,9 +253,29 @@ func pfInstanceName(executor string, localPort int) string {
 	return b.String()
 }
 
+func getPortForwardPorts() string {
+	if pfRunPorts != nil && *pfRunPorts != "" {
+		return *pfRunPorts
+	}
+	if pfStartPorts != nil && *pfStartPorts != "" {
+		return *pfStartPorts
+	}
+	if pfStopPorts != nil && *pfStopPorts != "" {
+		return *pfStopPorts
+	}
+	if pfStatusPorts != nil && *pfStatusPorts != "" {
+		return *pfStatusPorts
+	}
+	if pfRestartPorts != nil && *pfRestartPorts != "" {
+		return *pfRestartPorts
+	}
+	return ""
+}
+
 func daemonStartPortForward() error {
-	if *portForwardPorts == "" {
-		return fmt.Errorf("port mapping is required (e.g. relay pf 8080 start)")
+	ports := getPortForwardPorts()
+	if ports == "" {
+		return fmt.Errorf("port mapping is required (e.g. relay pf start 8080)")
 	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -269,13 +285,13 @@ func daemonStartPortForward() error {
 	if err != nil {
 		return err
 	}
-	spec, err := parsePortForwardSpec(*portForwardPorts, *portForwardBind)
+	spec, err := parsePortForwardSpec(ports, *portForwardBind)
 	if err != nil {
 		return err
 	}
 	instance := pfInstanceName(targetExec, spec.LocalPort)
 	args := []string{
-		"port-forward", *portForwardPorts, "run",
+		"port-forward", "run", ports,
 		"-e", targetExec,
 		"--bind", spec.BindHost,
 		"-c", *configPath,
@@ -284,8 +300,9 @@ func daemonStartPortForward() error {
 }
 
 func daemonStopPortForward() {
-	if *portForwardPorts == "" {
-		fmt.Fprintf(os.Stderr, "Error: port mapping is required (e.g. relay pf 8080 stop)\n")
+	ports := getPortForwardPorts()
+	if ports == "" {
+		fmt.Fprintf(os.Stderr, "Error: port mapping is required (e.g. relay pf stop 8080)\n")
 		return
 	}
 	cfg, err := config.Load(*configPath)
@@ -298,7 +315,7 @@ func daemonStopPortForward() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}
-	spec, err := parsePortForwardSpec(*portForwardPorts, *portForwardBind)
+	spec, err := parsePortForwardSpec(ports, *portForwardBind)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
@@ -307,10 +324,42 @@ func daemonStopPortForward() {
 	daemonStop(instance)
 }
 
+func daemonRestartPortForward() {
+	ports := getPortForwardPorts()
+	if ports == "" {
+		fmt.Fprintf(os.Stderr, "Error: port mapping is required (e.g. relay pf restart 8080)\n")
+		return
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	targetExec, err := resolveTargetExecutor(cfg, *portForwardNode, *portForwardExec, *portForwardWatch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	spec, err := parsePortForwardSpec(ports, *portForwardBind)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return
+	}
+	instance := pfInstanceName(targetExec, spec.LocalPort)
+	args := []string{
+		"port-forward", "run", ports,
+		"-e", targetExec,
+		"--bind", spec.BindHost,
+		"-c", *configPath,
+	}
+	daemonRestartArgs(instance, args)
+}
+
 func daemonStatusPortForward() error {
 	targetExec := resolveNodeTarget(*portForwardNode, *portForwardExec)
-	if *portForwardPorts != "" && targetExec != "" {
-		spec, err := parsePortForwardSpec(*portForwardPorts, *portForwardBind)
+	ports := getPortForwardPorts()
+	if ports != "" && targetExec != "" {
+		spec, err := parsePortForwardSpec(ports, *portForwardBind)
 		if err == nil {
 			return daemonStatus(pfInstanceName(targetExec, spec.LocalPort))
 		}

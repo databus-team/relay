@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"text/template"
+	"unicode/utf8"
 
 	"github.com/alecthomas/kingpin/v2"
 )
@@ -117,7 +118,7 @@ func displayWidth(s string) int {
 		r := rune(s[i])
 		if r > 127 {
 			// 解码多字节 UTF-8
-			_, size := utf8Rune(s[i:])
+			_, size := utf8.DecodeRuneInString(s[i:])
 			if size > 1 {
 				i += size - 1
 			}
@@ -127,15 +128,6 @@ func displayWidth(s string) int {
 		}
 	}
 	return w
-}
-
-func utf8Rune(s string) (rune, int) {
-	for i, r := range s {
-		if i > 0 {
-			return r, i
-		}
-	}
-	return 0, 1
 }
 
 // padRight 以可视宽度向右补齐空格
@@ -263,8 +255,13 @@ func renderHelp(app *kingpin.ApplicationModel, selCmd *kingpin.CmdModel, flags [
 			}
 		}
 
-		// 分组 Commands
+		// 分组 Commands (既支持顶级命令如 tunnel，也支持扁平子命令如 job run)
 		cmdMap := make(map[string]*kingpin.CmdModel)
+		for _, cmd := range app.Commands {
+			if !cmd.Hidden {
+				cmdMap[cmd.Name] = cmd
+			}
+		}
 		for _, cmd := range app.FlattenedCommands() {
 			if !cmd.Hidden {
 				cmdMap[cmd.FullCommand] = cmd
@@ -287,12 +284,20 @@ func renderHelp(app *kingpin.ApplicationModel, selCmd *kingpin.CmdModel, flags [
 			b.WriteString(style.CyanBold(cat.Title) + "\n")
 			maxCmdWidth := 16
 			for _, cmd := range catCmds {
-				if w := displayWidth(cmd.FullCommand); w > maxCmdWidth {
+				dispName := cmd.FullCommand
+				if dispName == "" {
+					dispName = cmd.Name
+				}
+				if w := displayWidth(dispName); w > maxCmdWidth {
 					maxCmdWidth = w
 				}
 			}
 			for _, cmd := range catCmds {
-				label := padRight(cmd.FullCommand, maxCmdWidth+2)
+				dispName := cmd.FullCommand
+				if dispName == "" {
+					dispName = cmd.Name
+				}
+				label := padRight(dispName, maxCmdWidth+2)
 				b.WriteString("  " + style.GreenBold(label) + decorateDesc(style, cmd.Help) + "\n")
 			}
 			b.WriteString("\n")
@@ -301,7 +306,8 @@ func renderHelp(app *kingpin.ApplicationModel, selCmd *kingpin.CmdModel, flags [
 		// 检查兜底未分组命令
 		var otherCmds []*kingpin.CmdModel
 		for _, cmd := range app.FlattenedCommands() {
-			if !cmd.Hidden && !rendered[cmd.FullCommand] && cmd.FullCommand != "help" {
+			top := strings.Split(cmd.FullCommand, " ")[0]
+			if !cmd.Hidden && !rendered[cmd.FullCommand] && !rendered[top] && cmd.FullCommand != "help" {
 				otherCmds = append(otherCmds, cmd)
 			}
 		}

@@ -21,10 +21,14 @@ import (
 var (
 	serverCmd = kingpin.Command("server", "Transit server daemon (deprecated, use node instead)")
 
-	// 位置参数 action:默认前台;run=前台;start/stop/status/restart/upgrade 为 daemon 控制。
-	serverAction = serverCmd.Arg("action", "run|start|stop|status|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "restart", "upgrade").String()
-	// upgrade 用的新二进制路径(仅 action=upgrade 时使用)。
-	serverUpgradePath = serverCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
+	// 子命令定义
+	_ = serverCmd.Command("run", "Run server in foreground")
+	_ = serverCmd.Command("start", "Start server daemon in background")
+	_ = serverCmd.Command("stop", "Stop running server daemon")
+	_ = serverCmd.Command("status", "Show status of server daemon")
+	_ = serverCmd.Command("restart", "Restart server daemon")
+	serverUpgradeCmd = serverCmd.Command("upgrade", "Upgrade server daemon binary")
+	serverUpgradePath = serverUpgradeCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 
 	serverConfigPath = serverCmd.Flag("server-config", "Path to server config file (YAML)").String()
 	serverAddr       = serverCmd.Flag("addr", "Server listen address").String()

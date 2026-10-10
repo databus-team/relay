@@ -39,7 +39,6 @@ func CollectResourceInfo(withUsage bool) ResourceInfo {
 		info.MemTotalMB = int64(mem.ullTotalPhys / (1024 * 1024))
 		if withUsage {
 			info.MemUsedMB = int64((mem.ullTotalPhys - mem.ullAvailPhys) / (1024 * 1024))
-			info.CPULoad = float64(mem.dwMemoryLoad) // Windows 内存负载百分比兜底
 		}
 	}
 

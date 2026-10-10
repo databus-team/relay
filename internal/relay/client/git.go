@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
 
 	"github.com/google/uuid"
 	"github.com/user/relay/internal/relay/protocol"
@@ -63,24 +62,18 @@ func (s *GitUndoSession) Done(resp *protocol.GitUndoResponse, err error) error {
 	})
 }
 
-var (
-	gitHandlerMu sync.RWMutex
-	gitStatusH   func(*GitStatusSession)
-	gitUndoH     func(*GitUndoSession)
-)
-
 // SetGitStatusHandler 设置入站 git-status 回调 (执行方视角)
 func (c *Client) SetGitStatusHandler(fn func(*GitStatusSession)) {
-	gitHandlerMu.Lock()
-	gitStatusH = fn
-	gitHandlerMu.Unlock()
+	c.gitHandlerM.Lock()
+	c.gitStatusHandler = fn
+	c.gitHandlerM.Unlock()
 }
 
 // SetGitUndoHandler 设置入站 git-undo 回调 (执行方视角)
 func (c *Client) SetGitUndoHandler(fn func(*GitUndoSession)) {
-	gitHandlerMu.Lock()
-	gitUndoH = fn
-	gitHandlerMu.Unlock()
+	c.gitHandlerM.Lock()
+	c.gitUndoHandler = fn
+	c.gitHandlerM.Unlock()
 }
 
 func (c *Client) handleInboundGitStatus(msg protocol.Message) {
@@ -88,9 +81,9 @@ func (c *Client) handleInboundGitStatus(msg protocol.Message) {
 	var req protocol.GitStatusRequest
 	_ = json.Unmarshal(data, &req)
 
-	gitHandlerMu.RLock()
-	h := gitStatusH
-	gitHandlerMu.RUnlock()
+	c.gitHandlerM.RLock()
+	h := c.gitStatusHandler
+	c.gitHandlerM.RUnlock()
 
 	sess := &GitStatusSession{client: c, requestID: msg.ID, req: req}
 	if h == nil {
@@ -105,9 +98,9 @@ func (c *Client) handleInboundGitUndo(msg protocol.Message) {
 	var req protocol.GitUndoRequest
 	_ = json.Unmarshal(data, &req)
 
-	gitHandlerMu.RLock()
-	h := gitUndoH
-	gitHandlerMu.RUnlock()
+	c.gitHandlerM.RLock()
+	h := c.gitUndoHandler
+	c.gitHandlerM.RUnlock()
 
 	sess := &GitUndoSession{client: c, requestID: msg.ID, req: req}
 	if h == nil {

@@ -144,20 +144,12 @@ func CreateDiffPayload(dir string, force bool) (*DiffPayload, error) {
 		patch = patchRaw
 	}
 
-	// 2. 查找未跟踪文件 (git status --porcelain)
-	untrackedFiles := []string{}
-	statusOut, err := runGit(ctx, dir, "status", "--porcelain")
-	if err == nil && statusOut != "" {
-		for _, line := range strings.Split(statusOut, "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "?? ") {
-				relPath := strings.TrimSpace(line[3:])
-				// 处理带引号的特殊路径
-				relPath = strings.Trim(relPath, "\"")
-				if relPath != "" {
-					untrackedFiles = append(untrackedFiles, relPath)
-				}
-			}
+	// 2. 查找未跟踪文件 (复用 InspectRepo 已解析出的结果，处理引号)
+	untrackedFiles := make([]string, 0, len(info.UntrackedFiles))
+	for _, f := range info.UntrackedFiles {
+		clean := strings.Trim(strings.TrimSpace(f), "\"")
+		if clean != "" {
+			untrackedFiles = append(untrackedFiles, clean)
 		}
 	}
 

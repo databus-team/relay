@@ -18,10 +18,14 @@ import (
 var (
 	nodeCmd = kingpin.Command("node", "Run unified peer node daemon (hub and agent roles)")
 
-	// 位置参数 action: 默认前台 run; start/stop/status/restart/upgrade 为 daemon 控制。
-	nodeAction = nodeCmd.Arg("action", "run|start|stop|status|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "restart", "upgrade").String()
-	// upgrade 用的新二进制路径 (仅 action=upgrade 时使用)。
-	nodeUpgradePath = nodeCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
+	// 子命令定义
+	_ = nodeCmd.Command("run", "Run node daemon in foreground")
+	_ = nodeCmd.Command("start", "Start node daemon in background")
+	_ = nodeCmd.Command("stop", "Stop running node daemon")
+	_ = nodeCmd.Command("status", "Show status of node daemon")
+	_ = nodeCmd.Command("restart", "Restart node daemon")
+	nodeUpgradeCmd = nodeCmd.Command("upgrade", "Upgrade node daemon binary")
+	nodeUpgradePath = nodeUpgradeCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 	nodeConfigPath  = nodeCmd.Flag("server-config", "Path to server config file (YAML, for backward compatibility)").String()
 )
 
@@ -113,28 +117,8 @@ func runNode() error {
 			fmt.Printf("[Node] Starting Agent (node_id: %s)\n", cfg.Node.ID)
 			relaybackend.SetExecutorRole(true)
 
-			// 确保作为 Agent 启动时开启执行器角色与节点标识绑定
-			if cfg.Backend.Config == nil {
-				cfg.Backend.Config = make(map[string]interface{})
-			}
-			cfg.Backend.Config["executor"] = true
-			if _, ok := cfg.Backend.Config["executor_id"]; !ok || cfg.Backend.Config["executor_id"] == "" {
-				cfg.Backend.Config["executor_id"] = cfg.Node.ID
-			}
-
-			// 若同机也是 Hub，且后端类型是 relay，确保后端连接走本地回环
-			if isHub && cfg.Backend.Type == "relay" {
-				localURL := cfg.GetLocalHubURL()
-				if localURL != "" {
-					cfg.Backend.Config["url"] = localURL
-				}
-				if srvConf != nil && len(srvConf.Auth.Tokens) > 0 {
-					cfg.Backend.Config["token"] = srvConf.Auth.Tokens[0]
-				}
-				if _, ok := cfg.Backend.Config["network_allow"]; !ok {
-					cfg.Backend.Config["network_allow"] = []string{"*"}
-				}
-			}
+			// 确保作为 Agent 启动时开启执行器角色
+			cfg.NormalizeNode()
 
 			w, err := watcher.New(cfg, cfgPath)
 			if err != nil {

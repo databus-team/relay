@@ -16,7 +16,6 @@ import (
 
 	"github.com/user/relay/internal/config"
 	"github.com/user/relay/internal/daemon"
-	"github.com/user/relay/internal/relay/backend"
 	"github.com/user/relay/internal/relay/protocol"
 )
 
@@ -87,13 +86,8 @@ func queryClusterStatusSafe() map[string]protocol.StatusSegment {
 		return nil
 	}
 
-	b, err := getBackendWithAdaptiveLoopback(cfg)
+	rb, err := getRelayBackend(cfg)
 	if err != nil {
-		return nil
-	}
-
-	rb, ok := b.(*backend.RelayBackend)
-	if !ok {
 		return nil
 	}
 
@@ -225,8 +219,8 @@ func daemonLogsTunnel() error {
 	}
 
 	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
-	if target == "" && *tunnelTargetArg != "" {
-		target = *tunnelTargetArg
+	if target == "" && tunnelLogsTarget != nil && *tunnelLogsTarget != "" {
+		target = *tunnelLogsTarget
 	}
 
 	// 若未显式指定目标，且本地恰好只有 1 个实例，自动推断
