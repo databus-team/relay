@@ -173,21 +173,24 @@ make help
 CLI usage (key forms):
 
 ```bash
+relay node [run|start|stop|status|restart]             # unified peer node daemon (hub + agent roles)
 relay watch [run|start|stop|status|restart|upgrade]   # executor (daemon actions)
 relay server [run|start|stop|status|restart|upgrade]  # transit (daemon actions)
-relay push [-w <workspace> | -e <executor-id>] <file> [--no-jobs] [--dest <abs>]
-relay exec [-w <workspace> | -e <executor-id>] [--sync] [-d] <cmd...>  # --sync = git diff sync; -d = detached
-relay ps [-e <executor-id>] [-a]                       # list tasks (TaskSupervisor)
-relay logs [-e <executor-id>] <task-id> [-f] [--tail N] # tail / stream task logs
-relay stop [-e <executor-id>] <task-id>                # terminate task process tree
-relay pf [local:]remote [-e <executor-id>] [start|stop|status] # port-forward (alias: port-forward)
-relay diff [-e <executor-id>] [-w <workspace>]         # inspect drift & conflict warning
-relay undo [-e <executor-id>] [-w <workspace>] [--list|--snapshot <ref>] # restore remote snapshot
+relay run [-w <workspace> | --node <node-id>] [--sync] [-d] <cmd...> # direct run / exec alias
+relay exec [-w <workspace> | --node <node-id>] [--sync] [-d] <cmd...>  # --sync = git diff sync; -d = detached
+relay nodes [--json]                                   # cluster-wide peer nodes & topology state
+relay push [-w <workspace> | --node <node-id>] <file> [--no-jobs] [--dest <abs>]
+relay ps [--node <node-id>] [-a]                       # list tasks (TaskSupervisor)
+relay logs [--node <node-id>] <task-id> [-f] [--tail N] # tail / stream task logs
+relay stop [--node <node-id>] <task-id>                # terminate task process tree
+relay pf [local:]remote [--node <node-id>] [start|stop|status] # port-forward (alias: port-forward)
+relay diff [--node <node-id>] [-w <workspace>]         # inspect drift & conflict warning
+relay undo [--node <node-id>] [-w <workspace>] [--list|--snapshot <ref>] # restore remote snapshot
 relay job run [-w <id>] <jobid> [file]
-relay sync  [-e <executor-id>]
-relay ws [-v] [--name <id>]                   # alias: relay workspaces
-relay status [--json]                         # whole deployment health + versions
-relay version [--json]                        # local build (remote ledger via `status`)
+relay sync  [--node <node-id>]
+relay ws [-v] [--name <id>]                            # alias: relay workspaces
+relay status [--json]                                  # whole deployment health + versions
+relay version [--json]                                 # local build (remote ledger via `status`)
 relay server-remote [--binary <path>] [--expect <ver+commit>]  # one-command transit self-upgrade
 relay tunnel [--listen 127.0.0.1:1080] -w <egress-executor-id>  # SOCKS5 (egress executor_id)
 relay pull [-w <workspace>] <filename> [-dl]    relay list [-w]    relay cleanup [-w <workspace>]
@@ -209,7 +212,8 @@ Pass `-c <config>` (default `~/.relay/config.yaml`) to share one config across e
 ## CONVENTIONS
 
 - **Standard Go layout**: `cmd/` for the binary, `internal/` for packages.
-- **Config is unified**: one shared `config.yaml` per `relay server`, `relay watch`, `relay push`; only the relevant section is read on each side.
+- **Config is unified**: one shared `config.yaml` per `relay server`, `relay watch`, `relay node`, `relay push`; only the relevant section is read on each side.
+- **Peer / Node Architecture**: `node:` block configures node identity (`node_id`), roles (`roles: [hub, agent]`), and access control (`authorized_nodes`). `relay node` daemon manages both roles within one process without port conflict.
 - **Backend registry**: constructor `init()`-based `RegisterBackend("name", NewX)`; `NewBackend(type, cfg)` dispatch, no switch.
 - **Error handling**: `fmt.Fprintf(os.Stderr, ...)` + `os.Exit(1)` in `main`; internal returns errors.
 - **Windows compat**: MSYS-style normalization (`/d/...` → `D:\...`) via `NormalizeWindowsPath`; `relay/backend` has `msysToWindowsPath` for exec dirs.
@@ -228,5 +232,6 @@ Pass `-c <config>` (default `~/.relay/config.yaml`) to share one config across e
 - `processed` map is bounded by `cleanupProcessedMap` (reset is lossy; files may re-trigger after a clear).
 - Config hot-reload is staged (synced then applied on next cycle / next event), never immediate.
 - Watcher in non-relay mode is polling; the relay backend is **event-driven** (no polling).
+- CLI commands automatically leverage adaptive loopback (`getBackendWithAdaptiveLoopback`) to connect directly to loopback when run on a machine acting as hub.
 - Module path is `github.com/user/relay` — update before publishing.
 - Docs: `docs/relay-protocol.md` (wire spec), `docs/relay-positioning.md` (arch rationale / why-not-alternatives), latest plans under `docs/plans/`.
