@@ -149,9 +149,10 @@ type VersionInfo struct {
 	Version    string `json:"version"`
 	Commit     string `json:"commit,omitempty"`
 	BuildTime  string `json:"build_time,omitempty"`
-	GOOS       string `json:"goos"`
-	GOARCH     string `json:"goarch"`
-	Go         string `json:"go"`
+	GOOS       string   `json:"goos"`
+	GOARCH     string   `json:"goarch"`
+	Go         string   `json:"go"`
+	Args       []string `json:"args,omitempty"`
 }
 
 // VersionResponse 中转对 MsgVersion 的应答:本机(transit)构建信息 + 各在线执行方构建信息。

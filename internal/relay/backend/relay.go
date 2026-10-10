@@ -1030,8 +1030,14 @@ func (b *RelayBackend) SubscribeEvents(ctx context.Context) error {
 		return err
 	}
 
-	if err := b.client.Subscribe(ctx, b.executorID); err != nil {
-		return err
+	targetWatch := b.watchDir
+	if targetWatch == "" {
+		targetWatch = b.executorID
+	}
+	if targetWatch != "" {
+		if err := b.client.Subscribe(ctx, targetWatch); err != nil {
+			logx.Debugf("[relay] subscribe %s (non-fatal if purely compute executor): %v", targetWatch, err)
+		}
 	}
 
 	go b.forwardEvents()

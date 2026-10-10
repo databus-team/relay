@@ -735,6 +735,7 @@ func (c *Client) transitVersion() protocol.VersionInfo {
 		GOOS:      runtime.GOOS,
 		GOARCH:    runtime.GOARCH,
 		Go:        runtime.Version(),
+		Args:      os.Args,
 	}
 }
 

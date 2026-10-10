@@ -1453,8 +1453,9 @@ type PeerNodeItem struct {
 	Platform string `json:"platform"`
 	CPU      string `json:"cpu"`
 	Memory   string `json:"memory"`
-	Version  string `json:"version"`
-	Latency  string `json:"latency"`
+	Version  string   `json:"version"`
+	Latency  string   `json:"latency"`
+	Args     []string `json:"args,omitempty"`
 }
 
 // runNodes 查看全网节点拓扑状态与角色 (类似 kubectl get nodes / docker node ls)
@@ -1560,6 +1561,7 @@ func runNodes() {
 		Memory:   transitMem,
 		Version:  ident(st.Transit),
 		Latency:  segmentText(st.Seg1),
+		Args:     st.Transit.Args,
 	})
 
 	// 3. 远端 Agent / Executor 节点
