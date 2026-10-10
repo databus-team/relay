@@ -143,23 +143,24 @@ relay list -w web-app-patches
 
 Lists files in the watch's remote `watch_dir` with size and modification time.
 
-### exec — Forward Command to Remote & Background Task
+### exec / run — Forward Command to Remote & Background Task
+
+`relay run` is an alias for `relay exec`. Commands support both `--node` and `--executor` (or `-e`):
 
 ```bash
 # Direct execution (interactive streaming)
-relay exec -w web-app-patches "npm run build"
-relay exec -e node-1 "go test -v ./..."
+relay run -w web-app-patches "npm run build"
+relay run --node linux-heavy "go test -v ./..."
 
 # Sync local Git workspace changes before executing remote command
-relay exec -w web-app-patches --sync "pytest tests/"
+relay run -w web-app-patches --sync "pytest tests/"
 
 # Detached execution: Run in background (returns Task ID immediately, Docker-like UX)
-relay exec -w web-app-patches -d "npm run dev"
+relay run -w web-app-patches -d "npm run dev"
 # Output: t-a1b2c3d4-1718000000
 ```
 
-Forwards a command to the remote side for execution. Requires a backend that supports `Exec` (local, fs_mcp, relay). The `-w` flag sets the working directory to the watch's `local_dir`. When omitted, `-w` is inferred from the cwd when it can be; otherwise `exec` falls back to its no-workspace behavior. Use `-e/--executor <id>` to address a specific executor by its `executor_id` directly (no workspace).
-
+Forwards a command to the remote side for execution. Requires a backend that supports `Exec` (local, fs_mcp, relay). The `-w` flag sets the working directory to the watch's `local_dir`. When omitted, `-w` is inferred from the cwd when it can be; otherwise `run/exec` falls back to its no-workspace behavior. Use `--node / -e <id>` to address a specific node by its ID directly.
 - `--sync`: Automatically detects uncommitted local Git modifications and untracked files, packs an incremental diff payload, and applies it to the remote workspace before executing the command. Includes base commit drift validation and automatic remote shadow snapshot backup (`refs/relay/backups/*`).
 - `-d, --detach`: Runs the command in the background under the node's **TaskSupervisor**. Process trees are tracked cleanly (no orphaned child processes), stdout/stderr are persisted to `~/.relay/tasks/<task-id>/run.log`, and real-time output is broadcasted to subscribers.
 
