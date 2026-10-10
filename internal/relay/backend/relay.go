@@ -1116,7 +1116,6 @@ func (b *RelayBackend) forwardEvents() {
 func (b *RelayBackend) Close() error {
 	b.supMu.Lock()
 	if b.sup != nil {
-		b.sup.StopAll()
 		activeSupervisorsMu.Lock()
 		delete(activeSupervisors, b.sup)
 		activeSupervisorsMu.Unlock()

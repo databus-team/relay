@@ -73,15 +73,12 @@ func (s *Supervisor) loadExistingTasks() {
 		}
 
 		// 存活状态校准：若记录为 running 但实际系统进程不存在，标记为 exited。
-		// 若记录为 running 且系统进程存活，说明这是旧 agent 重启或异常退出遗留的无主孤儿进程（已断开 I/O 管道）。
-		// 主动终止该孤儿进程树，避免无主进程霸占端口与系统资源。
 		if meta.Status == StatusRunning {
-			if isProcessAlive(meta.PID) {
-				_ = killProcessTree(meta.PID)
+			if !isProcessAlive(meta.PID) {
+				meta.Status = StatusExited
+				now := time.Now()
+				meta.EndTime = &now
 			}
-			meta.Status = StatusStopped
-			now := time.Now()
-			meta.EndTime = &now
 		}
 
 		t := &Task{
