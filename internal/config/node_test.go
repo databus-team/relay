@@ -76,3 +76,35 @@ backend:
 		t.Errorf("expected untrusted-node to be denied")
 	}
 }
+
+func TestGetLocalHubURL(t *testing.T) {
+	// 1. 无 TLS
+	cfg := &Config{
+		Server: &ServerConfig{
+			Addr: "0.0.0.0:8080",
+		},
+	}
+	if got := cfg.GetLocalHubURL(); got != "ws://127.0.0.1:8080/ws" {
+		t.Errorf("GetLocalHubURL() = %q, want %q", got, "ws://127.0.0.1:8080/ws")
+	}
+
+	// 2. 带 TLS
+	cfgTLS := &Config{
+		Server: &ServerConfig{
+			Addr: ":8443",
+			TLS: ServerTLSConfig{
+				Enabled: true,
+			},
+		},
+	}
+	if got := cfgTLS.GetLocalHubURL(); got != "wss://127.0.0.1:8443/ws" {
+		t.Errorf("GetLocalHubURL() = %q, want %q", got, "wss://127.0.0.1:8443/ws")
+	}
+
+	// 3. 未配置 Server
+	cfgNoServer := &Config{}
+	if got := cfgNoServer.GetLocalHubURL(); got != "" {
+		t.Errorf("GetLocalHubURL() = %q, want empty string", got)
+	}
+}
+

@@ -15,7 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/config"
 	relaybackend "github.com/user/relay/internal/relay/backend"
 )
@@ -44,17 +43,17 @@ func runTunnel() {
 		os.Exit(1)
 	}
 
-	// 出口 executor 选择:`-w` 是「执行方注册的节点身份 executor_id」(见 `relay status` 的
+	// 出口 node/executor 选择:`-w` 是「执行方注册的节点身份 executor_id」(见 `relay status` 的
 	// `executors[].executor_id`),不是本地工作区名。因此不走 resolveWorkspaceID 的 cwd 推断、也
 	// 不要求命中 cfg.Workspaces(那是 workspace,与执行方 watch 是两个命名空间)。中转按该
 	// watch 解析已注册 exec 的 executor;无在线执行方 → 建连即失败。
-	w := *tunnelExecName
+	w := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
 	if w == "" {
-		fmt.Fprintf(os.Stderr, "Specify --executor with the egress executor's executor_id (see `relay status --json` -> `executors[].executor_id`).\n")
+		fmt.Fprintf(os.Stderr, "Specify --node or --executor with the egress node's ID (see `relay status --json` -> `executors[].executor_id`).\n")
 		os.Exit(1)
 	}
 
-	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	b, err := getBackendWithAdaptiveLoopback(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
 		os.Exit(1)

@@ -7,13 +7,12 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/config"
 	relaybackend "github.com/user/relay/internal/relay/backend"
 	"github.com/user/relay/internal/sync/git"
 )
 
-func resolveGitTarget(cfg *config.Config, execFlag, watchFlag string) (string, string, string, error) {
+func resolveGitTarget(cfg *config.Config, nodeFlag, execFlag, watchFlag string) (string, string, string, error) {
 	workspaceID := watchFlag
 	if workspaceID == "" {
 		if inferred, err := resolveWorkspaceID(cfg, ""); err == nil {
@@ -21,7 +20,7 @@ func resolveGitTarget(cfg *config.Config, execFlag, watchFlag string) (string, s
 		}
 	}
 
-	targetExec := execFlag
+	targetExec := resolveNodeTarget(nodeFlag, execFlag)
 	localDir := "."
 
 	if workspaceID != "" {
@@ -36,7 +35,7 @@ func resolveGitTarget(cfg *config.Config, execFlag, watchFlag string) (string, s
 	}
 
 	if targetExec == "" {
-		return "", "", "", fmt.Errorf("target executor node required (-e/--executor or bind to a workspace via -w)")
+		return "", "", "", fmt.Errorf("target node required (-e/--node/--executor or bind to a workspace via -w)")
 	}
 
 	return targetExec, workspaceID, localDir, nil
@@ -46,7 +45,7 @@ func getRelayBackend(cfg *config.Config) (*relaybackend.RelayBackend, error) {
 	if cfg.Backend.Type != "relay" {
 		return nil, fmt.Errorf("command requires backend.type=relay, got %q", cfg.Backend.Type)
 	}
-	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	b, err := getBackendWithAdaptiveLoopback(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create backend: %w", err)
 	}
@@ -65,7 +64,7 @@ func runUndo() {
 		os.Exit(1)
 	}
 
-	targetExec, workspaceID, _, err := resolveGitTarget(cfg, *undoExec, *undoWatch)
+	targetExec, workspaceID, _, err := resolveGitTarget(cfg, *undoNode, *undoExec, *undoWatch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -140,7 +139,7 @@ func runDiff() {
 		os.Exit(1)
 	}
 
-	targetExec, workspaceID, localDir, err := resolveGitTarget(cfg, *diffExec, *diffWatch)
+	targetExec, workspaceID, localDir, err := resolveGitTarget(cfg, *diffNode, *diffExec, *diffWatch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)

@@ -11,7 +11,6 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/config"
 	"github.com/user/relay/internal/daemon"
 	relaybackend "github.com/user/relay/internal/relay/backend"
@@ -93,9 +92,10 @@ func parsePortForwardSpec(raw, defaultBind string) (*PortForwardSpec, error) {
 }
 
 // resolveTargetExecutor 解析目标执行方节点标识
-func resolveTargetExecutor(cfg *config.Config, execFlag, watchFlag string) (string, error) {
-	if execFlag != "" {
-		return execFlag, nil
+func resolveTargetExecutor(cfg *config.Config, nodeFlag, execFlag, watchFlag string) (string, error) {
+	target := resolveNodeTarget(nodeFlag, execFlag)
+	if target != "" {
+		return target, nil
 	}
 	w := watchFlag
 	if w == "" {
@@ -109,7 +109,7 @@ func resolveTargetExecutor(cfg *config.Config, execFlag, watchFlag string) (stri
 			return watchCfg.Executor, nil
 		}
 	}
-	return "", fmt.Errorf("specify target executor with -e/--executor or bind to a workspace with -w")
+	return "", fmt.Errorf("specify target node with -e/--node/--executor or bind to a workspace with -w")
 }
 
 // runPortForward 前台运行端口转发
@@ -124,7 +124,7 @@ func runPortForward() {
 		os.Exit(1)
 	}
 
-	targetExec, err := resolveTargetExecutor(cfg, *portForwardExec, *portForwardWatch)
+	targetExec, err := resolveTargetExecutor(cfg, *portForwardNode, *portForwardExec, *portForwardWatch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -141,7 +141,7 @@ func runPortForward() {
 		os.Exit(1)
 	}
 
-	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	b, err := getBackendWithAdaptiveLoopback(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
 		os.Exit(1)
@@ -265,7 +265,7 @@ func daemonStartPortForward() error {
 	if err != nil {
 		return err
 	}
-	targetExec, err := resolveTargetExecutor(cfg, *portForwardExec, *portForwardWatch)
+	targetExec, err := resolveTargetExecutor(cfg, *portForwardNode, *portForwardExec, *portForwardWatch)
 	if err != nil {
 		return err
 	}
@@ -293,7 +293,7 @@ func daemonStopPortForward() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}
-	targetExec, err := resolveTargetExecutor(cfg, *portForwardExec, *portForwardWatch)
+	targetExec, err := resolveTargetExecutor(cfg, *portForwardNode, *portForwardExec, *portForwardWatch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
@@ -308,10 +308,11 @@ func daemonStopPortForward() {
 }
 
 func daemonStatusPortForward() error {
-	if *portForwardPorts != "" && *portForwardExec != "" {
+	targetExec := resolveNodeTarget(*portForwardNode, *portForwardExec)
+	if *portForwardPorts != "" && targetExec != "" {
 		spec, err := parsePortForwardSpec(*portForwardPorts, *portForwardBind)
 		if err == nil {
-			return daemonStatus(pfInstanceName(*portForwardExec, spec.LocalPort))
+			return daemonStatus(pfInstanceName(targetExec, spec.LocalPort))
 		}
 	}
 	insts, err := daemon.ListInstances("pf")

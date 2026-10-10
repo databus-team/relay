@@ -56,8 +56,9 @@ var (
 
 	// Push command - upload files, optionally without running workspace jobs
 	pushCmd    = kingpin.Command("push", "Push file to remote (optionally run/wait workspace jobs)")
-	pushWatch  = pushCmd.Flag("watch", "Target workspace ID (defaults to current directory name); mutually exclusive with --executor").Short('w').String()
+	pushWatch  = pushCmd.Flag("watch", "Target workspace ID (defaults to current directory name); mutually exclusive with --node/--executor").Short('w').String()
 	pushExec   = pushCmd.Flag("executor", "Route directly to this executor (executor_id) without a workspace binding").Short('e').String()
+	pushNode   = pushCmd.Flag("node", "Target node ID (alias for --executor)").String()
 	pushSrc    = pushCmd.Arg("source", "Source file to push").Required().String()
 	pushDest   = pushCmd.Flag("dest", "Destination absolute path on the executor (defaults to <watch_dir>/<filename>; requires --no-jobs)").String()
 	pushNoJobs = pushCmd.Flag("no-jobs", "Transfer only; do not run workspace jobs on the remote").Bool()
@@ -71,8 +72,9 @@ var (
 
 	// Exec command - command forwarding (requires watch running)
 	execCmd         = kingpin.Command("exec", "Forward command to remote executor")
-	execWatch       = execCmd.Flag("watch", "Target workspace ID (defaults to current directory name); mutually exclusive with --executor").Short('w').String()
+	execWatch       = execCmd.Flag("watch", "Target workspace ID (defaults to current directory name); mutually exclusive with --node/--executor").Short('w').String()
 	execExec        = execCmd.Flag("executor", "Route directly to this executor (executor_id) without a workspace binding").Short('e').String()
+	execNode        = execCmd.Flag("node", "Target node ID (alias for --executor)").String()
 	execForceRemote = execCmd.Flag("force-remote", "Force overwrite remote state (creates shadow snapshot on remote first)").Short('f').Bool()
 	execNoSync      = execCmd.Flag("no-sync", "Skip git incremental sync before execution").Bool()
 	execDetach      = execCmd.Flag("detach", "Run command in background as daemon task (returns TaskID)").Short('d').Bool()
@@ -84,6 +86,7 @@ var (
 	psCmd  = kingpin.Command("ps", "List managed background tasks (similar to docker ps)")
 	psAll  = psCmd.Flag("all", "Show all tasks (default shows running only)").Short('a').Bool()
 	psExec = psCmd.Flag("executor", "Filter tasks by executor node").Short('e').String()
+	psNode = psCmd.Flag("node", "Filter tasks by node ID (alias for --executor)").String()
 	psJSON = psCmd.Flag("json", "Output as JSON").Bool()
 
 	// logs command - 查看任务日志
@@ -92,11 +95,13 @@ var (
 	logsFollow = logsCmd.Flag("follow", "Follow log output").Short('f').Bool()
 	logsTail   = logsCmd.Flag("tail", "Number of lines to show from the end").Default("100").Int()
 	logsExec   = logsCmd.Flag("executor", "Target executor node").Short('e').String()
+	logsNode   = logsCmd.Flag("node", "Target node ID (alias for --executor)").String()
 
 	// stop command - 终止后台任务
 	stopCmd    = kingpin.Command("stop", "Stop a running background task (similar to docker stop)")
 	stopTaskID = stopCmd.Arg("task-id", "Task ID to stop").Required().String()
 	stopExec   = stopCmd.Flag("executor", "Target executor node").Short('e').String()
+	stopNode   = stopCmd.Flag("node", "Target node ID (alias for --executor)").String()
 
 	// Status command - 整座部署连通性体检:本地→中转 一段 + 中转→每个执行方 的时延与版本。
 	// 不携带 -w(status 面向整座部署);继承原 `ping` 探活职责并把 `version -r` 台账归一到此。
@@ -110,6 +115,7 @@ var (
 	// Sync command - push config to remote watcher for hot reload
 	syncCmd      = kingpin.Command("sync", "Push config to remote watcher for hot reload")
 	syncExecutor = syncCmd.Flag("executor", "Target executor's executor_id (default = this config's backend executor_id)").Short('e').String()
+	syncNode     = syncCmd.Flag("node", "Target node ID (alias for --executor)").String()
 
 	// Workspaces command - list configured workspaces from config
 	// (alias: `workspaces`; kingpin v2 doesn't render aliases in --help)
@@ -131,6 +137,7 @@ var (
 	tunnelCmd      = kingpin.Command("tunnel", "本地 SOCKS5 出网隧道:经所选 executor 访问其内网白名单")
 	tunnelListen   = tunnelCmd.Flag("listen", "Local SOCKS5 listen address").Default("127.0.0.1:1080").String()
 	tunnelExecName = tunnelCmd.Flag("executor", "Egress executor's executor_id (see `relay status` -> executors[].executor_id)").Short('w').String()
+	tunnelNodeName = tunnelCmd.Flag("node", "Egress node ID (alias for --executor)").String()
 	tunnelAction   = tunnelCmd.Arg("action", "run|start|stop|status|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "restart", "upgrade").String()
 	tunnelUpgradePath = tunnelCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 
@@ -139,12 +146,14 @@ var (
 	portForwardPorts  = portForwardCmd.Arg("port", "[local:]remote port (e.g. 8080:8080 or 8080)").String()
 	portForwardAction = portForwardCmd.Arg("action", "run|start|stop|status|restart (default: run)").HintOptions("run", "start", "stop", "status", "restart").String()
 	portForwardExec   = portForwardCmd.Flag("executor", "Target executor node").Short('e').String()
+	portForwardNode   = portForwardCmd.Flag("node", "Target node ID (alias for --executor)").String()
 	portForwardWatch  = portForwardCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').String()
 	portForwardBind   = portForwardCmd.Flag("bind", "Local IP to bind to").Default("127.0.0.1").String()
 
 	// Undo command - 一键恢复远端工作区影子快照 (防误操作与冲突覆盖)
 	undoCmd      = kingpin.Command("undo", "Restore remote workspace to a shadow snapshot")
 	undoExec     = undoCmd.Flag("executor", "Target executor node").Short('e').String()
+	undoNode     = undoCmd.Flag("node", "Target node ID (alias for --executor)").String()
 	undoWatch    = undoCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').String()
 	undoList     = undoCmd.Flag("list", "List available snapshots on remote node").Short('l').Bool()
 	undoSnapshot = undoCmd.Flag("snapshot", "Specific snapshot ref to restore (default: latest)").String()
@@ -152,6 +161,7 @@ var (
 	// Diff command - 对比本地与远端 Git 状态及冲突预警
 	diffCmd   = kingpin.Command("diff", "Inspect and compare local and remote workspace Git status")
 	diffExec  = diffCmd.Flag("executor", "Target executor node").Short('e').String()
+	diffNode  = diffCmd.Flag("node", "Target node ID (alias for --executor)").String()
 	diffWatch = diffCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').String()
 )
 
@@ -454,13 +464,15 @@ func tunnelInstanceName(executor string) string {
 // 使子进程与前台 `relay tunnel -w <executor> --listen <addr>` 行为一致。
 // 注意 --listen 未定义 `-l` 短旗标,须用长旗标全名。
 func tunnelDaemonArgs() []string {
-	return []string{"tunnel", "run", "-w", *tunnelExecName, "--listen", *tunnelListen, "-c", *configPath}
+	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
+	return []string{"tunnel", "run", "-w", target, "--listen", *tunnelListen, "-c", *configPath}
 }
 
-// tunnelRequireExecutor 校验隧道控制类操作(启动/停止/重启/升级)必须携带 executor。
+// tunnelRequireExecutor 校验隧道控制类操作(启动/停止/重启/升级)必须携带 node/executor。
 func tunnelRequireExecutor() error {
-	if *tunnelExecName == "" {
-		return fmt.Errorf("Specify --executor with the egress executor's executor_id (see `relay status` -> `executors[].executor_id`)")
+	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
+	if target == "" {
+		return fmt.Errorf("Specify --node or --executor with the egress node ID (see `relay status` -> `executors[].executor_id`)")
 	}
 	return nil
 }
@@ -470,7 +482,8 @@ func daemonStartTunnel() error {
 	if err := tunnelRequireExecutor(); err != nil {
 		return err
 	}
-	return daemonStartArgs(tunnelInstanceName(*tunnelExecName), tunnelDaemonArgs())
+	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
+	return daemonStartArgs(tunnelInstanceName(target), tunnelDaemonArgs())
 }
 
 // daemonStopTunnel 停止指定 executor 的隧道实例。
@@ -479,7 +492,8 @@ func daemonStopTunnel() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}
-	daemonStop(tunnelInstanceName(*tunnelExecName))
+	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
+	daemonStop(tunnelInstanceName(target))
 }
 
 // daemonStatusTunnel 带 executor 查单实例;不带则列出全部隧道实例状态。
@@ -511,7 +525,8 @@ func daemonRestartTunnel() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}
-	daemonRestartArgs(tunnelInstanceName(*tunnelExecName), tunnelDaemonArgs())
+	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
+	daemonRestartArgs(tunnelInstanceName(target), tunnelDaemonArgs())
 }
 
 // daemonUpgradeTunnel 升级重启指定 executor 的隧道实例。
@@ -520,7 +535,8 @@ func daemonUpgradeTunnel(newBin string) {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}
-	daemonUpgradeArgs(tunnelInstanceName(*tunnelExecName), newBin, tunnelDaemonArgs())
+	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
+	daemonUpgradeArgs(tunnelInstanceName(target), newBin, tunnelDaemonArgs())
 }
 
 func runWatch() {
@@ -713,6 +729,32 @@ func resolveWatches(cfg *config.Config, name string) ([]config.WorkspaceConfig, 
 	return []config.WorkspaceConfig{*w}, nil
 }
 
+// resolveNodeTarget 统一处理 --node 与 --executor 旗标，优先取非空值
+func resolveNodeTarget(nodeVal, execVal string) string {
+	if nodeVal != "" {
+		return nodeVal
+	}
+	return execVal
+}
+
+// getBackendWithAdaptiveLoopback 根据配置构造后端，若当前节点同时运行 Hub，则自适应走本地回环 URL
+func getBackendWithAdaptiveLoopback(cfg *config.Config) (backend.FileTransferBackend, error) {
+	backendConfig := make(map[string]interface{})
+	for k, v := range cfg.Backend.Config {
+		backendConfig[k] = v
+	}
+
+	// 自适应回环: 若本节点也是 Hub (配置了 server 且可能处于本地监听)，且当前 backend 是 relay
+	if cfg.IsHub() && cfg.Backend.Type == "relay" {
+		localURL := cfg.GetLocalHubURL()
+		if localURL != "" {
+			backendConfig["url"] = localURL
+		}
+	}
+
+	return backend.NewBackend(cfg.Backend.Type, backendConfig)
+}
+
 // resolveWorkspaceID returns the watch ID a command should target. An explicit
 // -w value wins; otherwise the current working directory's basename is matched
 // against the configured watch ids. When the basename matches zero or more than
@@ -855,16 +897,17 @@ func runPush() {
 		os.Exit(1)
 	}
 
-	if *pushExec != "" && *pushWatch != "" {
-		fmt.Fprintln(os.Stderr, "Error: --executor and --watch are mutually exclusive")
+	targetNode := resolveNodeTarget(*pushNode, *pushExec)
+	if targetNode != "" && *pushWatch != "" {
+		fmt.Fprintln(os.Stderr, "Error: --node/--executor and --watch are mutually exclusive")
 		os.Exit(1)
 	}
 
-	// 目标:直接按 executor_id 寻址(不经 workspace),或经 -w/当前目录解析到绑定的 executor。
+	// 目标:直接按 node_id/executor_id 寻址(不经 workspace),或经 -w/当前目录解析到绑定的 executor。
 	var target string
 	var watchDir string
-	if *pushExec != "" {
-		target = *pushExec // 节点直连,无 workspace 视角
+	if targetNode != "" {
+		target = targetNode // 节点直连,无 workspace 视角
 	} else {
 		watchCfg, err := lookupWatch(cfg, *pushWatch)
 		if err != nil {
@@ -875,7 +918,7 @@ func runPush() {
 		target = watchCfg.Executor
 	}
 
-	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	b, err := getBackendWithAdaptiveLoopback(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
 		os.Exit(1)
@@ -1097,17 +1140,18 @@ func runExec() {
 		os.Exit(1)
 	}
 
-	if *execWatch != "" && *execExec != "" {
-		fmt.Fprintln(os.Stderr, "Error: --executor and --watch are mutually exclusive")
+	targetNode := resolveNodeTarget(*execNode, *execExec)
+	if *execWatch != "" && targetNode != "" {
+		fmt.Fprintln(os.Stderr, "Error: --node/--executor and --watch are mutually exclusive")
 		os.Exit(1)
 	}
 
-	// 目标与 cwd:--executor 直接按节点身份寻址(不经 workspace,无本地 cwd 映射);
-	// 否则按 -w/当前目录解析到绑定的 executor。
+	// 目标与 cwd: 若指定了 --node/--executor 则按节点身份寻址;
+	// 否则必须定位到一个有效工作区(通过 -w 或当前工作目录匹配)
 	var execCwd, targetExecutor string
 	w := *execWatch
-	if *execExec != "" {
-		targetExecutor = *execExec
+	if targetNode != "" {
+		targetExecutor = targetNode
 		w = ""
 	} else {
 		if w == "" {
@@ -1115,18 +1159,20 @@ func runExec() {
 				w = inferred
 			}
 		}
-		if w != "" {
-			watchCfg, err := cfg.GetWorkspaceByID(w)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
-				os.Exit(1)
-			}
-			execCwd = watchCfg.LocalDir
-			targetExecutor = watchCfg.Executor // 绑定 executor 时按其 executor_id 路由;空则单根回退
+		if w == "" {
+			fmt.Fprintf(os.Stderr, "Error: remote execution requires a workspace (specify -w or run within a configured workspace directory, or target node directly via -e/--node)\n")
+			os.Exit(1)
 		}
+		watchCfg, err := cfg.GetWorkspaceByID(w)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
+			os.Exit(1)
+		}
+		execCwd = watchCfg.LocalDir
+		targetExecutor = watchCfg.Executor // 绑定 executor 时按其 executor_id 路由;空则单根回退
 	}
 
-	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	b, err := getBackendWithAdaptiveLoopback(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
 		os.Exit(1)
@@ -1250,7 +1296,7 @@ func runPs() {
 		os.Exit(1)
 	}
 
-	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	b, err := getBackendWithAdaptiveLoopback(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
 		os.Exit(1)
@@ -1265,7 +1311,8 @@ func runPs() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	tasks, err := tb.TaskList(ctx, *psExec, *psAll)
+	targetNode := resolveNodeTarget(*psNode, *psExec)
+	tasks, err := tb.TaskList(ctx, targetNode, *psAll)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ps failed: %v\n", err)
 		os.Exit(1)
@@ -1327,7 +1374,7 @@ func runLogs() {
 		os.Exit(1)
 	}
 
-	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	b, err := getBackendWithAdaptiveLoopback(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
 		os.Exit(1)
@@ -1340,7 +1387,8 @@ func runLogs() {
 	}
 
 	ctx := context.Background()
-	err = tb.TaskLogs(ctx, *logsExec, *logsTaskID, *logsFollow, *logsTail, func(chunk backend.ExecChunk) {
+	targetNode := resolveNodeTarget(*logsNode, *logsExec)
+	err = tb.TaskLogs(ctx, targetNode, *logsTaskID, *logsFollow, *logsTail, func(chunk backend.ExecChunk) {
 		if chunk.Stdout {
 			os.Stdout.WriteString(chunk.Data)
 		} else {
@@ -1360,7 +1408,7 @@ func runStop() {
 		os.Exit(1)
 	}
 
-	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	b, err := getBackendWithAdaptiveLoopback(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
 		os.Exit(1)
@@ -1375,7 +1423,8 @@ func runStop() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := tb.TaskStop(ctx, *stopExec, *stopTaskID); err != nil {
+	targetNode := resolveNodeTarget(*stopNode, *stopExec)
+	if err := tb.TaskStop(ctx, targetNode, *stopTaskID); err != nil {
 		fmt.Fprintf(os.Stderr, "stop failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -1796,18 +1845,18 @@ func runSync() {
 	configData = []byte(os.ExpandEnv(string(configData)))
 
 	// Create backend for file exchange
-	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
+	b, err := getBackendWithAdaptiveLoopback(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
 		os.Exit(1)
 	}
 
 	// 通道遵循 backend:支持流式的后端(relay)经 WS 直达执行端落盘,不绕中转文件交换。
-	// --executor 指定目标执行方;空=单根回退到本配置的 backend.executor_id。
+	// --node/--executor 指定目标执行方;空=单根回退到本配置的 backend.executor_id。
 	if cs, ok := b.(backend.ConfigSyncCapable); ok {
-		target := *syncExecutor
+		target := resolveNodeTarget(*syncNode, *syncExecutor)
 		if target != "" {
-			fmt.Printf("Syncing config to executor %q via %s streaming channel...\n", target, cfg.Backend.Type)
+			fmt.Printf("Syncing config to node %q via %s streaming channel...\n", target, cfg.Backend.Type)
 		} else {
 			fmt.Printf("Syncing config via %s streaming channel...\n", cfg.Backend.Type)
 		}

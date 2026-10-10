@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strings"
 )
@@ -102,4 +103,22 @@ func (c *Config) IsControllerAllowed(controllerNodeID string) bool {
 		}
 	}
 	return false
+}
+
+// GetLocalHubURL 获取本地运行的 Hub 回环 WebSocket URL (若配置了 Server 且处于本地运行状态)
+// 例如: "ws://127.0.0.1:8080/ws" 或 "wss://127.0.0.1:8080/ws"
+func (c *Config) GetLocalHubURL() string {
+	if c.Server == nil || c.Server.Addr == "" {
+		return ""
+	}
+	port := c.Server.Addr
+	if strings.Contains(port, ":") {
+		parts := strings.Split(port, ":")
+		port = parts[len(parts)-1]
+	}
+	scheme := "ws"
+	if c.Server.TLS.Enabled {
+		scheme = "wss"
+	}
+	return fmt.Sprintf("%s://127.0.0.1:%s/ws", scheme, port)
 }
