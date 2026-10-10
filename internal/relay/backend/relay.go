@@ -256,6 +256,27 @@ func (b *RelayBackend) Exec(ctx context.Context, cmd string, cwd string, timeout
 	return out.String(), nil
 }
 
+var (
+	activeSupervisorsMu sync.Mutex
+	activeSupervisors   = make(map[*supervisor.Supervisor]struct{})
+)
+
+// Cleanup 停止当前进程管理的所有后台任务（在 agent 退出或重启时调用，避免孤儿进程残留）
+func Cleanup() {
+	activeSupervisorsMu.Lock()
+	sups := make([]*supervisor.Supervisor, 0, len(activeSupervisors))
+	for s := range activeSupervisors {
+		sups = append(sups, s)
+	}
+	activeSupervisorsMu.Unlock()
+
+	for _, s := range sups {
+		s.StopAll()
+	}
+}
+
+
+
 func (b *RelayBackend) getSupervisor() *supervisor.Supervisor {
 	b.supMu.Lock()
 	defer b.supMu.Unlock()
@@ -266,6 +287,9 @@ func (b *RelayBackend) getSupervisor() *supervisor.Supervisor {
 			return nil
 		}
 		b.sup = s
+		activeSupervisorsMu.Lock()
+		activeSupervisors[s] = struct{}{}
+		activeSupervisorsMu.Unlock()
 	}
 	return b.sup
 }
@@ -283,6 +307,11 @@ func (b *RelayBackend) ExecStreamWithGitSync(ctx context.Context, targetExecutor
 
 // ExecStreamWithOptions 携带完整选项(包括 detach)的流式执行。
 func (b *RelayBackend) ExecStreamWithOptions(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, syncPayload *backend.GitSyncPayload, detach bool, onChunk func(backend.ExecChunk)) (int, error) {
+	return b.ExecStreamWithPorts(ctx, targetExecutor, cmd, cwd, timeout, syncPayload, detach, nil, onChunk)
+}
+
+// ExecStreamWithPorts 携带完整选项(包括 detach 和 ports 端口列表)的流式执行。
+func (b *RelayBackend) ExecStreamWithPorts(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, syncPayload *backend.GitSyncPayload, detach bool, ports []string, onChunk func(backend.ExecChunk)) (int, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return 0, err
 	}
@@ -307,6 +336,7 @@ func (b *RelayBackend) ExecStreamWithOptions(ctx context.Context, targetExecutor
 		Timeout:        timeout,
 		GitSync:        protoSync,
 		Detach:         detach,
+		Ports:          ports,
 	}
 
 	resp, err := b.client.ExecStreamWithOptions(ctx, opts, func(chunk protocol.ExecChunk) {
@@ -381,6 +411,14 @@ func (b *RelayBackend) TunnelOpen(ctx context.Context, executorID, target string
 	return b.client.TunnelOpen(ctx, executorID, target, port)
 }
 
+// TunnelOpenPortForward 打开一条到远端 executor 的开发用临时端口转发隧道(跳过 network_allow 白名单)。
+func (b *RelayBackend) TunnelOpenPortForward(ctx context.Context, executorID, target string, port uint16) (*client.TunnelStream, error) {
+	if err := b.ensureConnected(ctx); err != nil {
+		return nil, err
+	}
+	return b.client.TunnelOpenPortForward(ctx, executorID, target, port)
+}
+
 // ConfigSync 请求方把新配置经中转流式直达执行方落盘(WS 流式通道,不写 command 文件)。
 // ConfigSync 经中转把配置流式直达指定执行方落盘(targetExecutor 为其节点身份 executor_id;空=单根回退)。
 func (b *RelayBackend) ConfigSync(ctx context.Context, targetExecutor string, payload []byte) (int, error) {
@@ -448,19 +486,28 @@ func (b *RelayBackend) handleInboundConfigSync(sess *client.ConfigSyncSession) {
 // tunnelDialTimeout 是 executor 向目标发真实 TCP 拨号的上限,防止黑洞目标导致建连确认无界等待。
 const tunnelDialTimeout = 10 * time.Second
 
-// handleInboundTunnelConnect 执行方收到中转转发来的隧道建连:校验 network_allow 白名单,
-// 命中则向**已校验的 IP 字面量**发起真实 TCP(dial 用 IP 而非原始 hostname,防 DNS 重绑 TOCTOU),
-// 连成回执 OK 并交回给 session 泵双向字节流;未命中/dial 失败一律 Reject、不建任何内网连接(默认拒绝)。
-// 空/缺省 network_allow → CheckTunnelTarget 恒不命中,全部拒绝(fail-closed,AE6)。
+// handleInboundTunnelConnect 执行方收到中转转发来的隧道建连:
+// - 若是开发临时端口转发 (PortForward)，免除 network_allow 白名单管控直接放行；
+// - 若是常规 SOCKS5 代理隧道出网，校验 network_allow 白名单 (fail-closed)。
 func (b *RelayBackend) handleInboundTunnelConnect(sess *client.TunnelSession) {
-	ip, ok := config.CheckTunnelTarget(b.tunnelAllow, sess.Target(), int(sess.Port()))
-	if !ok {
-		log.Printf("[tunnel] deny target %s:%d (watch=%s) not in network_allow", sess.Target(), sess.Port(), sess.ExecutorID())
-		sess.Reject(fmt.Sprintf("target %s:%d not allowed by network_allow", sess.Target(), sess.Port()))
-		return
+	var addr string
+	if sess.PortForward() {
+		// 开发用临时端口映射: 直接放行，不走 network_allow 白名单
+		target := sess.Target()
+		if target == "" || target == "0.0.0.0" {
+			target = "127.0.0.1"
+		}
+		addr = net.JoinHostPort(target, strconv.Itoa(int(sess.Port())))
+	} else {
+		ip, ok := config.CheckTunnelTarget(b.tunnelAllow, sess.Target(), int(sess.Port()))
+		if !ok {
+			log.Printf("[tunnel] deny target %s:%d (watch=%s) not in network_allow", sess.Target(), sess.Port(), sess.ExecutorID())
+			sess.Reject(fmt.Sprintf("target %s:%d not allowed by network_allow", sess.Target(), sess.Port()))
+			return
+		}
+		addr = net.JoinHostPort(ip.String(), strconv.Itoa(int(sess.Port())))
 	}
 
-	addr := net.JoinHostPort(ip.String(), strconv.Itoa(int(sess.Port())))
 	// 用有界超时拨号:黑洞/不可达目标在限定时间内报错,避免请求方无界等待建连确认。
 	conn, err := net.DialTimeout("tcp", addr, tunnelDialTimeout)
 	if err != nil {
@@ -468,7 +515,11 @@ func (b *RelayBackend) handleInboundTunnelConnect(sess *client.TunnelSession) {
 		sess.Reject("dial " + addr + ": " + err.Error())
 		return
 	}
-	log.Printf("[tunnel] conn %s:%d via %s (watch=%s)", sess.Target(), sess.Port(), addr, sess.ExecutorID())
+	if sess.PortForward() {
+		log.Printf("[port-forward] conn %s:%d via %s (watch=%s)", sess.Target(), sess.Port(), addr, sess.ExecutorID())
+	} else {
+		log.Printf("[tunnel] conn %s:%d via %s (watch=%s)", sess.Target(), sess.Port(), addr, sess.ExecutorID())
+	}
 	sess.Accept(conn)
 }
 
@@ -679,14 +730,14 @@ func (b *RelayBackend) handleInboundExec(sess *client.ExecSession) {
 			_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: "supervisor not available"})
 			return
 		}
-		task, err := sup.StartTask(sess.Cmd(), targetDir, nil)
+		task, err := sup.StartTaskWithPorts(sess.Cmd(), targetDir, sess.Ports(), nil)
 		if err != nil {
 			log.Printf("[exec -d] start task failed: %v", err)
 			_ = sess.Write(false, fmt.Sprintf("start background task failed: %v\n", err))
 			_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: err.Error()})
 			return
 		}
-		log.Printf("[exec -d] task started: id=%s pid=%d (watch=%s)", task.Meta().ID, task.Meta().PID, sess.ExecutorID())
+		log.Printf("[exec -d] task started: id=%s pid=%d (watch=%s, ports=%v)", task.Meta().ID, task.Meta().PID, sess.ExecutorID(), task.Meta().Ports)
 		_ = sess.Write(true, fmt.Sprintf("%s\n", task.Meta().ID))
 		_ = sess.Done(protocol.ExecResponse{
 			ExitCode: 0,
@@ -722,6 +773,7 @@ func (b *RelayBackend) handleInboundTaskList(sess *client.TaskListSession) {
 			Cmd:       t.Cmd,
 			Cwd:       t.Cwd,
 			PID:       t.PID,
+			Ports:     t.Ports,
 			Status:    string(t.Status),
 			ExitCode:  t.ExitCode,
 			StartTime: t.StartTime.Unix(),
@@ -824,6 +876,7 @@ func (b *RelayBackend) TaskList(ctx context.Context, targetExecutor string, all 
 			Cmd:       t.Cmd,
 			Cwd:       t.Cwd,
 			PID:       t.PID,
+			Ports:     t.Ports,
 			Status:    t.Status,
 			ExitCode:  t.ExitCode,
 			StartTime: t.StartTime,
@@ -1061,7 +1114,19 @@ func (b *RelayBackend) forwardEvents() {
 }
 
 func (b *RelayBackend) Close() error {
-	return b.client.Disconnect()
+	b.supMu.Lock()
+	if b.sup != nil {
+		b.sup.StopAll()
+		activeSupervisorsMu.Lock()
+		delete(activeSupervisors, b.sup)
+		activeSupervisorsMu.Unlock()
+		b.sup = nil
+	}
+	b.supMu.Unlock()
+	if b.client != nil {
+		return b.client.Disconnect()
+	}
+	return nil
 }
 
 func formatModTime(unixMs int64) string {

@@ -58,6 +58,7 @@ type GitSyncPayload struct {
 type GitSyncExecBackend interface {
 	ExecStreamWithGitSync(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, onChunk func(ExecChunk)) (int, error)
 	ExecStreamWithOptions(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, detach bool, onChunk func(ExecChunk)) (int, error)
+	ExecStreamWithPorts(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, detach bool, ports []string, onChunk func(ExecChunk)) (int, error)
 }
 
 // TaskInfo 跨机任务简报
@@ -67,6 +68,7 @@ type TaskInfo struct {
 	Cmd       string
 	Cwd       string
 	PID       int
+	Ports     []string
 	Status    string
 	ExitCode  int
 	StartTime int64

@@ -100,7 +100,7 @@ var globalFlags = []string{
 
 var commandSpecs = map[string]cmdSpec{
 	"run": {
-		flags: []string{"-w", "--watch", "-e", "--executor", "--node", "-f", "--force-remote", "--no-sync", "-d", "--detach"},
+		flags: []string{"-w", "--watch", "-e", "--executor", "--node", "-f", "--force-remote", "--no-sync", "-d", "--detach", "-p", "--publish", "--bind-host"},
 	},
 	"nodes": {
 		flags: []string{"--json", "-u", "--usage"},

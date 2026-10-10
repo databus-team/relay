@@ -24,6 +24,17 @@ type PortForwardSpec struct {
 	RemotePort int
 }
 
+// String 返回规格的标准字符串表示，例如 "8080"、"8080:9000" 或 "8080:db.local:5432"
+func (s *PortForwardSpec) String() string {
+	if s.RemoteHost != "" && s.RemoteHost != "127.0.0.1" && s.RemoteHost != "localhost" {
+		return fmt.Sprintf("%d:%s:%d", s.LocalPort, s.RemoteHost, s.RemotePort)
+	}
+	if s.LocalPort == s.RemotePort {
+		return strconv.Itoa(s.LocalPort)
+	}
+	return fmt.Sprintf("%d:%d", s.LocalPort, s.RemotePort)
+}
+
 // parsePortForwardSpec 解析形如 "8080", "8080:8080", "0.0.0.0:8080:8080", "8080:db.local:5432" 的规格
 func parsePortForwardSpec(raw, defaultBind string) (*PortForwardSpec, error) {
 	if defaultBind == "" {
@@ -189,7 +200,7 @@ func runPortForward() {
 func handlePortForwardConn(ctx context.Context, rb *relaybackend.RelayBackend, targetExec string, spec *PortForwardSpec, conn net.Conn) {
 	defer conn.Close()
 
-	stream, err := rb.TunnelOpen(ctx, targetExec, spec.RemoteHost, uint16(spec.RemotePort))
+	stream, err := rb.TunnelOpenPortForward(ctx, targetExec, spec.RemoteHost, uint16(spec.RemotePort))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[port-forward error] connect to %s:%d via %s failed: %v\n", spec.RemoteHost, spec.RemotePort, targetExec, err)
 		return
@@ -381,6 +392,65 @@ func daemonStatusPortForward() error {
 			pidStr = strconv.Itoa(inst.Status.Pid)
 		}
 		fmt.Printf("%-24s %-10s %-8s %s\n", inst.Name, st, pidStr, inst.LogFile)
+	}
+	return nil
+}
+
+// StartPortForwardsForeground 在前台启动端口转发监听，随 context 取消或 stop 回调关闭
+func StartPortForwardsForeground(ctx context.Context, rb *relaybackend.RelayBackend, targetExec string, specs []*PortForwardSpec) (func(), error) {
+	var listeners []net.Listener
+	cleanup := func() {
+		for _, ln := range listeners {
+			_ = ln.Close()
+		}
+	}
+
+	for _, spec := range specs {
+		listenAddr := fmt.Sprintf("%s:%d", spec.BindHost, spec.LocalPort)
+		ln, err := net.Listen("tcp", listenAddr)
+		if err != nil {
+			cleanup()
+			return nil, fmt.Errorf("listen %s failed: %w", listenAddr, err)
+		}
+		listeners = append(listeners, ln)
+
+		if !isLoopbackAddr(spec.BindHost) {
+			fmt.Fprintf(os.Stderr, "WARNING: listening on %q (non-loopback). This port has no auth.\n", listenAddr)
+		}
+		fmt.Printf("➜ [port-forward] %s -> %s:%d via %s\n", listenAddr, spec.RemoteHost, spec.RemotePort, targetExec)
+
+		go func(l net.Listener, s *PortForwardSpec) {
+			go func() {
+				<-ctx.Done()
+				_ = l.Close()
+			}()
+			for {
+				conn, err := l.Accept()
+				if err != nil {
+					return
+				}
+				go handlePortForwardConn(ctx, rb, targetExec, s, conn)
+			}
+		}(ln, spec)
+	}
+
+	return cleanup, nil
+}
+
+// StartPortForwardsBackground 为 specs 批量启动后台守护端口转发
+func StartPortForwardsBackground(targetExec string, specs []*PortForwardSpec, cfgPath string) error {
+	for _, spec := range specs {
+		ports := spec.String()
+		instance := pfInstanceName(targetExec, spec.LocalPort)
+		args := []string{
+			"port-forward", "run", ports,
+			"-e", targetExec,
+			"--bind", spec.BindHost,
+			"-c", cfgPath,
+		}
+		if err := daemonStartArgs(instance, args); err != nil {
+			return fmt.Errorf("start background port-forward %s: %w", ports, err)
+		}
 	}
 	return nil
 }

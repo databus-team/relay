@@ -106,3 +106,21 @@ func TestPfInstanceName(t *testing.T) {
 		}
 	}
 }
+
+func TestPortForwardSpec_String(t *testing.T) {
+	cases := []struct {
+		spec *PortForwardSpec
+		want string
+	}{
+		{&PortForwardSpec{LocalPort: 8080, RemotePort: 8080}, "8080"},
+		{&PortForwardSpec{LocalPort: 8080, RemotePort: 9000}, "8080:9000"},
+		{&PortForwardSpec{LocalPort: 8080, RemoteHost: "127.0.0.1", RemotePort: 9000}, "8080:9000"},
+		{&PortForwardSpec{LocalPort: 8080, RemoteHost: "db.local", RemotePort: 5432}, "8080:db.local:5432"},
+	}
+	for _, c := range cases {
+		got := c.spec.String()
+		if got != c.want {
+			t.Errorf("spec.String() = %q, want %q", got, c.want)
+		}
+	}
+}

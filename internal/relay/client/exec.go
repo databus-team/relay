@@ -82,6 +82,7 @@ type ExecOptions struct {
 	Timeout        int
 	GitSync        *protocol.GitSyncPayload
 	Detach         bool
+	Ports          []string
 }
 
 // ExecStream 发送命令请求并流式接收输出。onChunk 每次收到增量输出帧时回调(nil 可忽略)。
@@ -124,6 +125,7 @@ func (c *Client) ExecStreamWithOptions(ctx context.Context, opts ExecOptions, on
 			Timeout:    opts.Timeout,
 			GitSync:    opts.GitSync,
 			Detach:     opts.Detach,
+			Ports:      opts.Ports,
 		},
 	}
 
@@ -521,6 +523,7 @@ func (e *ExecSession) Timeout() int                     { return e.req.Timeout }
 func (e *ExecSession) ExecutorID() string               { return e.req.ExecutorID }
 func (e *ExecSession) GitSync() *protocol.GitSyncPayload { return e.req.GitSync }
 func (e *ExecSession) Detach() bool                     { return e.req.Detach }
+func (e *ExecSession) Ports() []string                  { return e.req.Ports }
 
 // SetExecHandler 设置入站 exec 处理回调。设置后,该客户端成为可被中转转发 exec 的执行方。
 func (c *Client) SetExecHandler(fn func(*ExecSession)) {

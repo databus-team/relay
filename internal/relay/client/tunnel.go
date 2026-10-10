@@ -137,18 +137,20 @@ func (c *Client) SetTunnelHandler(fn func(*TunnelSession)) {
 
 // TunnelSession 一次入站隧道建连(executor 视角):目标 + 出口 executor_id + 已建连通道。
 type TunnelSession struct {
-	client     *Client
-	requestID  string
-	streamID   string
-	executorID string
-	target     string
-	port       uint16
+	client      *Client
+	requestID   string
+	streamID    string
+	executorID  string
+	target      string
+	port        uint16
+	portForward bool
 }
 
-func (s *TunnelSession) StreamID() string   { return s.streamID }
-func (s *TunnelSession) ExecutorID() string { return s.executorID }
-func (s *TunnelSession) Target() string     { return s.target }
-func (s *TunnelSession) Port() uint16       { return s.port }
+func (s *TunnelSession) StreamID() string    { return s.streamID }
+func (s *TunnelSession) ExecutorID() string  { return s.executorID }
+func (s *TunnelSession) Target() string      { return s.target }
+func (s *TunnelSession) Port() uint16        { return s.port }
+func (s *TunnelSession) PortForward() bool   { return s.portForward }
 
 // Accept 建连成功:登记真实连接、回执成功 ACK,并启动「连接 → MsgTunnelData」泵。
 // 反向(MsgTunnelData → 连接)由 handleInboundTunnelData 处理。EOF/错误 → MsgTunnelEnd + 清理。
@@ -229,12 +231,13 @@ func (c *Client) handleInboundTunnelConnect(msg protocol.Message) {
 		return
 	}
 	sess := &TunnelSession{
-		client:     c,
-		requestID:  msg.ID,
-		streamID:   req.StreamID,
-		executorID: req.ExecutorID,
-		target:     req.Target,
-		port:       req.Port,
+		client:      c,
+		requestID:   msg.ID,
+		streamID:    req.StreamID,
+		executorID:  req.ExecutorID,
+		target:      req.Target,
+		port:        req.Port,
+		portForward: req.PortForward,
 	}
 	go h(sess)
 }
@@ -315,11 +318,16 @@ type TunnelStream struct {
 }
 
 // TunnelOpen 打开一条离站的 SOCKS5 隧道(requester 视角):发 MsgTunnelConnect 并等待建连确认。
-// 成功返回 *TunnelStream;失败(执行方不可达/白名单拒/无在线执行方/超时)返回错误,并把该 stream
-// 的中转注册表条目拆除(发 MsgTunnelEnd),避免被拒/超时建连泄漏中转槽位(耗尽 maxTunnels)。
-// 「并发隧道打满」属可恢复的瞬时缺槽,在此做指数退避重试(共用 tunnelConnectTimeout 预算);
-// 其余建连错误直接失败,不重复尝试。
 func (c *Client) TunnelOpen(ctx context.Context, executorID, target string, port uint16) (*TunnelStream, error) {
+	return c.tunnelOpen(ctx, executorID, target, port, false)
+}
+
+// TunnelOpenPortForward 打开一条离站的开发用端口转发隧道(跳过远端 network_allow 白名单)。
+func (c *Client) TunnelOpenPortForward(ctx context.Context, executorID, target string, port uint16) (*TunnelStream, error) {
+	return c.tunnelOpen(ctx, executorID, target, port, true)
+}
+
+func (c *Client) tunnelOpen(ctx context.Context, executorID, target string, port uint16, portForward bool) (*TunnelStream, error) {
 	// 建连确认只在总预算内有效;超时视为失败并拆除该 stream(复用 sendAndWait 的 pending/send
 	// 语义,但就建连这一等待单独加上限,防止对黑洞目标无界挂起)。
 	waitCtx, cancel := context.WithTimeout(ctx, tunnelConnectTimeout)
@@ -348,10 +356,11 @@ func (c *Client) TunnelOpen(ctx context.Context, executorID, target string, port
 			ID:       id,
 			StreamID: id,
 			Payload: protocol.TunnelConnectRequest{
-				ExecutorID: executorID,
-				Target:     target,
-				Port:       port,
-				StreamID:   id,
+				ExecutorID:  executorID,
+				Target:      target,
+				Port:        port,
+				StreamID:    id,
+				PortForward: portForward,
 			},
 		}
 

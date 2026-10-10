@@ -72,13 +72,16 @@ func (s *Supervisor) loadExistingTasks() {
 			continue
 		}
 
-		// 存活状态校准：若记录为 running 但实际系统进程不存在，标记为 exited
+		// 存活状态校准：若记录为 running 但实际系统进程不存在，标记为 exited。
+		// 若记录为 running 且系统进程存活，说明这是旧 agent 重启或异常退出遗留的无主孤儿进程（已断开 I/O 管道）。
+		// 主动终止该孤儿进程树，避免无主进程霸占端口与系统资源。
 		if meta.Status == StatusRunning {
-			if !isProcessAlive(meta.PID) {
-				meta.Status = StatusExited
-				now := time.Now()
-				meta.EndTime = &now
+			if isProcessAlive(meta.PID) {
+				_ = killProcessTree(meta.PID)
 			}
+			meta.Status = StatusStopped
+			now := time.Now()
+			meta.EndTime = &now
 		}
 
 		t := &Task{
@@ -93,6 +96,28 @@ func (s *Supervisor) loadExistingTasks() {
 		s.tasks[meta.ID] = t
 		_ = t.persist()
 	}
+}
+
+// StopAll 优雅终止所有正在运行的后台任务（并发执行，缩短停机等待时间）
+func (s *Supervisor) StopAll() {
+	s.mu.RLock()
+	var running []*Task
+	for _, t := range s.tasks {
+		if t.Meta().Status == StatusRunning {
+			running = append(running, t)
+		}
+	}
+	s.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	for _, t := range running {
+		wg.Add(1)
+		go func(task *Task) {
+			defer wg.Done()
+			_ = task.Stop()
+		}(t)
+	}
+	wg.Wait()
 }
 
 func generateTaskID() string {
@@ -127,6 +152,11 @@ func resolveShell() (string, []string) {
 
 // StartTask 启动一个后台守护任务
 func (s *Supervisor) StartTask(cmdStr, cwd string, env []string) (*Task, error) {
+	return s.StartTaskWithPorts(cmdStr, cwd, nil, env)
+}
+
+// StartTaskWithPorts 启动一个携带端口映射信息的后台守护任务
+func (s *Supervisor) StartTaskWithPorts(cmdStr, cwd string, ports []string, env []string) (*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -136,7 +166,7 @@ func (s *Supervisor) StartTask(cmdStr, cwd string, env []string) (*Task, error) 
 		return nil, fmt.Errorf("create task dir: %w", err)
 	}
 
-	task := newTask(id, cmdStr, cwd, taskDir)
+	task := newTaskWithPorts(id, cmdStr, cwd, ports, taskDir)
 
 	logFile, err := os.OpenFile(task.meta.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {

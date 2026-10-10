@@ -27,6 +27,7 @@ type TaskMeta struct {
 	Cmd       string     `json:"cmd"`
 	Cwd       string     `json:"cwd"`
 	PID       int        `json:"pid"`
+	Ports     []string   `json:"ports,omitempty"`
 	Status    TaskStatus `json:"status"`
 	ExitCode  int        `json:"exit_code"`
 	StartTime time.Time  `json:"start_time"`
@@ -46,11 +47,16 @@ type Task struct {
 }
 
 func newTask(id, cmdStr, cwd string, dir string) *Task {
+	return newTaskWithPorts(id, cmdStr, cwd, nil, dir)
+}
+
+func newTaskWithPorts(id, cmdStr, cwd string, ports []string, dir string) *Task {
 	return &Task{
 		meta: TaskMeta{
 			ID:        id,
 			Cmd:       cmdStr,
 			Cwd:       cwd,
+			Ports:     ports,
 			Status:    StatusRunning,
 			StartTime: time.Now(),
 			LogPath:   filepath.Join(dir, "run.log"),

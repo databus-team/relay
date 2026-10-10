@@ -145,3 +145,73 @@ func TestSupervisor_PersistenceAndRecovery(t *testing.T) {
 		t.Errorf("expected recovered status %s, got %s", StatusExited, recovered.Meta().Status)
 	}
 }
+
+func TestSupervisor_StopAll(t *testing.T) {
+	dir := t.TempDir()
+	sup, err := New(dir)
+	if err != nil {
+		t.Fatalf("new supervisor: %v", err)
+	}
+
+	task1, err := sup.StartTask("sleep 10", "", nil)
+	if err != nil {
+		t.Fatalf("start task 1: %v", err)
+	}
+	task2, err := sup.StartTask("sleep 10", "", nil)
+	if err != nil {
+		t.Fatalf("start task 2: %v", err)
+	}
+
+	sup.StopAll()
+
+	time.Sleep(200 * time.Millisecond)
+
+	for _, task := range []*Task{task1, task2} {
+		meta := task.Meta()
+		if meta.Status != StatusStopped {
+			t.Errorf("task %s expected stopped, got %s", meta.ID, meta.Status)
+		}
+		if isProcessAlive(meta.PID) {
+			t.Errorf("process %d should be terminated", meta.PID)
+		}
+	}
+}
+
+func TestSupervisor_OrphanCleanupOnRestart(t *testing.T) {
+	dir := t.TempDir()
+	sup1, err := New(dir)
+	if err != nil {
+		t.Fatalf("new supervisor: %v", err)
+	}
+
+	// 启动一个长运行任务
+	task, err := sup1.StartTask("sleep 15", "", nil)
+	if err != nil {
+		t.Fatalf("start task: %v", err)
+	}
+
+	pid := task.Meta().PID
+	if !isProcessAlive(pid) {
+		t.Fatalf("process %d should be alive", pid)
+	}
+
+	// 模拟 agent 重启：不调用 task.Stop()，直接启动新的 Supervisor 实例
+	sup2, err := New(dir)
+	if err != nil {
+		t.Fatalf("new supervisor 2: %v", err)
+	}
+
+	// 新 Supervisor 应该检测到并终止孤儿进程
+	time.Sleep(200 * time.Millisecond)
+	if isProcessAlive(pid) {
+		t.Errorf("orphan process %d should have been terminated on supervisor restart", pid)
+	}
+
+	recovered, err := sup2.GetTask(task.Meta().ID)
+	if err != nil {
+		t.Fatalf("get recovered task: %v", err)
+	}
+	if recovered.Meta().Status != StatusStopped {
+		t.Errorf("expected status %s for orphan task, got %s", StatusStopped, recovered.Meta().Status)
+	}
+}

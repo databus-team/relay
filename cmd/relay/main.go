@@ -83,6 +83,8 @@ var (
 	execForceRemote = execCmd.Flag("force-remote", "Force overwrite remote state (creates shadow snapshot on remote first)").Short('f').Bool()
 	execNoSync      = execCmd.Flag("no-sync", "Skip git incremental sync before execution").Bool()
 	execDetach      = execCmd.Flag("detach", "Run command in background as daemon task (returns TaskID)").Short('d').Bool()
+	execPublish     = execCmd.Flag("publish", "Publish remote port to local (e.g. -p 8080 or -p 8080:8080, similar to docker run -p)").Short('p').Strings()
+	execBindHost    = execCmd.Flag("bind-host", "Local bind host for published ports (default: 127.0.0.1)").Default("127.0.0.1").String()
 	// 支持多词命令:relay run git status 会收成 ["git","status"] 再空格 join。
 	// 含以 - 开头参数的命令(如 git log --oneline)仍须整体加引号,避免被当 flag。
 	execCmdStr = execCmd.Arg("command", "Command to execute (multiple words are joined)").Required().Strings()
@@ -632,6 +634,7 @@ func runWatch() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	defer relaybackend.Cleanup()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -1258,7 +1261,48 @@ func runExec() {
 		os.Exit(1)
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		cancel()
+	}()
+
+	// 端口转发准备 (-p / --publish)
+	var pfSpecs []*PortForwardSpec
+	if len(*execPublish) > 0 {
+		for _, p := range *execPublish {
+			spec, err := parsePortForwardSpec(p, *execBindHost)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: invalid port-forward spec %q: %v\n", p, err)
+				os.Exit(1)
+			}
+			pfSpecs = append(pfSpecs, spec)
+		}
+	}
+
+	if len(pfSpecs) > 0 {
+		if *execDetach {
+			if err := StartPortForwardsBackground(targetExecutor, pfSpecs, *configPath); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to start background port-forward: %v\n", err)
+			}
+		} else {
+			rb, ok := b.(*relaybackend.RelayBackend)
+			if !ok {
+				fmt.Fprintf(os.Stderr, "Error: port-forward requires relay backend\n")
+				os.Exit(1)
+			}
+			stopPF, err := StartPortForwardsForeground(ctx, rb, targetExecutor, pfSpecs)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Port-forward error: %v\n", err)
+				os.Exit(1)
+			}
+			defer stopPF()
+		}
+	}
 
 	// Get command directory, default to /tmp/relay-commands
 	commandDir := "/tmp/relay-commands"
@@ -1319,7 +1363,11 @@ func runExec() {
 
 	// 支持 Git 增量同步与后台托管的流式后端(relay)逐帧实时转发输出,并以 exit code 收尾
 	if eb, ok := b.(backend.GitSyncExecBackend); ok {
-		exit, err := eb.ExecStreamWithOptions(ctx, targetExecutor, cmd, execCwd, 0, gitSyncPayload, *execDetach, func(chunk backend.ExecChunk) {
+		var portStrs []string
+		for _, spec := range pfSpecs {
+			portStrs = append(portStrs, spec.String())
+		}
+		exit, err := eb.ExecStreamWithPorts(ctx, targetExecutor, cmd, execCwd, 0, gitSyncPayload, *execDetach, portStrs, func(chunk backend.ExecChunk) {
 			if chunk.Stdout {
 				os.Stdout.WriteString(chunk.Data)
 			} else {
@@ -1409,7 +1457,7 @@ func runPs() {
 		return
 	}
 
-	fmt.Printf("%-12s %-16s %-10s %-6s %-16s %s\n", "TASK ID", "NODE", "STATUS", "EXIT", "CREATED", "COMMAND")
+	fmt.Printf("%-12s %-16s %-10s %-16s %-6s %-16s %s\n", "TASK ID", "NODE", "STATUS", "PORTS", "EXIT", "CREATED", "COMMAND")
 	for _, t := range tasks {
 		createdStr := formatRelativeTime(time.Unix(t.StartTime, 0))
 		exitStr := "-"
@@ -1417,14 +1465,21 @@ func runPs() {
 			exitStr = fmt.Sprintf("%d", t.ExitCode)
 		}
 		cmdDisp := t.Cmd
-		if len(cmdDisp) > 40 {
-			cmdDisp = cmdDisp[:37] + "..."
+		if len(cmdDisp) > 35 {
+			cmdDisp = cmdDisp[:32] + "..."
 		}
 		nodeDisp := t.Node
 		if nodeDisp == "" {
 			nodeDisp = "(unknown)"
 		}
-		fmt.Printf("%-12s %-16s %-10s %-6s %-16s %s\n", t.ID, nodeDisp, t.Status, exitStr, createdStr, cmdDisp)
+		portsDisp := "-"
+		if len(t.Ports) > 0 {
+			portsDisp = strings.Join(t.Ports, ",")
+			if len(portsDisp) > 16 {
+				portsDisp = portsDisp[:13] + "..."
+			}
+		}
+		fmt.Printf("%-12s %-16s %-10s %-16s %-6s %-16s %s\n", t.ID, nodeDisp, t.Status, portsDisp, exitStr, createdStr, cmdDisp)
 	}
 }
 

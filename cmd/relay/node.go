@@ -59,6 +59,7 @@ func runNode() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	defer relaybackend.Cleanup()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)

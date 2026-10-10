@@ -35,9 +35,9 @@ func alive(pid int) bool {
 	return strings.Contains(string(out), ",\""+strconv.Itoa(pid)+"\",")
 }
 
-// kill 用 taskkill 强杀。
+// kill 用 taskkill 递归强杀进程树。
 func kill(pid int) {
-	cmd := exec.Command("taskkill", "/PID", strconv.Itoa(pid), "/F")
+	cmd := exec.Command("taskkill", "/PID", strconv.Itoa(pid), "/T", "/F")
 	detach(cmd) // 同上,避免无控制台上下文弹窗
 	_ = cmd.Run()
 }

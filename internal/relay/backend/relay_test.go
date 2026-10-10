@@ -758,10 +758,10 @@ func TestEndToEnd_TaskSupervisor(t *testing.T) {
 		t.Fatalf("requester does not implement GitSyncExecBackend")
 	}
 
-	// 3. 后台脱机执行任务 (detach = true)
+	// 3. 后台脱机执行任务 (detach = true, 带 ports)
 	var taskIDOut strings.Builder
 	start := time.Now()
-	exit, err := gb.ExecStreamWithOptions(ctx, "node-1", "printf 'task_step_1\n'; sleep 0.3; printf 'task_step_2\n'; sleep 5", "", 10, nil, true, func(c bk.ExecChunk) {
+	exit, err := gb.ExecStreamWithPorts(ctx, "node-1", "printf 'task_step_1\n'; sleep 0.3; printf 'task_step_2\n'; sleep 5", "", 10, nil, true, []string{"8080:8080"}, func(c bk.ExecChunk) {
 		taskIDOut.WriteString(c.Data)
 	})
 	dur := time.Since(start)
@@ -792,6 +792,9 @@ func TestEndToEnd_TaskSupervisor(t *testing.T) {
 			found = true
 			if tk.Status != "running" {
 				t.Errorf("expected running status, got: %s", tk.Status)
+			}
+			if len(tk.Ports) != 1 || tk.Ports[0] != "8080:8080" {
+				t.Errorf("expected ports [8080:8080], got %v", tk.Ports)
 			}
 			break
 		}
@@ -886,14 +889,14 @@ func TestEndToEnd_PortForward(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// 3. 执行方(node-1)接入并注册白名单:放行 127.0.0.1
+	// 3. 执行方(node-1)接入且 network_allow 为空(默认拒绝常规出网隧道)
 	_, err = NewRelayBackend(map[string]interface{}{
-		"url":           wsURL,
-		"token":         "tok-exe",
-		"executor_id":   "node-1",
-		"watch_dir":     ".",
-		"executor":      true,
-		"network_allow": []string{"127.0.0.1"},
+		"url":         wsURL,
+		"token":       "tok-exe",
+		"executor_id": "node-1",
+		"watch_dir":   ".",
+		"executor":    true,
+		// network_allow 为空: fail-closed，阻止常规出网隧道
 	})
 	if err != nil {
 		t.Fatalf("executor backend: %v", err)
@@ -911,10 +914,10 @@ func TestEndToEnd_PortForward(t *testing.T) {
 	}
 	rb := reqRaw.(*RelayBackend)
 
-	// 5. 开启到远端服务的端口转发隧道并测试数据透传
-	stream, err := rb.TunnelOpen(ctx, "node-1", "127.0.0.1", uint16(echoPort))
+	// 5. 开启开发用端口转发隧道(TunnelOpenPortForward)，跳过 network_allow 白名单
+	stream, err := rb.TunnelOpenPortForward(ctx, "node-1", "127.0.0.1", uint16(echoPort))
 	if err != nil {
-		t.Fatalf("tunnel open: %v", err)
+		t.Fatalf("port-forward tunnel open: %v", err)
 	}
 
 	payload := []byte("hello-relay-port-forward\n")
@@ -931,14 +934,14 @@ func TestEndToEnd_PortForward(t *testing.T) {
 	}
 	stream.Close()
 
-	// 6. 验证白名单拦截机制:未放行目标(10.0.0.1)必须被拒绝
-	_, err = rb.TunnelOpen(ctx, "node-1", "10.0.0.1", 80)
+	// 6. 验证常规出网隧道(TunnelOpen)仍然受白名单限制(此时 network_allow 为空应被拦截)
+	_, err = rb.TunnelOpen(ctx, "node-1", "127.0.0.1", uint16(echoPort))
 	if err == nil {
-		t.Fatalf("expected network_allow reject error, got nil")
+		t.Fatalf("expected network_allow reject error for normal TunnelOpen, got nil")
 	}
 
 	// 7. 验证不存在的目标节点错误
-	_, err = rb.TunnelOpen(ctx, "non-existent-node", "127.0.0.1", uint16(echoPort))
+	_, err = rb.TunnelOpenPortForward(ctx, "non-existent-node", "127.0.0.1", uint16(echoPort))
 	if err == nil {
 		t.Fatalf("expected error for non-existent node, got nil")
 	}
