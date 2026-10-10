@@ -38,8 +38,9 @@ type Server struct {
 	// executors 记录每个 executor_id 上注册的执行方客户端(远端 watcher)。
 	executors map[string]string
 	// executorVers 记录每个 executor 执行方的 relay 构建版本,供 relay version 对比。
-	executorVers map[string]string
-	executorMu   sync.RWMutex
+	executorVers      map[string]string
+	executorEndpoints map[string]ExecutorEndpoint
+	executorMu        sync.RWMutex
 	// reqOwner 记录被转发的 exec 请求(reqID)归属的请求方客户端,用于把执行方回流帧转回去。
 	reqOwner map[string]string
 	reqMu    sync.RWMutex
@@ -129,8 +130,9 @@ func New(cfg Config) (*Server, error) {
 		auth:          cfg.Auth,
 		tls:           cfg.TLS,
 		subs:          make(map[string]map[string]bool),
-		executors:     make(map[string]string),
-		executorVers:  make(map[string]string),
+		executors:         make(map[string]string),
+		executorVers:      make(map[string]string),
+		executorEndpoints: make(map[string]ExecutorEndpoint),
 		reqOwner:      make(map[string]string),
 		pending:       make(map[string]chan protocol.Message),
 		pushRelay:     make(map[string]pushRelayInfo),
@@ -418,19 +420,25 @@ func (s *Server) UnsubscribeAll(clientID string) {
 	}
 }
 
-// RegisterExecutor 将 clientID 注册为 executorID 的执行方,并记录其 relay 构建版本。
+// RegisterExecutor 将 clientID 注册为 executorID 的执行方,并记录其 relay 构建版本及平台架构。
 // 返回(旧执行方连接, 是否发生了覆盖),供上层做替换告警。
-func (s *Server) RegisterExecutor(executorID, clientID, version string) (prev string, replaced bool) {
+func (s *Server) RegisterExecutor(executorID, clientID, version, goos, goarch string) (prev string, replaced bool) {
 	s.executorMu.Lock()
 	defer s.executorMu.Unlock()
 	prev = s.executors[executorID]
 	replaced = prev != "" && prev != clientID
 	s.executors[executorID] = clientID
-	if version != "" {
+	if version != "" || goos != "" {
 		s.executorVers[executorID] = version
+		s.executorEndpoints[executorID] = ExecutorEndpoint{
+			ClientID: clientID,
+			Version:  version,
+			OS:       goos,
+			Arch:     goarch,
+		}
 	} else {
-		// 旧版执行方不携带 version,清空以表示未知,避免与真实值混淆。
 		delete(s.executorVers, executorID)
+		delete(s.executorEndpoints, executorID)
 	}
 	return prev, replaced
 }
@@ -442,6 +450,7 @@ func (s *Server) UnregisterExecutor(executorID, clientID string) {
 	if s.executors[executorID] == clientID {
 		delete(s.executors, executorID)
 		delete(s.executorVers, executorID)
+		delete(s.executorEndpoints, executorID)
 	}
 }
 
@@ -464,10 +473,12 @@ func (s *Server) GetExecutor(executorID string) (string, bool) {
 	return e, ok
 }
 
-// ExecutorEndpoint 中转记录的单个已注册执行方端点(身份 + 构建版本)。
+// ExecutorEndpoint 中转记录的单个已注册执行方端点(身份 + 构建版本 + 平台)。
 type ExecutorEndpoint struct {
 	ClientID string
 	Version  string
+	OS       string
+	Arch     string
 }
 
 // ExecutorEndpoints 返回全部已注册执行方的快照(executorID → 端点)。供 `relay status`
@@ -477,7 +488,12 @@ func (s *Server) ExecutorEndpoints() map[string]ExecutorEndpoint {
 	defer s.executorMu.RUnlock()
 	out := make(map[string]ExecutorEndpoint, len(s.executors))
 	for eid, cid := range s.executors {
-		out[eid] = ExecutorEndpoint{ClientID: cid, Version: s.executorVers[eid]}
+		ep := s.executorEndpoints[eid]
+		if ep.ClientID == "" {
+			ep.ClientID = cid
+			ep.Version = s.executorVers[eid]
+		}
+		out[eid] = ep
 	}
 	return out
 }

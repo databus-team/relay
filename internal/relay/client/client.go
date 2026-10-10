@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -497,6 +498,8 @@ func (c *Client) RegisterExecutor(ctx context.Context, executorID, action, build
 		ExecutorID: executorID,
 		Action:     action,
 		Version:    buildVersion,
+		OS:         runtime.GOOS,
+		Arch:       runtime.GOARCH,
 	})
 	if err != nil {
 		return err

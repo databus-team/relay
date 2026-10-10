@@ -1606,11 +1606,15 @@ func runNodes() {
 		if e.Seg2.Unavailable != "" {
 			stText = "NotReady"
 		}
+		platform := "-"
+		if e.OS != "" {
+			platform = fmt.Sprintf("%s/%s", e.OS, e.Arch)
+		}
 		nodes = append(nodes, PeerNodeItem{
 			ID:       e.ExecutorID,
 			Role:     "agent",
 			Status:   stText,
-			Platform: "-",
+			Platform: platform,
 			Version:  identStr(e.Version),
 			Latency:  segmentText(e.Total),
 		})

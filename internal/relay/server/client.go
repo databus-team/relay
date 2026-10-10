@@ -497,14 +497,16 @@ func (c *Client) handleRegisterExecutor(msg protocol.Message) {
 	executorID := toString(payload["executor_id"])
 	action := toString(payload["action"])
 	version := toString(payload["version"])
+	goos := toString(payload["os"])
+	goarch := toString(payload["arch"])
 
 	switch action {
 	case "add", "":
-		prev, replaced := c.server.RegisterExecutor(executorID, c.id, version)
+		prev, replaced := c.server.RegisterExecutor(executorID, c.id, version, goos, goarch)
 		if replaced {
-			log.Printf("[executor] executor=%s replaced previous executor %s by %s (v=%s)", executorID, prev, c.id, version)
+			log.Printf("[executor] executor=%s replaced previous executor %s by %s (v=%s %s/%s)", executorID, prev, c.id, version, goos, goarch)
 		} else {
-			log.Printf("[executor] executor=%s registered executor %s (v=%s)", executorID, c.id, version)
+			log.Printf("[executor] executor=%s registered executor %s (v=%s %s/%s)", executorID, c.id, version, goos, goarch)
 		}
 	case "remove":
 		c.server.UnregisterExecutor(executorID, c.id)
@@ -687,6 +689,8 @@ func (c *Client) handleStatus(msg protocol.Message) {
 				results[i] = protocol.ExecutorHealth{
 					ExecutorID: eid,
 					Version:    ep.Version,
+					OS:         ep.OS,
+					Arch:       ep.Arch,
 					Seg2:       c.probeExecutor(ep.ClientID),
 				}
 			}()

@@ -137,6 +137,8 @@ type RegisterExecutorRequest struct {
 	ExecutorID string `json:"executor_id"`
 	Action     string `json:"action"`            // "add" / "remove"
 	Version    string `json:"version,omitempty"` // 执行方 relay 构建版本(用于 relay version 对比)
+	OS         string `json:"os,omitempty"`      // 执行方操作系统 (runtime.GOOS)
+	Arch       string `json:"arch,omitempty"`    // 执行方 CPU 架构 (runtime.GOARCH)
 }
 
 // VersionInfo 描述部署中一个 relay 节点的构建信息,用于 `relay version` 跨机对比。
@@ -175,11 +177,15 @@ type StatusRequest struct{}
 // ExecutorHealth 中转对单个已注册执行方的体检结果。
 //   - ExecutorID: 执行方的节点身份(executor_id)
 //   - Version:    执行方的 relay 构建版本
+//   - OS:         执行方操作系统 (runtime.GOOS)
+//   - Arch:       执行方 CPU 架构 (runtime.GOARCH)
 //   - Seg2:       中→执行方 往返 RTT;执行方离线/探针超时标不可用
 //   - Total:      Seg1(本地→中转)+ Seg2,由请求方在本地累加
 type ExecutorHealth struct {
 	ExecutorID string        `json:"executor_id"`
 	Version    string        `json:"version,omitempty"`
+	OS         string        `json:"os,omitempty"`
+	Arch       string        `json:"arch,omitempty"`
 	Seg2       StatusSegment `json:"seg2"`
 	Total      StatusSegment `json:"total,omitempty"`
 }
