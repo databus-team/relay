@@ -17,33 +17,45 @@ var (
 const bashCompletionScript = `# bash completion for relay -*- shell-script -*-
 
 _relay_bash_autocomplete() {
-    local cur prev opts base
-    COMPREPLY=()
-    cur="${COMP_WORDS[COMP_CWORD]}"
-    opts=$( ${COMP_WORDS[0]} --completion-bash "${COMP_WORDS[@]:1:$COMP_CWORD}" )
-    COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
+    local cur prev words cword
+    _get_comp_words_by_ref -n =: cur prev words cword 2>/dev/null || {
+        cur="${COMP_WORDS[COMP_CWORD]}"
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+        words=("${COMP_WORDS[@]}")
+        cword=$COMP_CWORD
+    }
+
+    local IFS=$'\n'
+    COMPREPLY=($( ${COMP_WORDS[0]} __complete "${words[@]:1:$cword}" ))
     return 0
 }
 
-complete -F _relay_bash_autocomplete -o default relay
+complete -F _relay_bash_autocomplete -o default -o nospace relay
 `
 
 const zshCompletionScript = `#compdef relay
 # zsh completion for relay
 
+# Ensure compinit is loaded safely
+if ! type compdef >/dev/null 2>&1; then
+    autoload -Uz compinit && compinit -C 2>/dev/null || compinit 2>/dev/null
+fi
+
 _relay() {
     local -a matches
-    matches=($(${words[1]} --completion-bash "${(@)words[2,$CURRENT]}"))
-    compadd -a matches
+    local IFS=$'\n'
 
-    if [[ $compstate[nmatches] -eq 0 && $words[$CURRENT] != -* ]]; then
+    # Request suggestions from relay __complete
+    matches=($(${words[1]} __complete "${(@)words[2,$CURRENT]}"))
+
+    if [[ ${#matches[@]} -gt 0 ]]; then
+        compadd -Q -a matches
+    else
         _files
     fi
 }
 
-if [[ "$(basename -- ${(%):-%x})" != "_relay" ]]; then
-    compdef _relay relay
-fi
+compdef _relay relay
 `
 
 const fishCompletionScript = `# fish completion for relay
@@ -51,7 +63,7 @@ const fishCompletionScript = `# fish completion for relay
 function __fish_relay_complete
     set -l cmd (commandline -co)
     set -e cmd[1]
-    relay --completion-bash $cmd
+    relay __complete $cmd
 end
 
 complete -c relay -f -a "(__fish_relay_complete)"
@@ -62,12 +74,199 @@ const powershellCompletionScript = `# PowerShell completion for relay
 Register-ArgumentCompleter -Native -CommandName relay -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
     $words = $commandAst.ToString().Split(' ') | Where-Object { $_ }
-    $completions = & relay --completion-bash $words[1..($words.Length-1)]
+    $completions = & relay __complete $words[1..($words.Length-1)]
     $completions | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
         [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
     }
 }
 `
+
+type cmdSpec struct {
+	subcmds []string
+	flags   []string
+}
+
+var topCommands = []string{
+	"run", "ps", "logs", "stop",
+	"nodes", "port-forward", "tunnel",
+	"push", "pull", "diff", "undo", "ws", "sync",
+	"node", "version", "server-remote", "completion", "job",
+	"server", "watch", "list", "cleanup",
+}
+
+var globalFlags = []string{
+	"-c", "--config", "--debug", "-h", "--help",
+}
+
+var commandSpecs = map[string]cmdSpec{
+	"run": {
+		flags: []string{"-w", "--watch", "-e", "--executor", "--node", "-f", "--force-remote", "--no-sync", "-d", "--detach"},
+	},
+	"nodes": {
+		flags: []string{"--json", "-u", "--usage"},
+	},
+	"ps": {
+		flags: []string{"-a", "--all", "-e", "--executor", "--node", "--json"},
+	},
+	"logs": {
+		flags: []string{"-f", "--follow", "--tail", "-e", "--executor", "--node"},
+	},
+	"stop": {
+		flags: []string{"-e", "--executor", "--node"},
+	},
+	"push": {
+		flags: []string{"-w", "--watch", "-e", "--executor", "--node", "--dest", "--no-jobs"},
+	},
+	"pull": {
+		flags: []string{"-w", "--watch", "-d", "--delete"},
+	},
+	"diff": {
+		flags: []string{"-w", "--watch", "-e", "--executor", "--node"},
+	},
+	"undo": {
+		flags: []string{"-w", "--watch", "-e", "--executor", "--node", "-l", "--list", "--snapshot"},
+	},
+	"ws": {
+		flags: []string{"--name", "--json", "-v", "--verbose"},
+	},
+	"sync": {
+		flags: []string{"-e", "--executor", "--node"},
+	},
+	"node": {
+		subcmds: []string{"run", "start", "stop", "status", "restart", "upgrade"},
+	},
+	"completion": {
+		subcmds: []string{"bash", "zsh", "fish", "powershell"},
+	},
+	"job": {
+		subcmds: []string{"run"},
+		flags:   []string{"-w", "--watch"},
+	},
+	"tunnel": {
+		subcmds: []string{"run", "start", "stop", "status", "restart", "upgrade"},
+		flags:   []string{"--listen", "-w", "--executor", "--node"},
+	},
+	"port-forward": {
+		subcmds: []string{"run", "start", "stop", "status", "restart"},
+		flags:   []string{"-e", "--executor", "--node", "-w", "--watch", "--bind"},
+	},
+	"server": {
+		subcmds: []string{"run", "start", "stop", "status", "restart", "upgrade"},
+		flags:   []string{"--server-config", "--addr"},
+	},
+	"watch": {
+		subcmds: []string{"run", "start", "stop", "status", "restart", "upgrade"},
+	},
+	"list": {
+		flags: []string{"-w", "--watch"},
+	},
+	"cleanup": {
+		flags: []string{"-w", "--watch"},
+	},
+	"version": {
+		flags: []string{"--json"},
+	},
+	"server-remote": {
+		flags: []string{"--binary", "--expect"},
+	},
+}
+
+func isWorkspaceFlag(s string) bool {
+	return s == "-w" || s == "--watch" || s == "--name"
+}
+
+func isNodeFlag(s string) bool {
+	return s == "-e" || s == "--executor" || s == "--node"
+}
+
+// handleComplete 快速高效处理 shell 发起的补全请求，秒级返回候选项
+func handleComplete(args []string) {
+	if len(args) == 0 {
+		printSuggestions(topCommands, "")
+		return
+	}
+
+	lastWord := args[len(args)-1]
+	prevWord := ""
+	if len(args) >= 2 {
+		prevWord = args[len(args)-2]
+	}
+
+	// 1. 若前一个参数需要特定值（工作区或节点）
+	if isWorkspaceFlag(prevWord) {
+		printSuggestions(getWorkspaceHints(), lastWord)
+		return
+	}
+	if isNodeFlag(prevWord) {
+		printSuggestions(getNodeHints(), lastWord)
+		return
+	}
+	if prevWord == "-c" || prevWord == "--config" {
+		return // 交给 shell 走文件补全
+	}
+
+	// 2. 查找第一个命令名
+	cmd := ""
+	for i := 0; i < len(args)-1; i++ {
+		if !strings.HasPrefix(args[i], "-") {
+			cmd = args[i]
+			break
+		}
+	}
+
+	// 若尚未输入确定的一级命令
+	if cmd == "" {
+		if strings.HasPrefix(lastWord, "-") {
+			printSuggestions(globalFlags, lastWord)
+		} else {
+			all := append([]string{}, topCommands...)
+			all = append(all, globalFlags...)
+			printSuggestions(all, lastWord)
+		}
+		return
+	}
+
+	// 3. 处理已确定一级命令的后续补全
+	spec, ok := commandSpecs[cmd]
+	if !ok {
+		return
+	}
+
+	// 如果命令含有下级子命令（如 node, completion, job）
+	if len(spec.subcmds) > 0 {
+		hasSubcmd := false
+		for i := 0; i < len(args)-1; i++ {
+			for _, s := range spec.subcmds {
+				if args[i] == s {
+					hasSubcmd = true
+					break
+				}
+			}
+		}
+		if !hasSubcmd && !strings.HasPrefix(lastWord, "-") {
+			printSuggestions(spec.subcmds, lastWord)
+			return
+		}
+	}
+
+	// 提示该命令支持的 Flags
+	flags := append([]string{}, spec.flags...)
+	flags = append(flags, globalFlags...)
+	printSuggestions(flags, lastWord)
+}
+
+func printSuggestions(items []string, prefix string) {
+	seen := make(map[string]bool)
+	for _, item := range items {
+		if item == "" || seen[item] {
+			continue
+		}
+		seen[item] = true
+		if prefix == "" || strings.HasPrefix(item, prefix) {
+			fmt.Println(item)
+		}
+	}
+}
 
 func runCompletion() {
 	shell := strings.ToLower(strings.TrimSpace(*completionShell))
@@ -86,9 +285,21 @@ func runCompletion() {
 	}
 }
 
+func getEffectiveConfigPath() string {
+	for i := 1; i < len(os.Args)-1; i++ {
+		if os.Args[i] == "-c" || os.Args[i] == "--config" {
+			return os.Args[i+1]
+		}
+	}
+	if configPath != nil && *configPath != "" {
+		return *configPath
+	}
+	return "~/.relay/config.yaml"
+}
+
 // getWorkspaceHints 从本地配置文件动态提取所有工作区 ID，供 shell 自动补全
 func getWorkspaceHints() []string {
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.Load(getEffectiveConfigPath())
 	if err != nil {
 		return nil
 	}
@@ -103,7 +314,7 @@ func getWorkspaceHints() []string {
 
 // getNodeHints 从本地配置文件动态提取所有已知节点/执行方 ID，供 shell 自动补全
 func getNodeHints() []string {
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.Load(getEffectiveConfigPath())
 	if err != nil {
 		return nil
 	}

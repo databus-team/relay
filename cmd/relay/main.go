@@ -167,6 +167,11 @@ var (
 )
 
 func main() {
+	if len(os.Args) >= 2 && (os.Args[1] == "__complete" || os.Args[1] == "--completion-bash") {
+		handleComplete(os.Args[2:])
+		return
+	}
+
 	kingpin.CommandLine.HelpFlag.Short('h')
 	setupUsageTemplate()
 
