@@ -129,23 +129,24 @@ restart_binary() {
   # 不用 `watch upgrade` 换装:它会对「运行中的 exe」做自覆盖,Windows 下失败,
   # 会旧 daemon 已停、新的又没起来 -> watch 卡在 stopped。
   # 改用外部 sh 一次完成「停旧 -> 挪走旧 -> 挪入新 -> 起新」,与自替换无关:
-  #   watch stop   停旧 daemon(释放仍映射旧 exe 的进程)
+  #   node stop / watch stop   停旧 daemon(释放仍映射旧 exe 的进程)
   #   mv dest -> dest.prev / st -> dest(旧换出、新的就位)
-  #   watch start  以守护进程重启新 daemon(detach + 写 pid,无黑窗)
-  # 注意:该 exec 由旧 daemon 服务,watch stop 停掉它后回包会断,链仍随 exec
+  #   node start               以对等节点守护进程重启新 daemon(detach + 写 pid,无黑窗)
+  # 注意:该 exec 由旧 daemon 服务,stop 停掉它后回包会断,链仍随 exec
   # 解耦继续完成(detached),结果由 verify(relay status) 兜底核对。
   local swap
   # $dest/$st 在本地展开成路径值;$HOME 留给远端展开,故写成 \$HOME。
-  swap="\"$dest\" watch stop -c \"\$HOME/.relay/config.yaml\" ; "
+  swap="\"$dest\" node stop -c \"\$HOME/.relay/config.yaml\" 2>/dev/null || true ; "
+  swap+="\"$dest\" watch stop -c \"\$HOME/.relay/config.yaml\" 2>/dev/null || true ; "
   swap+="mv -f \"$dest\" \"$dest.prev\" ; "
   swap+="mv -f \"$st\" \"$dest\" ; "
-  swap+="\"$dest\" watch start -c \"\$HOME/.relay/config.yaml\""
+  swap+="\"$dest\" node start -c \"\$HOME/.relay/config.yaml\""
   # 整段在远端以 detached 后台(nohup … &)触发,让本条 exec 立即返回。
-  # 若在前台跑,`watch stop` 会先杀掉服务本 exec 的旧 daemon,导致本地 relay
+  # 若在前台跑,stop 会先杀掉服务本 exec 的旧 daemon,导致本地 relay
   # exec 永等其回包而卡死;换装本身并不依赖该连接,由 verify 兜底核对即可。
   relay exec -c "$CONFIG" --executor "$e" "nohup sh -c '$swap' >/dev/null 2>&1 &" \
     || warn "换装已在远端后台触发;结果以 verify (relay status) 为准"
-  log "换装已后台触发;远端日志: ~/.relay/watch.log"
+  log "换装已后台触发;远端日志: ~/.relay/node.log"
 }
 
 # ---- 6) 中转一键部署(受控自升级) ----

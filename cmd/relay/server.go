@@ -155,6 +155,9 @@ func buildServerInstance(path string) (*server.Server, *server.Config, error) {
 	if path == "" {
 		path = *serverConfigPath
 	}
+	if path == "" && nodeConfigPath != nil && *nodeConfigPath != "" {
+		path = *nodeConfigPath
+	}
 	if path == "" {
 		// 未指定 --server-config 时,回退到全局 -c/--config 客户端配置文件(统一 config.yaml)。
 		path = *configPath
@@ -288,7 +291,19 @@ func transitSelfUpgrade(newBin string) {
 		log.Printf("[upgrade] swap failed, .prev retained: %v", err)
 		return
 	}
-	if err := syscall.Exec(exe, os.Args, os.Environ()); err != nil {
+
+	// 平滑切为对等节点 daemon: 将启动参数中的 server 切换为 node
+	args := make([]string, len(os.Args))
+	copy(args, os.Args)
+	for i, arg := range args {
+		if arg == "server" {
+			args[i] = "node"
+		} else if arg == "--server-config" {
+			args[i] = "-c"
+		}
+	}
+
+	if err := syscall.Exec(exe, args, os.Environ()); err != nil {
 		log.Printf("[upgrade] in-place restart failed: %v", err)
 	}
 }

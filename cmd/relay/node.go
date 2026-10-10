@@ -22,6 +22,7 @@ var (
 	nodeAction = nodeCmd.Arg("action", "run|start|stop|status|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "restart", "upgrade").String()
 	// upgrade 用的新二进制路径 (仅 action=upgrade 时使用)。
 	nodeUpgradePath = nodeCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
+	nodeConfigPath  = nodeCmd.Flag("server-config", "Path to server config file (YAML, for backward compatibility)").String()
 )
 
 // runNode 运行统一对等节点 (Node)
@@ -30,7 +31,11 @@ var (
 // - 若包含 agent: 启动 Watcher (Agent)
 // - 若同时包含 hub 与 agent: 通过 srv.Ready() 闩同步，等待 Hub 端口成功监听后再拨号 Agent
 func runNode() error {
-	cfgPath, err := config.ExpandHome(*configPath)
+	path := *configPath
+	if nodeConfigPath != nil && *nodeConfigPath != "" {
+		path = *nodeConfigPath
+	}
+	cfgPath, err := config.ExpandHome(path)
 	if err != nil {
 		return fmt.Errorf("expand config path: %w", err)
 	}
@@ -107,6 +112,17 @@ func runNode() error {
 			defer wg.Done()
 			fmt.Printf("[Node] Starting Agent (node_id: %s)\n", cfg.Node.ID)
 			relaybackend.SetExecutorRole(true)
+
+			// 若同机也是 Hub，且后端类型是 relay，确保后端连接走本地回环
+			if isHub && cfg.Backend.Type == "relay" {
+				localURL := cfg.GetLocalHubURL()
+				if localURL != "" {
+					if cfg.Backend.Config == nil {
+						cfg.Backend.Config = make(map[string]interface{})
+					}
+					cfg.Backend.Config["url"] = localURL
+				}
+			}
 
 			w, err := watcher.New(cfg, cfgPath)
 			if err != nil {

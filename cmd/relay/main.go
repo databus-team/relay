@@ -1539,9 +1539,21 @@ func runNodes() {
 		transitMem = transitSysRes.FormatMemUsage()
 	}
 
+	transitRole := "hub"
+	hasHubAgent := false
+	for _, e := range st.Executors {
+		if e.ExecutorID == "hub" {
+			hasHubAgent = true
+			break
+		}
+	}
+	if hasHubAgent {
+		transitRole = "hub, agent"
+	}
+
 	nodes = append(nodes, PeerNodeItem{
 		ID:       "hub (transit)",
-		Role:     "hub",
+		Role:     transitRole,
 		Status:   "Ready",
 		Platform: transitPlatform,
 		CPU:      transitCPU,
@@ -1552,6 +1564,10 @@ func runNodes() {
 
 	// 3. 远端 Agent / Executor 节点
 	for _, e := range st.Executors {
+		if e.ExecutorID == "hub" {
+			// hub 自身作为 agent 已合并在 hub (transit) 呈现，避免重复行
+			continue
+		}
 		stText := "Ready"
 		if e.Seg2.Unavailable != "" {
 			stText = "NotReady"

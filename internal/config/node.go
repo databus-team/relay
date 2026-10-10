@@ -23,6 +23,8 @@ func (c *Config) NormalizeNode() {
 	if c.Node.ID == "" {
 		if execID, ok := c.Backend.Config["executor_id"].(string); ok && execID != "" && execID != "default" {
 			c.Node.ID = execID
+		} else if c.Server != nil && c.Server.Addr != "" {
+			c.Node.ID = "hub"
 		} else if host, err := os.Hostname(); err == nil && host != "" {
 			c.Node.ID = host
 		} else {
@@ -34,9 +36,8 @@ func (c *Config) NormalizeNode() {
 	if len(c.Node.Roles) == 0 {
 		var roles []string
 		if c.Server != nil && c.Server.Addr != "" {
-			roles = append(roles, "hub")
-		}
-		if c.Backend.Type != "" {
+			roles = append(roles, "hub", "agent")
+		} else if c.Backend.Type != "" {
 			roles = append(roles, "agent")
 		}
 		if len(roles) == 0 {
@@ -53,6 +54,33 @@ func (c *Config) NormalizeNode() {
 	// 4. 默认授权控制端白名单 (默认全放行 "*")
 	if len(c.Node.AllowedControllers) == 0 {
 		c.Node.AllowedControllers = []string{"*"}
+	}
+
+	// 5. 若承担 Hub 且同时承担 Agent，自动补全/纠正本地回环 relay 后端
+	if c.IsAgent() && c.IsHub() {
+		if c.Backend.Type == "" {
+			c.Backend.Type = "relay"
+		}
+		if c.Backend.Config == nil {
+			c.Backend.Config = make(map[string]interface{})
+		}
+		if _, ok := c.Backend.Config["url"]; !ok || c.Backend.Config["url"] == "" {
+			c.Backend.Config["url"] = c.GetLocalHubURL()
+		}
+		if _, ok := c.Backend.Config["executor_id"]; !ok || c.Backend.Config["executor_id"] == "" {
+			c.Backend.Config["executor_id"] = c.NodeID()
+		}
+		if _, ok := c.Backend.Config["token"]; !ok {
+			if c.Server != nil && len(c.Server.Auth.Tokens) > 0 {
+				c.Backend.Config["token"] = c.Server.Auth.Tokens[0]
+			}
+		}
+		if _, ok := c.Backend.Config["command_dir"]; !ok {
+			c.Backend.Config["command_dir"] = "/tmp/relay-commands"
+		}
+		if _, ok := c.Backend.Config["network_allow"]; !ok {
+			c.Backend.Config["network_allow"] = []string{"*"}
+		}
 	}
 }
 
@@ -106,7 +134,7 @@ func (c *Config) IsControllerAllowed(controllerNodeID string) bool {
 }
 
 // GetLocalHubURL 获取本地运行的 Hub 回环 WebSocket URL (若配置了 Server 且处于本地运行状态)
-// 例如: "ws://127.0.0.1:8080/ws" 或 "wss://127.0.0.1:8080/ws"
+// 例如: "ws://127.0.0.1:8080/relay" 或 "wss://127.0.0.1:8080/relay"
 func (c *Config) GetLocalHubURL() string {
 	if c.Server == nil || c.Server.Addr == "" {
 		return ""
@@ -120,5 +148,5 @@ func (c *Config) GetLocalHubURL() string {
 	if c.Server.TLS.Enabled {
 		scheme = "wss"
 	}
-	return fmt.Sprintf("%s://127.0.0.1:%s/ws", scheme, port)
+	return fmt.Sprintf("%s://127.0.0.1:%s/relay", scheme, port)
 }

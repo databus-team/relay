@@ -30,7 +30,7 @@ backend:
 		t.Errorf("expected all controllers allowed by default")
 	}
 
-	// 2. 旧版只有 server 配置 -> 自动推导为 hub 角色
+	// 2. 旧版只有 server 配置 -> 自动推导为 hub 与 agent 双角色，并自动补全 loopback relay backend
 	yamlLegacyHub := `
 name: relay
 server:
@@ -42,6 +42,18 @@ server:
 	}
 	if !cfg2.IsHub() {
 		t.Errorf("expected IsHub = true")
+	}
+	if !cfg2.IsAgent() {
+		t.Errorf("expected IsAgent = true (transit also acts as agent)")
+	}
+	if cfg2.NodeID() != "hub" {
+		t.Errorf("expected NodeID = 'hub', got %q", cfg2.NodeID())
+	}
+	if cfg2.Backend.Type != "relay" {
+		t.Errorf("expected Backend.Type = 'relay', got %q", cfg2.Backend.Type)
+	}
+	if cfg2.Backend.Config["url"] != "ws://127.0.0.1:8443/relay" {
+		t.Errorf("expected Backend.Config url = 'ws://127.0.0.1:8443/relay', got %v", cfg2.Backend.Config["url"])
 	}
 
 	// 3. 显式双角色全对等节点 (兼任 hub 与 agent) 与指定白名单
@@ -84,8 +96,8 @@ func TestGetLocalHubURL(t *testing.T) {
 			Addr: "0.0.0.0:8080",
 		},
 	}
-	if got := cfg.GetLocalHubURL(); got != "ws://127.0.0.1:8080/ws" {
-		t.Errorf("GetLocalHubURL() = %q, want %q", got, "ws://127.0.0.1:8080/ws")
+	if got := cfg.GetLocalHubURL(); got != "ws://127.0.0.1:8080/relay" {
+		t.Errorf("GetLocalHubURL() = %q, want %q", got, "ws://127.0.0.1:8080/relay")
 	}
 
 	// 2. 带 TLS
@@ -97,8 +109,8 @@ func TestGetLocalHubURL(t *testing.T) {
 			},
 		},
 	}
-	if got := cfgTLS.GetLocalHubURL(); got != "wss://127.0.0.1:8443/ws" {
-		t.Errorf("GetLocalHubURL() = %q, want %q", got, "wss://127.0.0.1:8443/ws")
+	if got := cfgTLS.GetLocalHubURL(); got != "wss://127.0.0.1:8443/relay" {
+		t.Errorf("GetLocalHubURL() = %q, want %q", got, "wss://127.0.0.1:8443/relay")
 	}
 
 	// 3. 未配置 Server
