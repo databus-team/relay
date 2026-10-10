@@ -18,27 +18,27 @@ type CommandCategory struct {
 // categories 定义所有命令的分组与展示顺序
 var categories = []CommandCategory{
 	{
-		Title: "Core Commands (核心执行与编排):",
+		Title: "Core Commands:",
 		Names: []string{"run", "ps", "logs", "stop"},
 	},
 	{
-		Title: "Cluster & Network (集群节点与网络):",
+		Title: "Cluster & Network:",
 		Names: []string{"nodes", "port-forward", "tunnel"},
 	},
 	{
-		Title: "Workspace & Sync (代码同步与恢复):",
+		Title: "Workspace & Sync:",
 		Names: []string{"push", "pull", "diff", "undo", "ws", "sync"},
 	},
 	{
-		Title: "Daemon (常驻守护进程):",
+		Title: "Daemon:",
 		Names: []string{"node"},
 	},
 	{
-		Title: "Utility (系统与工具):",
+		Title: "Utility:",
 		Names: []string{"version", "server-remote", "job run"},
 	},
 	{
-		Title: "Legacy / Archive (旧版兼容与归档):",
+		Title: "Legacy / Archive:",
 		Names: []string{"server", "watch", "exec", "list", "cleanup"},
 	},
 }
@@ -206,11 +206,11 @@ func formatFlagLabel(f *kingpin.FlagModel) string {
 // formatFlagDesc 提取选项说明并附带默认值
 func formatFlagDesc(f *kingpin.FlagModel) string {
 	if f.Name == "help" {
-		return "显示命令行帮助信息"
+		return "Show context-sensitive help"
 	}
 	desc := f.Help
 	if len(f.Default) > 0 && f.Default[0] != "" && !f.IsBoolFlag() && f.Default[0] != "false" {
-		desc += fmt.Sprintf(" (默认: %s)", f.Default[0])
+		desc += fmt.Sprintf(" (default: %s)", f.Default[0])
 	}
 	return desc
 }
@@ -222,7 +222,7 @@ func renderHelp(app *kingpin.ApplicationModel, selCmd *kingpin.CmdModel, flags [
 
 	// 1. 顶级 --help 视图
 	if selCmd == nil {
-		b.WriteString(style.CyanBold("Relay") + " - 极简星型中转拓扑的对等协同与远端任务编排系统\n\n")
+		b.WriteString(style.CyanBold("Relay") + " - Peer-to-peer execution and workspace synchronization\n\n")
 
 		b.WriteString(style.CyanBold("Usage:") + "\n")
 		b.WriteString("  " + style.Bold("relay") + " [flags] <command> [args...]\n\n")
@@ -314,7 +314,7 @@ func renderHelp(app *kingpin.ApplicationModel, selCmd *kingpin.CmdModel, flags [
 			b.WriteString("\n")
 		}
 
-		b.WriteString(style.Dim("使用 \"relay <command> --help\" 查看指定命令的详细参数与用法。") + "\n")
+		b.WriteString(style.Dim("Use \"relay <command> --help\" for more information about a command.") + "\n")
 		return b.String()
 	}
 

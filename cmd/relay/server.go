@@ -19,7 +19,7 @@ import (
 )
 
 var (
-	serverCmd = kingpin.Command("server", "中转服务端守护进程 (建议使用 node 代替)")
+	serverCmd = kingpin.Command("server", "Transit server daemon (deprecated, use node instead)")
 
 	// 位置参数 action:默认前台;run=前台;start/stop/status/restart/upgrade 为 daemon 控制。
 	serverAction = serverCmd.Arg("action", "run|start|stop|status|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "restart", "upgrade").String()
