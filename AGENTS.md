@@ -59,7 +59,7 @@ relay/
 | `ws` (alias `workspaces`) | `runWorkspaces`/`resolveWatches` | List/JSON/verbose workspace table |
 | `sync` (`-e` target executor) | `runSync` | WS streaming to executor, or cmd-file fallback |
 | `push` (direct + `--no-jobs`/`--dest`) | `runPush` · `runLocalJobsForPush` | Direct-to-executor with jobs, or transport-only |
-| `exec` | `runExec` | Streaming via `ExecStreamBackend`, `--sync` (git diff), `-d` (detach) |
+| `exec` / `run` | `runExec` | Streaming via `ExecStreamBackend`; git diff sync **default-on** (`--no-sync` to skip, `-f` to force); `-d` (detach); 30s foreground cap |
 | `ps` | `runPs` | List managed tasks across nodes |
 | `logs` | `runLogs` | Tail / stream task logs (`-f`, `--tail`) |
 | `stop` | `runStop` | Terminate process group by task ID |
@@ -176,8 +176,8 @@ CLI usage (key forms):
 relay node [run|start|stop|status|restart]             # unified peer node daemon (hub + agent roles)
 relay watch [run|start|stop|status|restart|upgrade]   # executor (daemon actions)
 relay server [run|start|stop|status|restart|upgrade]  # transit (daemon actions)
-relay run [-w <workspace> | --node <node-id>] [--sync] [-d] <cmd...> # direct run / exec alias
-relay exec [-w <workspace> | --node <node-id>] [--sync] [-d] <cmd...>  # --sync = git diff sync; -d = detached
+relay run [-w <workspace> | --node <node-id>] [--no-sync] [-f] [-d] <cmd...> # direct run / exec alias
+relay exec [-w <workspace> | --node <node-id>] [--no-sync] [-f] [-d] <cmd...>  # git diff sync default-on; -d = detached (30s foreground cap)
 relay nodes [-u|--usage] [--json]                      # cluster-wide peer nodes & topology state (alias: node ls, status)
 relay push [-w <workspace> | --node <node-id>] <file> [--no-jobs] [--dest <abs>]
 relay ps [--node <node-id>] [-a]                       # list tasks (TaskSupervisor)
@@ -211,6 +211,7 @@ Pass `-c <config>` (default `~/.relay/config.yaml`) to share one config across e
 - **Reconnect 1s→30×10.** Default `reconnect.go` config: initial 1s, exponential ×2 up to 30s max, max 10 retries, then gives up (`failAllPending` + close). A successful reconnect restarts `readLoop` + heartbeat (single writeLoop persists).
 - **Config atomic write.** `ApplyConfigFile` parses/validates the payload, backs up the current file to `config.bak`, writes to `config.tmp`, then `os.Rename` (atomic). It is shared by both sync paths: the exchange/`command`-file watcher (`handleConfigSync`) and the relay WS streaming `ConfigSync`. `relay sync` pushes the shared config to the executor.
 - **Streaming/interaction.** `MsgExec*`/push/stream transfer binary content via `StreamStart`/`StreamData`/`StreamEnd` (binary frames + zstd) rather than in JSON headers; file events fan out via `MsgFileEvent` to subscribers.
+- **Exec git-sync semantics + 30s foreground cap.** `relay run`/`exec` sync the local Git diff **by default** — there is no `--sync` flag; `--no-sync` opts out and `-f`/`--force-remote` forces it. Two consequences: (a) sync carries **only uncommitted working-tree changes, never commits** — unpushed commits do not transfer; (b) its source dir is the workspace's `local_dir`, which must be a valid Git repo **on the CLI machine** — a Windows-style `local_dir` (e.g. `/d/...`) is invisible to a macOS CLI, so sync is silently skipped. A foreground exec is capped at **30s** on the executor (`runStream` defaults `timeout=30` when the client sends 0; no CLI override), so long commands/servers must use `-d` (TaskSupervisor) + `relay logs <task-id> -f`.
 
 ## CONVENTIONS
 

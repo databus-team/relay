@@ -11,7 +11,7 @@ A Go-based daemon for monitoring remote directories and executing actions when f
 - **Multiple Paths**: One watch supports multiple file glob patterns
 - **Multiple Jobs**: Each watch supports a chain of jobs with conditional execution (`if: jobs.X.success/failure`)
 - **Push/Pull**: Upload and download files with streaming transfer and zstd compression
-- **Remote Exec & Git Sync**: Forward commands via WebSocket with real-time streaming; optionally incremental Git diff sync (`--sync`) before execution with shadow snapshot protection
+- **Remote Exec & Git Sync**: Forward commands via WebSocket with real-time streaming; incremental Git diff sync runs **by default** before execution (opt out with `--no-sync`), with shadow snapshot protection
 - **Task Supervisor (Docker-style UX)**: Detached background execution (`exec -d`), task listing (`ps`), live log tailing (`logs -f`), and process group termination (`stop`)
 - **Port Forwarding (kubectl-style)**: Forward local ports to remote services (`relay pf 8080:8080`) over full-duplex tunnel stream with fail-closed network whitelist
 - **One-Click Undo & Drift Diff**: Restore overwritten remote workspaces instantly (`relay undo`) and inspect cross-node drift & file conflicts (`relay diff`)
@@ -152,8 +152,9 @@ Lists files in the watch's remote `watch_dir` with size and modification time.
 relay run -w web-app-patches "npm run build"
 relay run --node linux-heavy "go test -v ./..."
 
-# Sync local Git workspace changes before executing remote command
-relay run -w web-app-patches --sync "pytest tests/"
+# Incremental Git sync of local workspace changes runs by default
+relay run -w web-app-patches "pytest tests/"            # syncs the local diff, then runs
+relay run -w web-app-patches --no-sync "pytest tests/"  # skip sync
 
 # Detached execution: Run in background (returns Task ID immediately, Docker-like UX)
 relay run -w web-app-patches -d "npm run dev"
@@ -161,8 +162,10 @@ relay run -w web-app-patches -d "npm run dev"
 ```
 
 Forwards a command to the remote side for execution. Requires a backend that supports `Exec` (local, fs_mcp, relay). The `-w` flag sets the working directory to the watch's `local_dir`. When omitted, `-w` is inferred from the cwd when it can be; otherwise `run/exec` falls back to its no-workspace behavior. Use `--node / -e <id>` to address a specific node by its ID directly.
-- `--sync`: Automatically detects uncommitted local Git modifications and untracked files, packs an incremental diff payload, and applies it to the remote workspace before executing the command. Includes base commit drift validation and automatic remote shadow snapshot backup (`refs/relay/backups/*`).
+- **Git sync (ON by default — opt out with `--no-sync`):** Automatically detects uncommitted local Git modifications and untracked files, packs an incremental diff payload, and applies it to the remote workspace before executing the command. Includes base commit drift validation and automatic remote shadow snapshot backup (`refs/relay/backups/*`). Note: it carries **only the local working-tree diff, never unpushed commits**, and its source is the workspace's `local_dir` — which must be a valid Git repo **on the CLI machine** (otherwise sync is silently skipped).
+- `-f, --force-remote`: Force a sync even when the local tree is clean (creates a shadow snapshot on the remote first, then overwrites remote state).
 - `-d, --detach`: Runs the command in the background under the node's **TaskSupervisor**. Process trees are tracked cleanly (no orphaned child processes), stdout/stderr are persisted to `~/.relay/tasks/<task-id>/run.log`, and real-time output is broadcasted to subscribers.
+- **Foreground cap: 30s.** A foreground `run`/`exec` is capped at 30 seconds on the executor side and there is no CLI flag to raise it — long-running commands or servers must use `-d` (detached), then `relay logs <task-id> -f`.
 
 ### ps — List Managed Background Tasks
 
@@ -264,7 +267,7 @@ relay undo -e node-1
 relay undo -e node-1 --snapshot refs/relay/backups/1718000000
 ```
 
-Whenever `exec --sync` applies changes onto a dirty remote workspace, a shadow snapshot (`refs/relay/backups/<timestamp>`) is automatically created beforehand. If an accidental overwrite occurs or remote tests alter the state, `relay undo` cleanly resets the remote workspace back to its pre-sync state (including unstaged and untracked files). Pre-undo changes are preserved in a safety snapshot to prevent accidental data loss.
+Whenever an exec with Git sync applies changes onto a dirty remote workspace, a shadow snapshot (`refs/relay/backups/<timestamp>`) is automatically created beforehand. If an accidental overwrite occurs or remote tests alter the state, `relay undo` cleanly resets the remote workspace back to its pre-sync state (including unstaged and untracked files). Pre-undo changes are preserved in a safety snapshot to prevent accidental data loss.
 
 ### job run — Run a Config Job Locally
 
