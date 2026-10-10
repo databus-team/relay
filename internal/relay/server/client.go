@@ -704,13 +704,18 @@ func (c *Client) handleStatus(msg protocol.Message) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				seg, dynRes := c.probeExecutor(ep.ClientID, withUsage)
+				res := ep.Resource
+				if dynRes != nil {
+					res = *dynRes
+				}
 				results[i] = protocol.ExecutorHealth{
 					ExecutorID: eid,
 					Version:    ep.Version,
 					OS:         ep.OS,
 					Arch:       ep.Arch,
-					Resource:   ep.Resource,
-					Seg2:       c.probeExecutor(ep.ClientID),
+					Resource:   res,
+					Seg2:       seg,
 				}
 			}()
 		}
@@ -733,28 +738,42 @@ func (c *Client) transitVersion() protocol.VersionInfo {
 	}
 }
 
-// probeExecutor 对单个执行方连接发一条探针并等待回过包,测「中纪→执行方」段往返 RTT。
+// probeExecutor 对单个执行方连接发一条探针并等待回包,测「中转→执行方」段往返 RTT,并在 withUsage 为 true 时收集执行方最新动态资源。
 // 探针复用 MsgPing→MsgPong:执行方在自身连接上回 MsgPong(RequestID=probeID),由
 // maybeResolvePending 命中 pending 并投递。发送带写超时兜底,防止 half-open 连接把探针
 // 写卡死(与等待回包一同受 statusProbeTimeout 约束)。失败返回不可用段,不把错误上抛。
-func (c *Client) probeExecutor(executorID string) protocol.StatusSegment {
+func (c *Client) probeExecutor(clientID string, withUsage bool) (protocol.StatusSegment, *protocol.ResourceStats) {
 	probeID := uuid.New().String()
 	probeCh := c.server.registerPending(probeID)
 	defer c.server.deletePending(probeID)
 
+	var payload interface{}
+	if withUsage {
+		payload = map[string]interface{}{"with_usage": true}
+	}
+
 	start := time.Now()
-	if err := c.server.sendProbe(executorID, protocol.Message{Type: protocol.MsgPing, ID: probeID}, statusProbeTimeout); err != nil {
-		return protocol.StatusSegment{Unavailable: "executor unavailable"}
+	if err := c.server.sendProbe(clientID, protocol.Message{Type: protocol.MsgPing, ID: probeID, Payload: payload}, statusProbeTimeout); err != nil {
+		return protocol.StatusSegment{Unavailable: "executor unavailable"}, nil
 	}
 
 	select {
-	case <-probeCh:
+	case pongMsg := <-probeCh:
 		latency := time.Since(start).Milliseconds()
-		return protocol.StatusSegment{LatencyMS: &latency}
+		var res *protocol.ResourceStats
+		if pongMsg.Payload != nil {
+			if data, err := json.Marshal(pongMsg.Payload); err == nil {
+				var r protocol.ResourceStats
+				if err := json.Unmarshal(data, &r); err == nil && r.CPUCores > 0 {
+					res = &r
+				}
+			}
+		}
+		return protocol.StatusSegment{LatencyMS: &latency}, res
 	case <-time.After(statusProbeTimeout):
-		return protocol.StatusSegment{Unavailable: "executor probe timeout"}
+		return protocol.StatusSegment{Unavailable: "executor probe timeout"}, nil
 	case <-c.closeCh:
-		return protocol.StatusSegment{Unavailable: "disconnected"}
+		return protocol.StatusSegment{Unavailable: "disconnected"}, nil
 	}
 }
 

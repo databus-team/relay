@@ -378,11 +378,25 @@ func (c *Client) handleMessage(msg protocol.Message) {
 		// 经发送队列出站(比直写连接安全),镜像 server/client.go 的 MsgPing→MsgPong 写法。
 		// 用非阻塞投递:发送队列满时丢弃。探针本就允许超时降级(中转把该段标不可用),
 		// 不因探针回包阻塞执行方自身的读写循环(避免 status 风暴挤掉正常心跳/exec 帧)。
+		var pongPayload interface{}
+		if reqMap, ok := msg.Payload.(map[string]interface{}); ok {
+			if u, ok := reqMap["with_usage"].(bool); u && ok {
+				res := sysinfo.CollectResourceInfo(true)
+				pongPayload = protocol.ResourceStats{
+					CPUCores:    res.CPUCores,
+					CPULoad:     res.CPULoad,
+					MemTotalMB:  res.MemTotalMB,
+					MemUsedMB:   res.MemUsedMB,
+					IsContainer: res.IsContainer,
+				}
+			}
+		}
 		select {
 		case c.sendCh <- sendMsg{Message: &protocol.Message{
 			Type:      protocol.MsgPong,
 			ID:        uuid.New().String(),
 			RequestID: msg.ID,
+			Payload:   pongPayload,
 		}}:
 		default:
 		}
