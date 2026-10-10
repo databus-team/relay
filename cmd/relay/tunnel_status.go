@@ -5,10 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"os/signal"
 	"os/user"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/user/relay/internal/config"
@@ -213,3 +216,154 @@ func daemonStatusTunnel() error {
 
 	return nil
 }
+
+// daemonLogsTunnel 查看/跟踪指定隧道实例的日志
+func daemonLogsTunnel() error {
+	insts, err := daemon.ListInstances("tunnel")
+	if err != nil {
+		return err
+	}
+
+	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
+	if target == "" && *tunnelTargetArg != "" {
+		target = *tunnelTargetArg
+	}
+
+	// 若未显式指定目标，且本地恰好只有 1 个实例，自动推断
+	if target == "" {
+		if len(insts) == 1 {
+			target = strings.TrimPrefix(insts[0].Name, "tunnel-")
+		} else if len(insts) == 0 {
+			return fmt.Errorf("no active tunnel instances found")
+		} else {
+			var names []string
+			for _, in := range insts {
+				names = append(names, strings.TrimPrefix(in.Name, "tunnel-"))
+			}
+			return fmt.Errorf("multiple tunnel instances found (%s); please specify target node via `relay tunnel logs <node>` or `-w <node>`", strings.Join(names, ", "))
+		}
+	}
+
+	// 定位日志文件
+	instName := tunnelInstanceName(target)
+	logFile := daemon.LogFile(instName)
+
+	f, err := os.Open(logFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("log file not found for tunnel %q (%s)", target, logFile)
+		}
+		return fmt.Errorf("open log file: %w", err)
+	}
+	defer f.Close()
+
+	tailLines := *tunnelTail
+	if tailLines <= 0 {
+		tailLines = 100
+	}
+
+	// 读取末尾 tailLines 行
+	lines, err := readTailLines(f, tailLines)
+	if err != nil {
+		return fmt.Errorf("read tail lines: %w", err)
+	}
+	for _, l := range lines {
+		fmt.Println(l)
+	}
+
+	if !*tunnelFollow {
+		return nil
+	}
+
+	// Follow 模式持续输出
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cancel()
+	}()
+
+	// 移至文件当前末尾
+	offset, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	buf := make([]byte, 4096)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			fi, err := f.Stat()
+			if err != nil {
+				continue
+			}
+			if fi.Size() < offset {
+				// 文件可能被 rotate 或清空，重新从头读
+				offset = 0
+				_, _ = f.Seek(0, io.SeekStart)
+			}
+			for {
+				n, err := f.Read(buf)
+				if n > 0 {
+					os.Stdout.Write(buf[:n])
+					offset += int64(n)
+				}
+				if err != nil {
+					break
+				}
+			}
+		}
+	}
+}
+
+// readTailLines 高效读取文件末尾最多 N 行
+func readTailLines(f *os.File, n int) ([]string, error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	size := fi.Size()
+	if size == 0 {
+		return nil, nil
+	}
+
+	// 预估每行约 128 字节，先向前定位
+	chunkSize := int64(n * 256)
+	if chunkSize > size {
+		chunkSize = size
+	}
+	if chunkSize > 1024*1024 {
+		chunkSize = 1024 * 1024
+	}
+
+	buf := make([]byte, chunkSize)
+	start := size - chunkSize
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return nil, err
+	}
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return nil, err
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(string(buf)))
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+
+	// 如果末尾块中的行数超过 n，取最后 n 行
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return lines, nil
+}
+

@@ -134,14 +134,15 @@ var (
 	serverRemoteBin = serverRemoteCmd.Flag("binary", "Path to the new relay binary to send (default: current executable)").String()
 	serverRemoteExpect = serverRemoteCmd.Flag("expect", "Expected transit version after swap (default: this relay's version.String())").String()
 
-	// Tunnel command - 本地 SOCKS5 出网隧道,经所选 executor 出口访问内网白名单目标。
 	tunnelCmd      = kingpin.Command("tunnel", "Open SOCKS5 egress tunnel through remote node")
 	tunnelListen   = tunnelCmd.Flag("listen", "Local SOCKS5 listen address").Default("127.0.0.1:1080").String()
 	tunnelExecName = tunnelCmd.Flag("executor", "Egress executor's executor_id (see `relay status` -> executors[].executor_id)").Short('w').HintAction(getNodeHints).String()
 	tunnelNodeName = tunnelCmd.Flag("node", "Egress node ID (alias for --executor)").HintAction(getNodeHints).String()
 	tunnelJSON     = tunnelCmd.Flag("json", "Output as JSON").Bool()
-	tunnelAction   = tunnelCmd.Arg("action", "run|start|stop|status|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "restart", "upgrade").String()
-	tunnelUpgradePath = tunnelCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
+	tunnelFollow   = tunnelCmd.Flag("follow", "Follow log output (with action=logs)").Short('f').Bool()
+	tunnelTail     = tunnelCmd.Flag("tail", "Number of lines to show from the end (with action=logs)").Default("100").Int()
+	tunnelAction   = tunnelCmd.Arg("action", "run|start|stop|status|logs|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "logs", "restart", "upgrade").String()
+	tunnelTargetArg = tunnelCmd.Arg("target-or-path", "Target node ID (with action=logs) or new binary path (with action=upgrade)").String()
 
 	// Port-forward command - 本地端口映射到远端服务 (类似 kubectl port-forward / docker -p)
 	portForwardCmd    = kingpin.Command("port-forward", "Forward local port to remote node (alias: pf)").Alias("pf")
@@ -302,10 +303,15 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
+		case "logs":
+			if err := daemonLogsTunnel(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
 		case "restart":
 			daemonRestartTunnel()
 		case "upgrade":
-			daemonUpgradeTunnel(*tunnelUpgradePath)
+			daemonUpgradeTunnel(*tunnelTargetArg)
 		default:
 			runTunnel()
 		}
@@ -345,7 +351,7 @@ func normalizedAction(a string) string {
 	switch a {
 	case "run", "":
 		return ""
-	case "start", "stop", "status", "restart", "upgrade":
+	case "start", "stop", "status", "logs", "restart", "upgrade":
 		return a
 	default:
 		return ""
