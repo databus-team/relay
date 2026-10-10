@@ -49,10 +49,23 @@ command -v relay >/dev/null || die "未找到 relay CLI(先 make install)"
 # workspace 绑定;未绑定 workspace 的执行器同样可被部署/操作)。
 remote_cmd() { "$(command -v relay)" exec -c "$CONFIG" --executor "$1" "${@:2}" 2>&1 | sed -E 's/^Checking remote watcher\.\.\. OK//'; }
 
-# 枚举在线执行器:`relay status --json` 的 executors[] 里每台的 executor_id。
+# 枚举在线执行器:`relay nodes --json` 里 Ready 状态且不含 "(local)" 和 "(transit)" 的节点 id。
 list_online_executors() {
-  relay status --json -c "$CONFIG" 2>/dev/null \
-    | awk 'match($0,/"executor_id": *"[^"]*"/){s=substr($0,RSTART,RLENGTH); split(s,a,"\""); print a[4]}'
+  relay nodes --json -c "$CONFIG" 2>/dev/null \
+    | awk '
+        /"id":/ {
+          match($0, /"id": *"[^"]*"/);
+          s=substr($0, RSTART, RLENGTH);
+          split(s, a, "\"");
+          id=a[4];
+        }
+        /"status": *"Ready"/ {
+          if (id != "" && id !~ /\(local\)/ && id !~ /\(transit\)/) {
+            print id;
+            id="";
+          }
+        }
+      '
 }
 
 # ---- 1) 探测远端 OS/arch ----
@@ -166,12 +179,23 @@ verify_executor() {
   local id="${1:?需要 <executor_id>}" want="${2:-$GIT_COMMIT}" i ver
   # RESTART=1 换装后执行器 daemon 约 3s 后被杀重启,给足时间并容忍瞬时不可达。
   sleep 3
-  log "核验执行器 $id 版本 (status --json, 等待新提交 $want, 至 30s) ..."
+  log "核验执行器 $id 版本 (nodes --json, 等待新提交 $want, 至 30s) ..."
   for i in $(seq 1 15); do
-    ver="$(relay status --json -c "$CONFIG" 2>/dev/null \
+    ver="$(relay nodes --json -c "$CONFIG" 2>/dev/null \
       | awk -v id="$id" '
-          /"executor_id":/{c=""; if(match($0,/"executor_id": *"[^"]*"/)){s=substr($0,RSTART,RLENGTH); split(s,a,"\""); c=a[4]}}
-          /"version":/ && c==id && match($0,/"version": *"[^"]*"/){s=substr($0,RSTART,RLENGTH); split(s,a,"\""); print a[4]; exit}
+          /"id":/ {
+            match($0, /"id": *"[^"]*"/);
+            s=substr($0, RSTART, RLENGTH);
+            split(s, a, "\"");
+            c=a[4];
+          }
+          /"version":/ && c==id {
+            match($0, /"version": *"[^"]*"/);
+            s=substr($0, RSTART, RLENGTH);
+            split(s, a, "\"");
+            print a[4];
+            exit;
+          }
         ')"
     if grep -q "+${want}" <<<"$ver"; then
       log "执行器 $id 已切到新提交 $want ✔"

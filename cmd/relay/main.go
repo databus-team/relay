@@ -103,13 +103,8 @@ var (
 	stopExec   = stopCmd.Flag("executor", "Target executor node").Short('e').String()
 	stopNode   = stopCmd.Flag("node", "Target node ID (alias for --executor)").String()
 
-	// Status command - 整座部署连通性体检:本地→中转 一段 + 中转→每个执行方 的时延与版本。
-	// 不携带 -w(status 面向整座部署);继承原 `ping` 探活职责并把 `version -r` 台账归一到此。
-	statusCmd     = kingpin.Command("status", "整座部署连通性体检:本地→中转 与 中转→每个执行方 的时延及版本")
-	statusJSONOut = statusCmd.Flag("json", "Output as JSON").Bool()
-
-	// Nodes command - 查看全网节点拓扑状态与角色 (类似 kubectl get nodes / docker node ls)
-	nodesCmd     = kingpin.Command("nodes", "查看集群对等节点与拓扑状态 (alias: node ls)")
+	// Nodes command - 查看全网节点拓扑状态与角色 (类似 kubectl get nodes / docker node ls; alias: status)
+	nodesCmd     = kingpin.Command("nodes", "查看集群对等节点与拓扑状态 (alias: node ls, status)").Alias("status")
 	nodesJSONOut = nodesCmd.Flag("json", "Output as JSON").Bool()
 
 	// Cleanup command - remove stale command files
@@ -259,8 +254,6 @@ func main() {
 		runPush()
 	case execCmd.FullCommand():
 		runExec()
-	case statusCmd.FullCommand():
-		runStatus()
 	case nodesCmd.FullCommand():
 		runNodes()
 	case listCmd.FullCommand():
@@ -1441,89 +1434,7 @@ func runStop() {
 // statusTimeout 是 `relay status` 单条命令的上限(含对中转 status 请求的等待)。
 const statusTimeout = 15 * time.Second
 
-// runStatus 整座部署连通性体检:输出 本地→中转 一段 + 中转→每个执行方的时延与版本。
-// 不携带 `-w`:status 面向整座部署(中转 + 全部执行方),而非单个 workspace/executor。
-// relay 后端给出完整结果;其余后端(local/fs-mcp/jumpserver)尽力而为,只有单跳段可达,
-// 执行方向为空,保持相同列结构与 --json 字段。
-func runStatus() {
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
-		os.Exit(1)
-	}
 
-	b, err := backend.NewBackend(cfg.Backend.Type, cfg.Backend.Config)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
-		os.Exit(1)
-	}
-
-	// relay 后端专属:整座部署——本地→中转 + 中转→每个执行方 + 版本台账。
-	if rb, ok := b.(*relaybackend.RelayBackend); ok {
-		ctx, cancel := context.WithTimeout(context.Background(), statusTimeout)
-		defer cancel()
-		st, err := rb.Status(ctx)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		printStatus(cfg.Backend.Type, st, *statusJSONOut)
-		return
-	}
-
-	// 非 relay 端点:单段可达(仅 本地→后端),执行方向不可用。
-	commandDir := "/tmp/relay-commands"
-	if dir, ok := cfg.Backend.Config["command_dir"].(string); ok && dir != "" {
-		commandDir = dir
-	}
-	start := time.Now()
-	bufwatch := ""
-	if inferred, err := resolveWorkspaceID(cfg, ""); err == nil {
-		bufwatch = inferred
-	}
-	if err := b.Ping(context.Background(), commandDir, bufwatch); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-	ms := time.Since(start).Milliseconds()
-	st := protocol.StatusResponse{
-		OK:   true,
-		Seg1: protocol.StatusSegment{LatencyMS: &ms},
-	}
-	printStatus(cfg.Backend.Type, st, *statusJSONOut)
-}
-
-// printStatus 渲染 `relay status` 结果:--json 输出与文本一致的相同字段,段不可用时 latency_ms
-// 留空并给出 unavailable 原因。status 面向整座部署:本地→中转 一段 + 中转→每个执行方
-// 各自的段与时延(Total=段1+段2),执行方离线时其段标不可用,全部离线时执行方列表为空。
-func printStatus(backendName string, st protocol.StatusResponse, jsonOut bool) {
-	if jsonOut {
-		rep := map[string]interface{}{
-			"backend":   backendName,
-			"local":     protocol.VersionInfo{Version: version.Version, Commit: version.Commit},
-			"seg1":      st.Seg1,
-			"transit":   st.Transit,
-			"executors": st.Executors,
-		}
-		enc, _ := json.MarshalIndent(rep, "", "  ")
-		fmt.Println(string(enc))
-		return
-	}
-
-	fmt.Printf("status (%s backend)\n", backendName)
-	fmt.Printf("  local         %s (%s/%s)\n", ident(protocol.VersionInfo{Version: version.Version, Commit: version.Commit}), runtime.GOOS, runtime.GOARCH)
-	fmt.Printf("  local→transit  %s\n", segmentText(st.Seg1))
-	fmt.Printf("  transit        %s (%s/%s)\n", ident(st.Transit), st.Transit.GOOS, st.Transit.GOARCH)
-	if len(st.Executors) == 0 {
-		fmt.Println("  executors: (none registered/online)")
-		return
-	}
-	fmt.Println("  executors:")
-	for _, e := range st.Executors {
-		fmt.Printf("    %s  transit→executor %s  total %s  (%s)\n",
-			e.ExecutorID, segmentText(e.Seg2), segmentText(e.Total), identStr(e.Version))
-	}
-}
 
 // PeerNodeItem 描述拓扑中的一个对等节点
 type PeerNodeItem struct {

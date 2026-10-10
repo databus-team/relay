@@ -20,7 +20,7 @@ var categories = []CommandCategory{
 	},
 	{
 		Title: "Cluster & Network (集群节点拓扑与网络):",
-		Names: []string{"nodes", "status", "port-forward", "tunnel"},
+		Names: []string{"nodes", "port-forward", "tunnel"},
 	},
 	{
 		Title: "Workspace & Sync (工作区代码同步与恢复):",
