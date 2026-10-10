@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"net"
+	"os"
 	"reflect"
 	"testing"
 )
@@ -139,3 +140,32 @@ func TestIsLoopbackAddr(t *testing.T) {
 		}
 	}
 }
+
+func TestParseTunnelMeta(t *testing.T) {
+	// 1. 无日志文件，直接根据实例名推导
+	listen, egress := parseTunnelMeta("tunnel-node-b", "", "127.0.0.1:1085")
+	if egress != "node-b" {
+		t.Errorf("expected egress node-b, got %s", egress)
+	}
+	if listen != "127.0.0.1:1085" {
+		t.Errorf("expected listen 127.0.0.1:1085, got %s", listen)
+	}
+
+	// 2. 模拟日志头部含有实际 listen 地址
+	tmpFile, err := os.CreateTemp("", "tunnel-log-*.log")
+	if err != nil {
+		t.Fatalf("create temp log: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	_, _ = tmpFile.WriteString("tunnel: SOCKS5 on 127.0.0.1:2088 -> egress node-custom (Ctrl-C to stop)\n")
+	tmpFile.Close()
+
+	listen2, egress2 := parseTunnelMeta("tunnel-fallback", tmpFile.Name(), "127.0.0.1:1080")
+	if egress2 != "node-custom" {
+		t.Errorf("expected egress node-custom, got %s", egress2)
+	}
+	if listen2 != "127.0.0.1:2088" {
+		t.Errorf("expected listen 127.0.0.1:2088, got %s", listen2)
+	}
+}
+

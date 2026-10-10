@@ -139,6 +139,7 @@ var (
 	tunnelListen   = tunnelCmd.Flag("listen", "Local SOCKS5 listen address").Default("127.0.0.1:1080").String()
 	tunnelExecName = tunnelCmd.Flag("executor", "Egress executor's executor_id (see `relay status` -> executors[].executor_id)").Short('w').HintAction(getNodeHints).String()
 	tunnelNodeName = tunnelCmd.Flag("node", "Egress node ID (alias for --executor)").HintAction(getNodeHints).String()
+	tunnelJSON     = tunnelCmd.Flag("json", "Output as JSON").Bool()
 	tunnelAction   = tunnelCmd.Arg("action", "run|start|stop|status|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "restart", "upgrade").String()
 	tunnelUpgradePath = tunnelCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 
@@ -503,29 +504,6 @@ func daemonStopTunnel() {
 	}
 	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
 	daemonStop(tunnelInstanceName(target))
-}
-
-// daemonStatusTunnel 带 executor 查单实例;不带则列出全部隧道实例状态。
-func daemonStatusTunnel() error {
-	if *tunnelExecName != "" {
-		return daemonStatus(tunnelInstanceName(*tunnelExecName))
-	}
-	insts, err := daemon.ListInstances("tunnel")
-	if err != nil {
-		return err
-	}
-	if len(insts) == 0 {
-		fmt.Println("no tunnel instances")
-		return nil
-	}
-	for _, in := range insts {
-		if in.Status.Running {
-			fmt.Printf("tunnel-%s: running (pid %d)\nlog: %s\n", in.Name, in.Status.Pid, in.LogFile)
-		} else {
-			fmt.Printf("tunnel-%s: stopped\nlog: %s\n", in.Name, in.LogFile)
-		}
-	}
-	return nil
 }
 
 // daemonRestartTunnel 重启指定 executor 的隧道实例。
