@@ -1397,6 +1397,16 @@ func runLogs() {
 
 	ctx := context.Background()
 	targetNode := resolveNodeTarget(*logsNode, *logsExec)
+	if targetNode == "" {
+		if tasks, err := tb.TaskList(ctx, "", true); err == nil {
+			for _, t := range tasks {
+				if t.ID == *logsTaskID {
+					targetNode = t.Node
+					break
+				}
+			}
+		}
+	}
 	err = tb.TaskLogs(ctx, targetNode, *logsTaskID, *logsFollow, *logsTail, func(chunk backend.ExecChunk) {
 		if chunk.Stdout {
 			os.Stdout.WriteString(chunk.Data)
@@ -1433,6 +1443,16 @@ func runStop() {
 	defer cancel()
 
 	targetNode := resolveNodeTarget(*stopNode, *stopExec)
+	if targetNode == "" {
+		if tasks, err := tb.TaskList(ctx, "", true); err == nil {
+			for _, t := range tasks {
+				if t.ID == *stopTaskID {
+					targetNode = t.Node
+					break
+				}
+			}
+		}
+	}
 	if err := tb.TaskStop(ctx, targetNode, *stopTaskID); err != nil {
 		fmt.Fprintf(os.Stderr, "stop failed: %v\n", err)
 		os.Exit(1)
