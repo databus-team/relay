@@ -151,14 +151,16 @@ func legacyServerBase(data []byte) (serverBaseConfig, error) {
 	}, nil
 }
 
-func runServer() error {
-	path := *serverConfigPath
+func buildServerInstance(path string) (*server.Server, *server.Config, error) {
+	if path == "" {
+		path = *serverConfigPath
+	}
 	if path == "" {
 		// 未指定 --server-config 时,回退到全局 -c/--config 客户端配置文件(统一 config.yaml)。
 		path = *configPath
 	}
 	if path == "" {
-		return fmt.Errorf("no server config: pass --server-config or -c")
+		return nil, nil, fmt.Errorf("no server config: pass --server-config or -c")
 	}
 
 	expanded := path
@@ -170,7 +172,7 @@ func runServer() error {
 	}
 	data, err := os.ReadFile(expanded)
 	if err != nil {
-		return fmt.Errorf("read server config: %w", err)
+		return nil, nil, fmt.Errorf("read server config: %w", err)
 	}
 	data = []byte(os.ExpandEnv(string(data)))
 
@@ -181,42 +183,44 @@ func runServer() error {
 		base, err = legacyServerBase(data)
 	}
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	addr := base.addr
-	if *serverAddr != "" {
+	if serverAddr != nil && *serverAddr != "" {
 		addr = *serverAddr
 	}
 
 	watchDirs := base.watchDirs
-	for _, wd := range *serverWatchDirs {
-		parts := strings.SplitN(wd, ":", 2)
-		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-			fmt.Fprintf(os.Stderr, "Invalid watch format: %s (expected id:path)\n", wd)
-			continue
+	if serverWatchDirs != nil {
+		for _, wd := range *serverWatchDirs {
+			parts := strings.SplitN(wd, ":", 2)
+			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+				fmt.Fprintf(os.Stderr, "Invalid watch format: %s (expected id:path)\n", wd)
+				continue
+			}
+			watchDirs = append(watchDirs, server.WatchDirConfig{ID: parts[0], Dir: config.NormalizeWindowsPath(parts[1])})
 		}
-		watchDirs = append(watchDirs, server.WatchDirConfig{ID: parts[0], Dir: config.NormalizeWindowsPath(parts[1])})
 	}
 
 	tokens := base.tokens
-	if len(*serverToken) > 0 {
+	if serverToken != nil && len(*serverToken) > 0 {
 		tokens = *serverToken
 	}
 
 	tlsCert := base.tls.CertFile
 	tlsKey := base.tls.KeyFile
 	tlsEnabled := base.tls.Enabled
-	if *serverTLSCert != "" {
+	if serverTLSCert != nil && *serverTLSCert != "" {
 		tlsCert = *serverTLSCert
 		tlsEnabled = true
 	}
-	if *serverTLSKey != "" {
+	if serverTLSKey != nil && *serverTLSKey != "" {
 		tlsKey = *serverTLSKey
 	}
 
 	maxTunnels := base.maxTunnels
-	if *serverMaxTunnels > 0 {
+	if serverMaxTunnels != nil && *serverMaxTunnels > 0 {
 		maxTunnels = *serverMaxTunnels
 	}
 
@@ -231,11 +235,20 @@ func runServer() error {
 
 	srv, err := server.New(cfg)
 	if err != nil {
-		return fmt.Errorf("create server: %w", err)
+		return nil, nil, fmt.Errorf("create server: %w", err)
 	}
 	// 接线「受控自升级」换装:自检/ACK 在 server 内完成,换装由这里注入(停旧 → .prev →
 	// 替换 → 原地重启)。未接线时升级通道只回执 ACK。
 	srv.SetUpgradeSwap(transitSelfUpgrade)
+
+	return srv, &cfg, nil
+}
+
+func runServer() error {
+	srv, cfg, err := buildServerInstance("")
+	if err != nil {
+		return err
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -248,12 +261,12 @@ func runServer() error {
 		cancel()
 	}()
 
-	fmt.Printf("Starting relay server on %s\n", addr)
-	for _, wd := range watchDirs {
+	fmt.Printf("Starting relay server on %s\n", cfg.Addr)
+	for _, wd := range cfg.WatchDirs {
 		fmt.Printf("  Watching: %s -> %s\n", wd.ID, wd.Dir)
 	}
-	if tlsEnabled {
-		fmt.Printf("  TLS: %s\n", tlsCert)
+	if cfg.TLS.Enabled {
+		fmt.Printf("  TLS: %s\n", cfg.TLS.CertFile)
 	}
 
 	return srv.Serve(ctx)

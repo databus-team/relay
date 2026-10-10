@@ -193,6 +193,30 @@ func main() {
 				os.Exit(1)
 			}
 		}
+	case nodeCmd.FullCommand():
+		switch normalizedAction(*nodeAction) {
+		case "start":
+			if err := daemonStart("node"); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		case "stop":
+			daemonStop("node")
+		case "status":
+			if err := daemonStatus("node"); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		case "restart":
+			daemonRestart("node")
+		case "upgrade":
+			daemonUpgrade("node", *nodeUpgradePath)
+		default:
+			if err := runNode(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		}
 	case watchCmd.FullCommand():
 		switch normalizedAction(*watchAction) {
 		case "start":

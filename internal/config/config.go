@@ -16,6 +16,7 @@ import (
 type Config struct {
 	Name       string            `yaml:"name"`
 	Version    int               `yaml:"version"`
+	Node       *NodeConfig       `yaml:"node,omitempty"` // 逻辑对等节点配置
 	Backend    BackendConfig     `yaml:"backend"`
 	Workspaces []WorkspaceConfig `yaml:"workspaces"`
 	Server     *ServerConfig     `yaml:"server,omitempty"` // 仅 relay server 读取;其它端忽略
@@ -129,6 +130,7 @@ func loadFromBytes(data []byte) (*Config, error) {
 		}
 	}
 
+	cfg.NormalizeNode()
 	return &cfg, nil
 }
 

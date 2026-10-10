@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -66,6 +67,9 @@ type Server struct {
 	// upgradeMu 串行化换装:仅允许一条 upgrade 会话到达 ReplaceBinaryWithKeep + 重启,
 	// 防止两个并发 token 会话在同一 os.Executable 上竞争(双 Exec / .prev 竞争)。
 	upgradeMu sync.Mutex
+
+	readyCh   chan struct{}
+	readyOnce sync.Once
 }
 
 // pushRelayInfo 一次被中转发出的流式 push 的路由信息。
@@ -133,6 +137,7 @@ func New(cfg Config) (*Server, error) {
 		tunnels:       make(map[string]*tunnelEntry),
 		tunnelEnabled: cfg.TunnelEnabled,
 		maxTunnels:    maxTunnels,
+		readyCh:       make(chan struct{}),
 	}
 
 	for _, wd := range cfg.WatchDirs {
@@ -225,7 +230,20 @@ func (s *Server) SetUpgradeSwap(fn func(newBin string)) {
 	s.upgradeSwap = fn
 }
 
+// Ready 返回监听就绪信号 (通道闭合代表端口已成功绑定)
+func (s *Server) Ready() <-chan struct{} {
+	return s.readyCh
+}
+
 func (s *Server) Serve(ctx context.Context) error {
+	ln, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", s.addr, err)
+	}
+	defer ln.Close()
+
+	s.readyOnce.Do(func() { close(s.readyCh) })
+
 	httpServer := &http.Server{Addr: s.addr, Handler: s}
 
 	fw, err := NewFileWatcher(s)
@@ -248,10 +266,10 @@ func (s *Server) Serve(ctx context.Context) error {
 
 	if s.tls.Enabled {
 		log.Printf("[server] TLS enabled: %s", s.tls.CertFile)
-		return httpServer.ListenAndServeTLS(s.tls.CertFile, s.tls.KeyFile)
+		return httpServer.ServeTLS(ln, s.tls.CertFile, s.tls.KeyFile)
 	}
 
-	return httpServer.ListenAndServe()
+	return httpServer.Serve(ln)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
