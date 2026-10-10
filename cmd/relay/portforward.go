@@ -5,14 +5,10 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 
-	"github.com/user/relay/internal/config"
-	"github.com/user/relay/internal/daemon"
 	relaybackend "github.com/user/relay/internal/relay/backend"
 )
 
@@ -102,99 +98,45 @@ func parsePortForwardSpec(raw, defaultBind string) (*PortForwardSpec, error) {
 	}
 }
 
-// resolveTargetExecutor 解析目标执行方节点标识
-func resolveTargetExecutor(cfg *config.Config, nodeFlag, execFlag, watchFlag string) (string, error) {
-	target := resolveNodeTarget(nodeFlag, execFlag)
-	if target != "" {
-		return target, nil
-	}
-	w := watchFlag
-	if w == "" {
-		if inferred, err := resolveWorkspaceID(cfg, ""); err == nil {
-			w = inferred
+// StartPortForwardsForeground 在前台启动端口转发监听，随 context 取消或 stop 回调关闭
+func StartPortForwardsForeground(ctx context.Context, rb *relaybackend.RelayBackend, targetExec string, specs []*PortForwardSpec) (func(), error) {
+	var listeners []net.Listener
+	cleanup := func() {
+		for _, ln := range listeners {
+			_ = ln.Close()
 		}
 	}
-	if w != "" {
-		watchCfg, err := cfg.GetWorkspaceByID(w)
-		if err == nil && watchCfg.Executor != "" {
-			return watchCfg.Executor, nil
-		}
-	}
-	return "", fmt.Errorf("specify target node with -e/--node/--executor or bind to a workspace with -w")
-}
 
-// runPortForward 前台运行端口转发
-func runPortForward() {
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
-		os.Exit(1)
-	}
-	if cfg.Backend.Type != "relay" {
-		fmt.Fprintf(os.Stderr, "Error: port-forward requires backend.type=relay, got %q\n", cfg.Backend.Type)
-		os.Exit(1)
-	}
-
-	targetExec, err := resolveTargetExecutor(cfg, *portForwardNode, *portForwardExec, *portForwardWatch)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	ports := getPortForwardPorts()
-	if ports == "" {
-		fmt.Fprintf(os.Stderr, "Error: port mapping is required (e.g. relay pf 8080 or relay pf run 8080)\n")
-		os.Exit(1)
-	}
-
-	spec, err := parsePortForwardSpec(ports, *portForwardBind)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	rb, err := getRelayBackend(cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	listenAddr := fmt.Sprintf("%s:%d", spec.BindHost, spec.LocalPort)
-	ln, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Port-forward listen %s failed: %v\n", listenAddr, err)
-		os.Exit(1)
-	}
-	defer ln.Close()
-
-	if !isLoopbackAddr(spec.BindHost) {
-		fmt.Fprintf(os.Stderr, "WARNING: listening on %q (non-loopback). This port has no auth.\n", listenAddr)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		fmt.Fprintln(os.Stderr, "\nStopping port-forward...")
-		cancel()
-		ln.Close()
-	}()
-
-	fmt.Printf("Forwarding from %s -> %s:%d via %s (Ctrl-C to stop)\n", listenAddr, spec.RemoteHost, spec.RemotePort, targetExec)
-
-	for {
-		conn, err := ln.Accept()
+	for _, spec := range specs {
+		listenAddr := fmt.Sprintf("%s:%d", spec.BindHost, spec.LocalPort)
+		ln, err := net.Listen("tcp", listenAddr)
 		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			continue
+			cleanup()
+			return nil, fmt.Errorf("listen %s failed: %w", listenAddr, err)
 		}
-		go handlePortForwardConn(ctx, rb, targetExec, spec, conn)
+		listeners = append(listeners, ln)
+
+		if !isLoopbackAddr(spec.BindHost) {
+			fmt.Fprintf(os.Stderr, "WARNING: listening on %q (non-loopback). This port has no auth.\n", listenAddr)
+		}
+		fmt.Printf("➜ [port-forward] %s -> %s:%d via %s\n", listenAddr, spec.RemoteHost, spec.RemotePort, targetExec)
+
+		go func(l net.Listener, s *PortForwardSpec) {
+			go func() {
+				<-ctx.Done()
+				_ = l.Close()
+			}()
+			for {
+				conn, err := l.Accept()
+				if err != nil {
+					return
+				}
+				go handlePortForwardConn(ctx, rb, targetExec, s, conn)
+			}
+		}(ln, spec)
 	}
+
+	return cleanup, nil
 }
 
 func handlePortForwardConn(ctx context.Context, rb *relaybackend.RelayBackend, targetExec string, spec *PortForwardSpec, conn net.Conn) {
@@ -246,211 +188,4 @@ func handlePortForwardConn(ctx context.Context, rb *relaybackend.RelayBackend, t
 	}()
 
 	wg.Wait()
-}
-
-// 实例名派生与后台守护进程管理
-func pfInstanceName(executor string, localPort int) string {
-	var b strings.Builder
-	b.WriteString("pf-")
-	for _, r := range executor {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-			b.WriteRune(r)
-		default:
-			b.WriteByte('_')
-		}
-	}
-	b.WriteString(fmt.Sprintf("-%d", localPort))
-	return b.String()
-}
-
-func getPortForwardPorts() string {
-	if pfRunPorts != nil && *pfRunPorts != "" {
-		return *pfRunPorts
-	}
-	if pfStartPorts != nil && *pfStartPorts != "" {
-		return *pfStartPorts
-	}
-	if pfStopPorts != nil && *pfStopPorts != "" {
-		return *pfStopPorts
-	}
-	if pfStatusPorts != nil && *pfStatusPorts != "" {
-		return *pfStatusPorts
-	}
-	if pfRestartPorts != nil && *pfRestartPorts != "" {
-		return *pfRestartPorts
-	}
-	return ""
-}
-
-func daemonStartPortForward() error {
-	ports := getPortForwardPorts()
-	if ports == "" {
-		return fmt.Errorf("port mapping is required (e.g. relay pf start 8080)")
-	}
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		return err
-	}
-	targetExec, err := resolveTargetExecutor(cfg, *portForwardNode, *portForwardExec, *portForwardWatch)
-	if err != nil {
-		return err
-	}
-	spec, err := parsePortForwardSpec(ports, *portForwardBind)
-	if err != nil {
-		return err
-	}
-	instance := pfInstanceName(targetExec, spec.LocalPort)
-	args := []string{
-		"port-forward", "run", ports,
-		"-e", targetExec,
-		"--bind", spec.BindHost,
-		"-c", *configPath,
-	}
-	return daemonStartArgs(instance, args)
-}
-
-func daemonStopPortForward() {
-	ports := getPortForwardPorts()
-	if ports == "" {
-		fmt.Fprintf(os.Stderr, "Error: port mapping is required (e.g. relay pf stop 8080)\n")
-		return
-	}
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return
-	}
-	targetExec, err := resolveTargetExecutor(cfg, *portForwardNode, *portForwardExec, *portForwardWatch)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return
-	}
-	spec, err := parsePortForwardSpec(ports, *portForwardBind)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return
-	}
-	instance := pfInstanceName(targetExec, spec.LocalPort)
-	daemonStop(instance)
-}
-
-func daemonRestartPortForward() {
-	ports := getPortForwardPorts()
-	if ports == "" {
-		fmt.Fprintf(os.Stderr, "Error: port mapping is required (e.g. relay pf restart 8080)\n")
-		return
-	}
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return
-	}
-	targetExec, err := resolveTargetExecutor(cfg, *portForwardNode, *portForwardExec, *portForwardWatch)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return
-	}
-	spec, err := parsePortForwardSpec(ports, *portForwardBind)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return
-	}
-	instance := pfInstanceName(targetExec, spec.LocalPort)
-	args := []string{
-		"port-forward", "run", ports,
-		"-e", targetExec,
-		"--bind", spec.BindHost,
-		"-c", *configPath,
-	}
-	daemonRestartArgs(instance, args)
-}
-
-func daemonStatusPortForward() error {
-	targetExec := resolveNodeTarget(*portForwardNode, *portForwardExec)
-	ports := getPortForwardPorts()
-	if ports != "" && targetExec != "" {
-		spec, err := parsePortForwardSpec(ports, *portForwardBind)
-		if err == nil {
-			return daemonStatus(pfInstanceName(targetExec, spec.LocalPort))
-		}
-	}
-	insts, err := daemon.ListInstances("pf")
-	if err != nil {
-		return err
-	}
-	if len(insts) == 0 {
-		fmt.Println("No active port-forward instances found.")
-		return nil
-	}
-	fmt.Printf("%-24s %-10s %-8s %s\n", "INSTANCE", "STATUS", "PID", "LOG")
-	for _, inst := range insts {
-		st := "stopped"
-		pidStr := "-"
-		if inst.Status.Running {
-			st = "running"
-			pidStr = strconv.Itoa(inst.Status.Pid)
-		}
-		fmt.Printf("%-24s %-10s %-8s %s\n", inst.Name, st, pidStr, inst.LogFile)
-	}
-	return nil
-}
-
-// StartPortForwardsForeground 在前台启动端口转发监听，随 context 取消或 stop 回调关闭
-func StartPortForwardsForeground(ctx context.Context, rb *relaybackend.RelayBackend, targetExec string, specs []*PortForwardSpec) (func(), error) {
-	var listeners []net.Listener
-	cleanup := func() {
-		for _, ln := range listeners {
-			_ = ln.Close()
-		}
-	}
-
-	for _, spec := range specs {
-		listenAddr := fmt.Sprintf("%s:%d", spec.BindHost, spec.LocalPort)
-		ln, err := net.Listen("tcp", listenAddr)
-		if err != nil {
-			cleanup()
-			return nil, fmt.Errorf("listen %s failed: %w", listenAddr, err)
-		}
-		listeners = append(listeners, ln)
-
-		if !isLoopbackAddr(spec.BindHost) {
-			fmt.Fprintf(os.Stderr, "WARNING: listening on %q (non-loopback). This port has no auth.\n", listenAddr)
-		}
-		fmt.Printf("➜ [port-forward] %s -> %s:%d via %s\n", listenAddr, spec.RemoteHost, spec.RemotePort, targetExec)
-
-		go func(l net.Listener, s *PortForwardSpec) {
-			go func() {
-				<-ctx.Done()
-				_ = l.Close()
-			}()
-			for {
-				conn, err := l.Accept()
-				if err != nil {
-					return
-				}
-				go handlePortForwardConn(ctx, rb, targetExec, s, conn)
-			}
-		}(ln, spec)
-	}
-
-	return cleanup, nil
-}
-
-// StartPortForwardsBackground 为 specs 批量启动后台守护端口转发
-func StartPortForwardsBackground(targetExec string, specs []*PortForwardSpec, cfgPath string) error {
-	for _, spec := range specs {
-		ports := spec.String()
-		instance := pfInstanceName(targetExec, spec.LocalPort)
-		args := []string{
-			"port-forward", "run", ports,
-			"-e", targetExec,
-			"--bind", spec.BindHost,
-			"-c", cfgPath,
-		}
-		if err := daemonStartArgs(instance, args); err != nil {
-			return fmt.Errorf("start background port-forward %s: %w", ports, err)
-		}
-	}
-	return nil
 }

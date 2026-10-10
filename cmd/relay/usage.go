@@ -24,7 +24,7 @@ var categories = []CommandCategory{
 	},
 	{
 		Title: "Cluster & Network:",
-		Names: []string{"nodes", "port-forward", "tunnel"},
+		Names: []string{"nodes", "tunnel"},
 	},
 	{
 		Title: "Workspace & Sync:",

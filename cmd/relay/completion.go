@@ -88,7 +88,7 @@ type cmdSpec struct {
 
 var topCommands = []string{
 	"run", "ps", "logs", "stop",
-	"nodes", "port-forward", "tunnel",
+	"nodes", "tunnel",
 	"push", "pull", "diff", "undo", "ws", "sync",
 	"node", "version", "server-remote", "completion", "job",
 	"server", "watch", "list", "cleanup",
@@ -145,10 +145,6 @@ var commandSpecs = map[string]cmdSpec{
 	"tunnel": {
 		subcmds: []string{"run", "start", "stop", "status", "logs", "restart", "upgrade"},
 		flags:   []string{"--listen", "-w", "--executor", "--node", "--json", "-f", "--follow", "--tail"},
-	},
-	"port-forward": {
-		subcmds: []string{"run", "start", "stop", "status", "restart"},
-		flags:   []string{"-e", "--executor", "--node", "-w", "--watch", "--bind"},
 	},
 	"server": {
 		subcmds: []string{"run", "start", "stop", "status", "restart", "upgrade"},

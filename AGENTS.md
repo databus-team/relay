@@ -63,7 +63,6 @@ relay/
 | `ps` | `runPs` | List managed tasks across nodes |
 | `logs` | `runLogs` | Tail / stream task logs (`-f`, `--tail`) |
 | `stop` | `runStop` | Terminate process group by task ID |
-| `port-forward` (alias `pf`) | `cmd/relay/portforward.go` | Local port forward to remote service / daemon |
 | `undo` | `cmd/relay/git_ops.go` | Restore remote workspace shadow snapshot |
 | `diff` | `cmd/relay/git_ops.go` | Compare local/remote Git drift & conflict warning |
 | `job run` | `runJobRun` | Run one config job locally |
@@ -176,14 +175,13 @@ CLI usage (key forms):
 relay node [run|start|stop|status|restart]             # unified peer node daemon (hub + agent roles)
 relay watch [run|start|stop|status|restart|upgrade]   # executor (daemon actions)
 relay server [run|start|stop|status|restart|upgrade]  # transit (daemon actions)
-relay run [-w <workspace> | --node <node-id>] [--no-sync] [-f] [-d] <cmd...> # direct run / exec alias
-relay exec [-w <workspace> | --node <node-id>] [--no-sync] [-f] [-d] <cmd...>  # git diff sync default-on; -d = detached (30s foreground cap)
+relay run [-w <workspace> | --node <node-id>] [-p <port>] [--no-sync] [-f] [-d] <cmd...> # direct run / exec (Docker-style -p)
+relay exec [-w <workspace> | --node <node-id>] [-p <port>] [--no-sync] [-f] [-d] <cmd...>  # git diff sync default-on; -d = detached (30s foreground cap)
 relay nodes [-u|--usage] [--json]                      # cluster-wide peer nodes & topology state (alias: node ls, status)
 relay push [-w <workspace> | --node <node-id>] <file> [--no-jobs] [--dest <abs>]
 relay ps [--node <node-id>] [-a]                       # list tasks (TaskSupervisor)
 relay logs [--node <node-id>] <task-id> [-f] [--tail N] # tail / stream task logs
 relay stop [--node <node-id>] <task-id>                # terminate task process tree
-relay pf [local:]remote [--node <node-id>] [start|stop|status] # port-forward (alias: port-forward)
 relay diff [--node <node-id>] [-w <workspace>]         # inspect drift & conflict warning
 relay undo [--node <node-id>] [-w <workspace>] [--list|--snapshot <ref>] # restore remote snapshot
 relay job run [-w <id>] <jobid> [file]

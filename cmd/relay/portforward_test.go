@@ -90,23 +90,6 @@ func TestParsePortForwardSpec(t *testing.T) {
 	}
 }
 
-func TestPfInstanceName(t *testing.T) {
-	cases := []struct {
-		executor  string
-		localPort int
-		want      string
-	}{
-		{"node-1", 8080, "pf-node-1-8080"},
-		{"win.dev@lab", 3000, "pf-win_dev_lab-3000"},
-	}
-	for _, c := range cases {
-		got := pfInstanceName(c.executor, c.localPort)
-		if got != c.want {
-			t.Errorf("pfInstanceName(%q, %d) = %q, want %q", c.executor, c.localPort, got, c.want)
-		}
-	}
-}
-
 func TestPortForwardSpec_String(t *testing.T) {
 	cases := []struct {
 		spec *PortForwardSpec

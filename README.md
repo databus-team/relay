@@ -13,7 +13,7 @@ A Go-based daemon for monitoring remote directories and executing actions when f
 - **Push/Pull**: Upload and download files with streaming transfer and zstd compression
 - **Remote Exec & Git Sync**: Forward commands via WebSocket with real-time streaming; incremental Git diff sync runs **by default** before execution (opt out with `--no-sync`), with shadow snapshot protection
 - **Task Supervisor (Docker-style UX)**: Detached background execution (`exec -d`), task listing (`ps`), live log tailing (`logs -f`), and process group termination (`stop`)
-- **Port Forwarding (kubectl-style)**: Forward local ports to remote services (`relay pf 8080:8080`) over full-duplex tunnel stream with fail-closed network whitelist
+- **Port Forwarding (Docker-style -p)**: Forward local ports to remote command/service (`relay run -p 8080:8080`) over full-duplex tunnel stream without requiring network allowlist rules
 - **One-Click Undo & Drift Diff**: Restore overwritten remote workspaces instantly (`relay undo`) and inspect cross-node drift & file conflicts (`relay diff`)
 - **Config Hot-Reload**: Push config to a running watcher without restart
 - **Pluggable Backends**: Local filesystem, native relay (WebSocket), MCP SDK (HTTP SSE), JumpServer API
@@ -156,12 +156,16 @@ relay run --node linux-heavy "go test -v ./..."
 relay run -w web-app-patches "pytest tests/"            # syncs the local diff, then runs
 relay run -w web-app-patches --no-sync "pytest tests/"  # skip sync
 
+# Forward local port 8080 to remote 8080 while running command (Docker -p paradigm)
+relay run -w web-app-patches -p 8080:8080 "npm run dev"
+
 # Detached execution: Run in background (returns Task ID immediately, Docker-like UX)
 relay run -w web-app-patches -d "npm run dev"
 # Output: t-a1b2c3d4-1718000000
 ```
 
 Forwards a command to the remote side for execution. Requires a backend that supports `Exec` (local, fs_mcp, relay). The `-w` flag sets the working directory to the watch's `local_dir`. When omitted, `-w` is inferred from the cwd when it can be; otherwise `run/exec` falls back to its no-workspace behavior. Use `--node / -e <id>` to address a specific node by its ID directly.
+- **`-p, --publish [local:]remote`**: Forward local ports to the remote command (e.g. `-p 8080` or `-p 3000:8080`), automatically tearing down the forwarders when the command exits. Temporary development port forwards do not require `network_allow` whitelist rules.
 - **Git sync (ON by default — opt out with `--no-sync`):** Automatically detects uncommitted local Git modifications and untracked files, packs an incremental diff payload, and applies it to the remote workspace before executing the command. Includes base commit drift validation and automatic remote shadow snapshot backup (`refs/relay/backups/*`). Note: it carries **only the local working-tree diff, never unpushed commits**, and its source is the workspace's `local_dir` — which must be a valid Git repo **on the CLI machine** (otherwise sync is silently skipped).
 - `-f, --force-remote`: Force a sync even when the local tree is clean (creates a shadow snapshot on the remote first, then overwrites remote state).
 - `-d, --detach`: Runs the command in the background under the node's **TaskSupervisor**. Process trees are tracked cleanly (no orphaned child processes), stdout/stderr are persisted to `~/.relay/tasks/<task-id>/run.log`, and real-time output is broadcasted to subscribers.
@@ -223,25 +227,6 @@ extranet                 agent          Ready      feae97f+feae97f  -           
 intranet                 agent          Ready      feae97f+feae97f  -                13 ms
 ```
 
-### port-forward (pf) — Port Forwarding & Intranet Service Access
-
-```bash
-# Forward local port 8080 to remote executor port 8080 (similar to kubectl port-forward)
-relay pf 8080 -e node-1
-
-# Map local port 3000 to remote port 8080
-relay pf 3000:8080 -e node-1
-
-# Access an intranet database behind the executor node
-relay pf 5432:db.internal:5432 -e node-1
-
-# Run as background daemon (managed instance: pf-<node>-<port>)
-relay pf 8080 start -e node-1
-relay pf status              # list all active port-forward daemons
-relay pf 8080 stop -e node-1   # stop port-forward daemon
-```
-
-Opens a local TCP listener and pipes data directly through the transit WebSocket to the remote executor using full-duplex binary streams. The destination target is checked against the executor's `network_allow` whitelist (fail-closed security).
 
 ### diff — Cross-Node Workspace Drift & Conflict Analysis
 

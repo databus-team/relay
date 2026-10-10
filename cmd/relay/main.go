@@ -159,28 +159,6 @@ var (
 	tunnelUpgradeCmd = tunnelCmd.Command("upgrade", "Upgrade tunnel daemon binary")
 	tunnelUpgradePath = tunnelUpgradeCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 
-	// Port-forward command - 本地端口映射到远端服务 (类似 kubectl port-forward / docker -p)
-	portForwardCmd    = kingpin.Command("port-forward", "Forward local port to remote node (alias: pf)").Alias("pf")
-	portForwardExec   = portForwardCmd.Flag("executor", "Target executor node").Short('e').HintAction(getNodeHints).String()
-	portForwardNode   = portForwardCmd.Flag("node", "Target node ID (alias for --executor)").HintAction(getNodeHints).String()
-	portForwardWatch  = portForwardCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').HintAction(getWorkspaceHints).String()
-	portForwardBind   = portForwardCmd.Flag("bind", "Local IP to bind to").Default("127.0.0.1").String()
-
-	// port-forward 子命令
-	pfRunCmd = portForwardCmd.Command("run", "Run port forwarding in foreground")
-	pfRunPorts = pfRunCmd.Arg("port", "[local:]remote port (e.g. 8080:8080 or 8080)").String()
-
-	pfStartCmd = portForwardCmd.Command("start", "Start port forwarding daemon in background")
-	pfStartPorts = pfStartCmd.Arg("port", "[local:]remote port (e.g. 8080:8080 or 8080)").Required().String()
-
-	pfStopCmd = portForwardCmd.Command("stop", "Stop running port forwarding daemon")
-	pfStopPorts = pfStopCmd.Arg("port", "[local:]remote port (e.g. 8080:8080 or 8080)").String()
-
-	pfStatusCmd = portForwardCmd.Command("status", "Show status of port forwarding instances")
-	pfStatusPorts = pfStatusCmd.Arg("port", "[local:]remote port (e.g. 8080:8080 or 8080)").String()
-
-	pfRestartCmd = portForwardCmd.Command("restart", "Restart port forwarding daemon")
-	pfRestartPorts = pfRestartCmd.Arg("port", "[local:]remote port (e.g. 8080:8080 or 8080)").Required().String()
 
 	// Undo command - 一键恢复远端工作区影子快照 (防误操作与冲突覆盖)
 	undoCmd      = kingpin.Command("undo", "Restore remote workspace shadow snapshot")
@@ -214,7 +192,6 @@ func main() {
 		logx.SetDebug(true)
 	}
 
-	os.Args = rewritePfArgs(os.Args)
 
 	parseCtx, parseErr := kingpin.CommandLine.ParseContext(os.Args[1:])
 	if parseErr == nil && parseCtx != nil {
@@ -333,28 +310,6 @@ func main() {
 		default:
 			app.Usage(os.Args[1:])
 		}
-	case selectedCmd == "port-forward" || strings.HasPrefix(selectedCmd, "port-forward "):
-		sub := strings.TrimSpace(strings.TrimPrefix(selectedCmd, "port-forward"))
-		switch sub {
-		case "start":
-			if err := daemonStartPortForward(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		case "stop":
-			daemonStopPortForward()
-		case "status":
-			if err := daemonStatusPortForward(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		case "restart":
-			daemonRestartPortForward()
-		case "run":
-			runPortForward()
-		default:
-			app.Usage(os.Args[1:])
-		}
 	case selectedCmd == pullCmd.FullCommand():
 		runPull()
 	case selectedCmd == pushCmd.FullCommand():
@@ -396,51 +351,6 @@ func main() {
 	}
 }
 
-// rewritePfArgs 兼容旧用法：如果用户输入 `relay pf 8080 start` 或 `relay pf -e node 8080 start`，
-// 自动转换为 `relay pf start 8080` 供标准子命令解析
-func rewritePfArgs(args []string) []string {
-	if len(args) < 2 {
-		return args
-	}
-	cmdIdx := -1
-	for i, a := range args {
-		if a == "port-forward" || a == "pf" {
-			cmdIdx = i
-			break
-		}
-	}
-	if cmdIdx == -1 {
-		return args
-	}
-
-	actions := map[string]bool{"start": true, "stop": true, "status": true, "restart": true, "run": true}
-	subArgs := args[cmdIdx+1:]
-	var nonFlags []int
-	for i := 0; i < len(subArgs); i++ {
-		a := subArgs[i]
-		if strings.HasPrefix(a, "-") {
-			if a == "-e" || a == "--executor" || a == "--node" || a == "-w" || a == "--watch" || a == "--bind" || a == "-c" || a == "--config" {
-				i++
-			}
-			continue
-		}
-		nonFlags = append(nonFlags, i)
-	}
-	if len(nonFlags) >= 2 {
-		first := subArgs[nonFlags[0]]
-		second := subArgs[nonFlags[1]]
-		if !actions[first] && actions[second] {
-			idx1 := cmdIdx + 1 + nonFlags[0]
-			idx2 := cmdIdx + 1 + nonFlags[1]
-			newArgs := make([]string, len(args))
-			copy(newArgs, args)
-			newArgs[idx1] = second
-			newArgs[idx2] = first
-			return newArgs
-		}
-	}
-	return args
-}
 
 // daemonStart 已运行则提示,否则 detached 拉起 `relay <name> run -c <config>` 并记录 pid。
 func daemonStart(name string) error {
@@ -1284,24 +1194,18 @@ func runExec() {
 		}
 	}
 
-	if len(pfSpecs) > 0 {
-		if *execDetach {
-			if err := StartPortForwardsBackground(targetExecutor, pfSpecs, *configPath); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to start background port-forward: %v\n", err)
-			}
-		} else {
-			rb, ok := b.(*relaybackend.RelayBackend)
-			if !ok {
-				fmt.Fprintf(os.Stderr, "Error: port-forward requires relay backend\n")
-				os.Exit(1)
-			}
-			stopPF, err := StartPortForwardsForeground(ctx, rb, targetExecutor, pfSpecs)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Port-forward error: %v\n", err)
-				os.Exit(1)
-			}
-			defer stopPF()
+	if len(pfSpecs) > 0 && !*execDetach {
+		rb, ok := b.(*relaybackend.RelayBackend)
+		if !ok {
+			fmt.Fprintf(os.Stderr, "Error: port-forward requires relay backend\n")
+			os.Exit(1)
 		}
+		stopPF, err := StartPortForwardsForeground(ctx, rb, targetExecutor, pfSpecs)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Port-forward error: %v\n", err)
+			os.Exit(1)
+		}
+		defer stopPF()
 	}
 
 	// Get command directory, default to /tmp/relay-commands
