@@ -70,8 +70,8 @@ var (
 	jobRunID    = jobRun.Arg("jobid", "Job ID to run").Required().String()
 	jobRunFile  = jobRun.Arg("file", "Local file to bind to {file_path} and friends").String()
 
-	// Exec command - command forwarding (requires watch running)
-	execCmd         = kingpin.Command("exec", "Forward command to remote executor")
+	// Exec command - command forwarding (requires watch running, alias: run)
+	execCmd         = kingpin.Command("exec", "Forward command to remote executor (alias: run)").Alias("run")
 	execWatch       = execCmd.Flag("watch", "Target workspace ID (defaults to current directory name); mutually exclusive with --node/--executor").Short('w').String()
 	execExec        = execCmd.Flag("executor", "Route directly to this executor (executor_id) without a workspace binding").Short('e').String()
 	execNode        = execCmd.Flag("node", "Target node ID (alias for --executor)").String()
