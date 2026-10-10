@@ -201,6 +201,25 @@ relay stop -e node-1 t-a1b2c3d4-1718000000
 
 Stops a running task. The executor cleans up the entire process tree using process groups/signals on Unix or `taskkill /T /F` on Windows, leaving no orphaned server processes behind.
 
+### nodes — List Cluster Topology & Roles
+
+```bash
+# List all peer nodes across topology (similar to kubectl get nodes)
+relay nodes
+
+# Output in JSON format
+relay nodes --json
+```
+
+Displays cluster topology with node identities, roles (`hub`, `agent`), operational readiness, platform architecture, and end-to-end latency:
+```
+NAME                     ROLES          STATUS     VERSION          PLATFORM         LATENCY
+CT-MBP.local (local)     agent          Ready      feae97f+feae97f  darwin/arm64     -
+hub (transit)            hub            Ready      feae97f+feae97f  linux/amd64      9 ms
+extranet                 agent          Ready      feae97f+feae97f  -                12 ms
+intranet                 agent          Ready      feae97f+feae97f  -                13 ms
+```
+
 ### port-forward (pf) — Port Forwarding & Intranet Service Access
 
 ```bash

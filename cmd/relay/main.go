@@ -108,6 +108,10 @@ var (
 	statusCmd     = kingpin.Command("status", "整座部署连通性体检:本地→中转 与 中转→每个执行方 的时延及版本")
 	statusJSONOut = statusCmd.Flag("json", "Output as JSON").Bool()
 
+	// Nodes command - 查看全网节点拓扑状态与角色 (类似 kubectl get nodes / docker node ls)
+	nodesCmd     = kingpin.Command("nodes", "List all peer nodes across topology (alias: node ls)")
+	nodesJSONOut = nodesCmd.Flag("json", "Output as JSON").Bool()
+
 	// Cleanup command - remove stale command files
 	cleanupCmd   = kingpin.Command("cleanup", "Remove stale command and result files from remote")
 	cleanupWatch = cleanupCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
@@ -256,6 +260,8 @@ func main() {
 		runExec()
 	case statusCmd.FullCommand():
 		runStatus()
+	case nodesCmd.FullCommand():
+		runNodes()
 	case listCmd.FullCommand():
 		runList()
 	case cleanupCmd.FullCommand():
@@ -1515,6 +1521,111 @@ func printStatus(backendName string, st protocol.StatusResponse, jsonOut bool) {
 	for _, e := range st.Executors {
 		fmt.Printf("    %s  transit→executor %s  total %s  (%s)\n",
 			e.ExecutorID, segmentText(e.Seg2), segmentText(e.Total), identStr(e.Version))
+	}
+}
+
+// PeerNodeItem 描述拓扑中的一个对等节点
+type PeerNodeItem struct {
+	ID       string `json:"id"`
+	Role     string `json:"role"`
+	Status   string `json:"status"`
+	Platform string `json:"platform"`
+	Version  string `json:"version"`
+	Latency  string `json:"latency"`
+}
+
+// runNodes 查看全网节点拓扑状态与角色 (类似 kubectl get nodes / docker node ls)
+func runNodes() {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	b, err := getBackendWithAdaptiveLoopback(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
+		os.Exit(1)
+	}
+
+	rb, ok := b.(*relaybackend.RelayBackend)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Error: nodes command requires relay backend, got %q\n", cfg.Backend.Type)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), statusTimeout)
+	defer cancel()
+
+	st, err := rb.Status(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to query cluster status: %v\n", err)
+		os.Exit(1)
+	}
+
+	var nodes []PeerNodeItem
+
+	// 1. 本机节点
+	localPlatform := fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH)
+	localVer := ident(protocol.VersionInfo{Version: version.Version, Commit: version.Commit})
+	localRoles := "client"
+	if cfg.IsHub() && cfg.IsAgent() {
+		localRoles = "hub,agent"
+	} else if cfg.IsHub() {
+		localRoles = "hub"
+	} else if cfg.IsAgent() {
+		localRoles = "agent"
+	}
+	nodes = append(nodes, PeerNodeItem{
+		ID:       cfg.NodeID() + " (local)",
+		Role:     localRoles,
+		Status:   "Ready",
+		Platform: localPlatform,
+		Version:  localVer,
+		Latency:  "-",
+	})
+
+	// 2. Hub / Transit 节点
+	transitPlatform := "-"
+	if st.Transit.GOOS != "" {
+		transitPlatform = fmt.Sprintf("%s/%s", st.Transit.GOOS, st.Transit.GOARCH)
+	}
+	nodes = append(nodes, PeerNodeItem{
+		ID:       "hub (transit)",
+		Role:     "hub",
+		Status:   "Ready",
+		Platform: transitPlatform,
+		Version:  ident(st.Transit),
+		Latency:  segmentText(st.Seg1),
+	})
+
+	// 3. 远端 Agent / Executor 节点
+	for _, e := range st.Executors {
+		stText := "Ready"
+		if e.Seg2.Unavailable != "" {
+			stText = "NotReady"
+		}
+		nodes = append(nodes, PeerNodeItem{
+			ID:       e.ExecutorID,
+			Role:     "agent",
+			Status:   stText,
+			Platform: "-",
+			Version:  identStr(e.Version),
+			Latency:  segmentText(e.Total),
+		})
+	}
+
+	if *nodesJSONOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(nodes)
+		return
+	}
+
+	// 文本表格输出 (类似 kubectl get nodes)
+	fmt.Printf("%-24s %-14s %-10s %-16s %-16s %s\n", "NAME", "ROLES", "STATUS", "VERSION", "PLATFORM", "LATENCY")
+	for _, n := range nodes {
+		fmt.Printf("%-24s %-14s %-10s %-16s %-16s %s\n", n.ID, n.Role, n.Status, n.Version, n.Platform, n.Latency)
 	}
 }
 
