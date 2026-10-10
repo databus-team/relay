@@ -113,14 +113,26 @@ func runNode() error {
 			fmt.Printf("[Node] Starting Agent (node_id: %s)\n", cfg.Node.ID)
 			relaybackend.SetExecutorRole(true)
 
+			// 确保作为 Agent 启动时开启执行器角色与节点标识绑定
+			if cfg.Backend.Config == nil {
+				cfg.Backend.Config = make(map[string]interface{})
+			}
+			cfg.Backend.Config["executor"] = true
+			if _, ok := cfg.Backend.Config["executor_id"]; !ok || cfg.Backend.Config["executor_id"] == "" {
+				cfg.Backend.Config["executor_id"] = cfg.Node.ID
+			}
+
 			// 若同机也是 Hub，且后端类型是 relay，确保后端连接走本地回环
 			if isHub && cfg.Backend.Type == "relay" {
 				localURL := cfg.GetLocalHubURL()
 				if localURL != "" {
-					if cfg.Backend.Config == nil {
-						cfg.Backend.Config = make(map[string]interface{})
-					}
 					cfg.Backend.Config["url"] = localURL
+				}
+				if srvConf != nil && len(srvConf.Auth.Tokens) > 0 {
+					cfg.Backend.Config["token"] = srvConf.Auth.Tokens[0]
+				}
+				if _, ok := cfg.Backend.Config["network_allow"]; !ok {
+					cfg.Backend.Config["network_allow"] = []string{"*"}
 				}
 			}
 

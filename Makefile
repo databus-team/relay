@@ -4,7 +4,7 @@ BINARY_NAME := relay
 MAIN_PATH := ./cmd/relay
 
 GOCMD := go
-GOBUILD := $(GOCMD) build
+GOBUILD := $(GOCMD) build -buildvcs=false
 GOTEST := $(GOCMD) test
 GOCLEAN := $(GOCMD) clean
 GOMOD := $(GOCMD) mod

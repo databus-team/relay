@@ -2,10 +2,12 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -133,7 +135,11 @@ func (c *Client) establish(ctx context.Context) error {
 }
 
 func (c *Client) dial(ctx context.Context) error {
-	dialer := websocket.Dialer{}
+	dialer := websocket.Dialer{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: strings.Contains(c.url, "127.0.0.1") || strings.Contains(c.url, "localhost"),
+		},
+	}
 	conn, httpResp, err := dialer.DialContext(ctx, c.url, c.headers)
 	if err != nil {
 		if httpResp != nil {
@@ -167,6 +173,15 @@ func (c *Client) dial(ctx context.Context) error {
 	if resp.Type != protocol.MsgConnectAck {
 		conn.Close()
 		return fmt.Errorf("unexpected message type: %s", resp.Type)
+	}
+
+	var connResp protocol.ConnectResponse
+	if b, err := json.Marshal(resp.Payload); err == nil {
+		_ = json.Unmarshal(b, &connResp)
+	}
+	if !connResp.OK {
+		conn.Close()
+		return fmt.Errorf("connect rejected by server: %s", connResp.Error)
 	}
 
 	c.setConn(conn)

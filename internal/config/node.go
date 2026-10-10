@@ -56,23 +56,31 @@ func (c *Config) NormalizeNode() {
 		c.Node.AllowedControllers = []string{"*"}
 	}
 
-	// 5. 若承担 Hub 且同时承担 Agent，自动补全/纠正本地回环 relay 后端
-	if c.IsAgent() && c.IsHub() {
-		if c.Backend.Type == "" {
-			c.Backend.Type = "relay"
-		}
+	// 5. 若承担 Agent 角色，确保 executor 为 true，且绑定当前节点 ID
+	if c.IsAgent() {
 		if c.Backend.Config == nil {
 			c.Backend.Config = make(map[string]interface{})
 		}
-		if _, ok := c.Backend.Config["url"]; !ok || c.Backend.Config["url"] == "" {
-			c.Backend.Config["url"] = c.GetLocalHubURL()
+		if _, ok := c.Backend.Config["executor"]; !ok {
+			c.Backend.Config["executor"] = true
 		}
 		if _, ok := c.Backend.Config["executor_id"]; !ok || c.Backend.Config["executor_id"] == "" {
 			c.Backend.Config["executor_id"] = c.NodeID()
 		}
-		if _, ok := c.Backend.Config["token"]; !ok {
+	}
+
+	// 6. 若承担 Hub 且同时承担 Agent，自动补全/纠正本地回环 relay 后端
+	if c.IsAgent() && c.IsHub() {
+		if c.Backend.Type == "" {
+			c.Backend.Type = "relay"
+		}
+		if _, ok := c.Backend.Config["url"]; !ok || c.Backend.Config["url"] == "" {
+			c.Backend.Config["url"] = c.GetLocalHubURL()
+		}
+		tok, hasTok := c.Backend.Config["token"].(string)
+		if !hasTok || tok == "" || strings.HasPrefix(tok, "${") {
 			if c.Server != nil && len(c.Server.Auth.Tokens) > 0 {
-				c.Backend.Config["token"] = c.Server.Auth.Tokens[0]
+				c.Backend.Config["token"] = os.ExpandEnv(c.Server.Auth.Tokens[0])
 			}
 		}
 		if _, ok := c.Backend.Config["command_dir"]; !ok {
