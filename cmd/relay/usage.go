@@ -35,7 +35,7 @@ var categories = []CommandCategory{
 	},
 	{
 		Title: "Utility:",
-		Names: []string{"version", "server-remote", "job run"},
+		Names: []string{"version", "server-remote", "completion", "job run"},
 	},
 	{
 		Title: "Legacy / Archive:",

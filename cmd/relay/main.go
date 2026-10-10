@@ -47,19 +47,19 @@ var (
 
 	// Pull command - download single file (requires filename)
 	pullCmd    = kingpin.Command("pull", "Pull file from remote workspace")
-	pullWatch  = pullCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
+	pullWatch  = pullCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').HintAction(getWorkspaceHints).String()
 	pullFile   = pullCmd.Arg("filename", "Remote filename to download").Required().String()
 	pullDelete = pullCmd.Flag("delete", "Delete the remote file after a successful pull").Short('d').Bool()
 
 	// List command - list remote directory
 	listCmd   = kingpin.Command("list", "List files in remote watch directory")
-	listWatch = listCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
+	listWatch = listCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').HintAction(getWorkspaceHints).String()
 
 	// Push command - upload files, optionally without running workspace jobs
 	pushCmd    = kingpin.Command("push", "Push files to remote workspace and trigger jobs")
-	pushWatch  = pushCmd.Flag("watch", "Target workspace ID (defaults to current directory name); mutually exclusive with --node/--executor").Short('w').String()
-	pushExec   = pushCmd.Flag("executor", "Route directly to this executor (executor_id) without a workspace binding").Short('e').String()
-	pushNode   = pushCmd.Flag("node", "Target node ID (alias for --executor)").String()
+	pushWatch  = pushCmd.Flag("watch", "Target workspace ID (defaults to current directory name); mutually exclusive with --node/--executor").Short('w').HintAction(getWorkspaceHints).String()
+	pushExec   = pushCmd.Flag("executor", "Route directly to this executor (executor_id) without a workspace binding").Short('e').HintAction(getNodeHints).String()
+	pushNode   = pushCmd.Flag("node", "Target node ID (alias for --executor)").HintAction(getNodeHints).String()
 	pushSrc    = pushCmd.Arg("source", "Source file to push").Required().String()
 	pushDest   = pushCmd.Flag("dest", "Destination absolute path on the executor (defaults to <watch_dir>/<filename>; requires --no-jobs)").String()
 	pushNoJobs = pushCmd.Flag("no-jobs", "Transfer only; do not run workspace jobs on the remote").Bool()
@@ -67,15 +67,15 @@ var (
 	// Job command - run config-defined jobs locally
 	jobCmd      = kingpin.Command("job", "Run configured jobs locally")
 	jobRun      = jobCmd.Command("run", "Run a configured job manually on local node")
-	jobRunWatch = jobRun.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
+	jobRunWatch = jobRun.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').HintAction(getWorkspaceHints).String()
 	jobRunID    = jobRun.Arg("jobid", "Job ID to run").Required().String()
 	jobRunFile  = jobRun.Arg("file", "Local file to bind to {file_path} and friends").String()
 
 	// Run command - command forwarding & execution (alias: exec)
 	execCmd         = kingpin.Command("run", "Run command on remote node (alias: exec)").Alias("exec")
-	execWatch       = execCmd.Flag("watch", "Target workspace ID (defaults to current directory name); mutually exclusive with --node/--executor").Short('w').String()
-	execExec        = execCmd.Flag("executor", "Route directly to this executor (executor_id) without a workspace binding").Short('e').String()
-	execNode        = execCmd.Flag("node", "Target node ID (alias for --executor)").String()
+	execWatch       = execCmd.Flag("watch", "Target workspace ID (defaults to current directory name); mutually exclusive with --node/--executor").Short('w').HintAction(getWorkspaceHints).String()
+	execExec        = execCmd.Flag("executor", "Route directly to this executor (executor_id) without a workspace binding").Short('e').HintAction(getNodeHints).String()
+	execNode        = execCmd.Flag("node", "Target node ID (alias for --executor)").HintAction(getNodeHints).String()
 	execForceRemote = execCmd.Flag("force-remote", "Force overwrite remote state (creates shadow snapshot on remote first)").Short('f').Bool()
 	execNoSync      = execCmd.Flag("no-sync", "Skip git incremental sync before execution").Bool()
 	execDetach      = execCmd.Flag("detach", "Run command in background as daemon task (returns TaskID)").Short('d').Bool()
@@ -86,8 +86,8 @@ var (
 	// ps command - 查询后台任务
 	psCmd  = kingpin.Command("ps", "List managed background tasks (similar to docker ps)")
 	psAll  = psCmd.Flag("all", "Show all tasks (default shows running only)").Short('a').Bool()
-	psExec = psCmd.Flag("executor", "Filter tasks by executor node").Short('e').String()
-	psNode = psCmd.Flag("node", "Filter tasks by node ID (alias for --executor)").String()
+	psExec = psCmd.Flag("executor", "Filter tasks by executor node").Short('e').HintAction(getNodeHints).String()
+	psNode = psCmd.Flag("node", "Filter tasks by node ID (alias for --executor)").HintAction(getNodeHints).String()
 	psJSON = psCmd.Flag("json", "Output as JSON").Bool()
 
 	// logs command - 查看任务日志
@@ -95,14 +95,14 @@ var (
 	logsTaskID = logsCmd.Arg("task-id", "Task ID to view").Required().String()
 	logsFollow = logsCmd.Flag("follow", "Follow log output").Short('f').Bool()
 	logsTail   = logsCmd.Flag("tail", "Number of lines to show from the end").Default("100").Int()
-	logsExec   = logsCmd.Flag("executor", "Target executor node").Short('e').String()
-	logsNode   = logsCmd.Flag("node", "Target node ID (alias for --executor)").String()
+	logsExec   = logsCmd.Flag("executor", "Target executor node").Short('e').HintAction(getNodeHints).String()
+	logsNode   = logsCmd.Flag("node", "Target node ID (alias for --executor)").HintAction(getNodeHints).String()
 
 	// stop command - 终止后台任务
 	stopCmd    = kingpin.Command("stop", "Terminate running task process tree (similar to docker stop)")
 	stopTaskID = stopCmd.Arg("task-id", "Task ID to stop").Required().String()
-	stopExec   = stopCmd.Flag("executor", "Target executor node").Short('e').String()
-	stopNode   = stopCmd.Flag("node", "Target node ID (alias for --executor)").String()
+	stopExec   = stopCmd.Flag("executor", "Target executor node").Short('e').HintAction(getNodeHints).String()
+	stopNode   = stopCmd.Flag("node", "Target node ID (alias for --executor)").HintAction(getNodeHints).String()
 
 	// Nodes command - 查看全网节点拓扑状态与角色 (类似 kubectl get nodes / docker node ls; alias: status)
 	nodesCmd      = kingpin.Command("nodes", "List cluster peer nodes and topology (alias: status)").Alias("status")
@@ -111,17 +111,17 @@ var (
 
 	// Cleanup command - remove stale command files
 	cleanupCmd   = kingpin.Command("cleanup", "Clean up stale remote commands and results")
-	cleanupWatch = cleanupCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
+	cleanupWatch = cleanupCmd.Flag("watch", "Target watch ID").Short('w').Required().HintAction(getWorkspaceHints).String()
 
 	// Sync command - push config to remote watcher for hot reload
 	syncCmd      = kingpin.Command("sync", "Push config to remote node for live reload")
-	syncExecutor = syncCmd.Flag("executor", "Target executor's executor_id (default = this config's backend executor_id)").Short('e').String()
-	syncNode     = syncCmd.Flag("node", "Target node ID (alias for --executor)").String()
+	syncExecutor = syncCmd.Flag("executor", "Target executor's executor_id (default = this config's backend executor_id)").Short('e').HintAction(getNodeHints).String()
+	syncNode     = syncCmd.Flag("node", "Target node ID (alias for --executor)").HintAction(getNodeHints).String()
 
 	// Workspaces command - list configured workspaces from config
 	// (alias: `workspaces`; kingpin v2 doesn't render aliases in --help)
 	wsCmd     = kingpin.Command("ws", "List configured workspaces (alias: workspaces)").Alias("workspaces")
-	wsName    = wsCmd.Flag("name", "Show details for a specific workspace ID").String()
+	wsName    = wsCmd.Flag("name", "Show details for a specific workspace ID").HintAction(getWorkspaceHints).String()
 	wsJSON    = wsCmd.Flag("json", "Output as JSON").Bool()
 	wsVerbose = wsCmd.Flag("verbose", "Show detailed table output").Short('v').Bool()
 
@@ -137,8 +137,8 @@ var (
 	// Tunnel command - 本地 SOCKS5 出网隧道,经所选 executor 出口访问内网白名单目标。
 	tunnelCmd      = kingpin.Command("tunnel", "Open SOCKS5 egress tunnel through remote node")
 	tunnelListen   = tunnelCmd.Flag("listen", "Local SOCKS5 listen address").Default("127.0.0.1:1080").String()
-	tunnelExecName = tunnelCmd.Flag("executor", "Egress executor's executor_id (see `relay status` -> executors[].executor_id)").Short('w').String()
-	tunnelNodeName = tunnelCmd.Flag("node", "Egress node ID (alias for --executor)").String()
+	tunnelExecName = tunnelCmd.Flag("executor", "Egress executor's executor_id (see `relay status` -> executors[].executor_id)").Short('w').HintAction(getNodeHints).String()
+	tunnelNodeName = tunnelCmd.Flag("node", "Egress node ID (alias for --executor)").HintAction(getNodeHints).String()
 	tunnelAction   = tunnelCmd.Arg("action", "run|start|stop|status|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "restart", "upgrade").String()
 	tunnelUpgradePath = tunnelCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 
@@ -146,24 +146,24 @@ var (
 	portForwardCmd    = kingpin.Command("port-forward", "Forward local port to remote node (alias: pf)").Alias("pf")
 	portForwardPorts  = portForwardCmd.Arg("port", "[local:]remote port (e.g. 8080:8080 or 8080)").String()
 	portForwardAction = portForwardCmd.Arg("action", "run|start|stop|status|restart (default: run)").HintOptions("run", "start", "stop", "status", "restart").String()
-	portForwardExec   = portForwardCmd.Flag("executor", "Target executor node").Short('e').String()
-	portForwardNode   = portForwardCmd.Flag("node", "Target node ID (alias for --executor)").String()
-	portForwardWatch  = portForwardCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').String()
+	portForwardExec   = portForwardCmd.Flag("executor", "Target executor node").Short('e').HintAction(getNodeHints).String()
+	portForwardNode   = portForwardCmd.Flag("node", "Target node ID (alias for --executor)").HintAction(getNodeHints).String()
+	portForwardWatch  = portForwardCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').HintAction(getWorkspaceHints).String()
 	portForwardBind   = portForwardCmd.Flag("bind", "Local IP to bind to").Default("127.0.0.1").String()
 
 	// Undo command - 一键恢复远端工作区影子快照 (防误操作与冲突覆盖)
 	undoCmd      = kingpin.Command("undo", "Restore remote workspace shadow snapshot")
-	undoExec     = undoCmd.Flag("executor", "Target executor node").Short('e').String()
-	undoNode     = undoCmd.Flag("node", "Target node ID (alias for --executor)").String()
-	undoWatch    = undoCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').String()
+	undoExec     = undoCmd.Flag("executor", "Target executor node").Short('e').HintAction(getNodeHints).String()
+	undoNode     = undoCmd.Flag("node", "Target node ID (alias for --executor)").HintAction(getNodeHints).String()
+	undoWatch    = undoCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').HintAction(getWorkspaceHints).String()
 	undoList     = undoCmd.Flag("list", "List available snapshots on remote node").Short('l').Bool()
 	undoSnapshot = undoCmd.Flag("snapshot", "Specific snapshot ref to restore (default: latest)").String()
 
 	// Diff command - 对比本地与远端 Git 状态及冲突预警
 	diffCmd   = kingpin.Command("diff", "Inspect workspace Git drift and conflict warnings")
-	diffExec  = diffCmd.Flag("executor", "Target executor node").Short('e').String()
-	diffNode  = diffCmd.Flag("node", "Target node ID (alias for --executor)").String()
-	diffWatch = diffCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').String()
+	diffExec  = diffCmd.Flag("executor", "Target executor node").Short('e').HintAction(getNodeHints).String()
+	diffNode  = diffCmd.Flag("node", "Target node ID (alias for --executor)").HintAction(getNodeHints).String()
+	diffWatch = diffCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').HintAction(getWorkspaceHints).String()
 )
 
 func main() {
@@ -278,6 +278,8 @@ func main() {
 		runStop()
 	case serverRemoteCmd.FullCommand():
 		runServerRemote()
+	case completionCmd.FullCommand():
+		runCompletion()
 	case jobRun.FullCommand():
 		runJobRun()
 	case tunnelCmd.FullCommand():

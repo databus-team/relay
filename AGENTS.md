@@ -192,6 +192,7 @@ relay ws [-v] [--name <id>]                            # alias: relay workspaces
 relay version [--json]                                 # local build version
 relay server-remote [--binary <path>] [--expect <ver+commit>]  # one-command transit self-upgrade
 relay tunnel [--listen 127.0.0.1:1080] -w <egress-executor-id>  # SOCKS5 (egress executor_id)
+relay completion <bash|zsh|fish|powershell>             # generate shell completion script
 relay pull [-w <workspace>] <filename> [-dl]    relay list [-w]    relay cleanup [-w <workspace>]
 ```
 
