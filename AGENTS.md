@@ -59,7 +59,13 @@ relay/
 | `ws` (alias `workspaces`) | `runWorkspaces`/`resolveWatches` | List/JSON/verbose workspace table |
 | `sync` (`-e` target executor) | `runSync` | WS streaming to executor, or cmd-file fallback |
 | `push` (direct + `--no-jobs`/`--dest`) | `runPush` · `runLocalJobsForPush` | Direct-to-executor with jobs, or transport-only |
-| `exec` | `runExec` | Streaming via `ExecStreamBackend`, else exec |
+| `exec` | `runExec` | Streaming via `ExecStreamBackend`, `--sync` (git diff), `-d` (detach) |
+| `ps` | `runPs` | List managed tasks across nodes |
+| `logs` | `runLogs` | Tail / stream task logs (`-f`, `--tail`) |
+| `stop` | `runStop` | Terminate process group by task ID |
+| `port-forward` (alias `pf`) | `cmd/relay/portforward.go` | Local port forward to remote service / daemon |
+| `undo` | `cmd/relay/git_ops.go` | Restore remote workspace shadow snapshot |
+| `diff` | `cmd/relay/git_ops.go` | Compare local/remote Git drift & conflict warning |
 | `job run` | `runJobRun` | Run one config job locally |
 | Version stamp | `internal/version/version.go` | `Version`/`Commit`/`Date`, `String()`, `Full()` |
 
@@ -170,7 +176,13 @@ CLI usage (key forms):
 relay watch [run|start|stop|status|restart|upgrade]   # executor (daemon actions)
 relay server [run|start|stop|status|restart|upgrade]  # transit (daemon actions)
 relay push [-w <workspace> | -e <executor-id>] <file> [--no-jobs] [--dest <abs>]
-relay exec  [-w <workspace> | -e <executor-id>] <cmd...>     # -e = direct node addressing
+relay exec [-w <workspace> | -e <executor-id>] [--sync] [-d] <cmd...>  # --sync = git diff sync; -d = detached
+relay ps [-e <executor-id>] [-a]                       # list tasks (TaskSupervisor)
+relay logs [-e <executor-id>] <task-id> [-f] [--tail N] # tail / stream task logs
+relay stop [-e <executor-id>] <task-id>                # terminate task process tree
+relay pf [local:]remote [-e <executor-id>] [start|stop|status] # port-forward (alias: port-forward)
+relay diff [-e <executor-id>] [-w <workspace>]         # inspect drift & conflict warning
+relay undo [-e <executor-id>] [-w <workspace>] [--list|--snapshot <ref>] # restore remote snapshot
 relay job run [-w <id>] <jobid> [file]
 relay sync  [-e <executor-id>]
 relay ws [-v] [--name <id>]                   # alias: relay workspaces

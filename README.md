@@ -11,7 +11,10 @@ A Go-based daemon for monitoring remote directories and executing actions when f
 - **Multiple Paths**: One watch supports multiple file glob patterns
 - **Multiple Jobs**: Each watch supports a chain of jobs with conditional execution (`if: jobs.X.success/failure`)
 - **Push/Pull**: Upload and download files with streaming transfer and zstd compression
-- **Remote Exec**: Forward commands to remote server via WebSocket
+- **Remote Exec & Git Sync**: Forward commands via WebSocket with real-time streaming; optionally incremental Git diff sync (`--sync`) before execution with shadow snapshot protection
+- **Task Supervisor (Docker-style UX)**: Detached background execution (`exec -d`), task listing (`ps`), live log tailing (`logs -f`), and process group termination (`stop`)
+- **Port Forwarding (kubectl-style)**: Forward local ports to remote services (`relay pf 8080:8080`) over full-duplex tunnel stream with fail-closed network whitelist
+- **One-Click Undo & Drift Diff**: Restore overwritten remote workspaces instantly (`relay undo`) and inspect cross-node drift & file conflicts (`relay diff`)
 - **Config Hot-Reload**: Push config to a running watcher without restart
 - **Pluggable Backends**: Local filesystem, native relay (WebSocket), MCP SDK (HTTP SSE), JumpServer API
 - **Backend Auto-Discovery**: New backends register via `init()` — no switch/enum dispatch
@@ -140,15 +143,108 @@ relay list -w web-app-patches
 
 Lists files in the watch's remote `watch_dir` with size and modification time.
 
-### exec — Forward Command to Remote
+### exec — Forward Command to Remote & Background Task
 
 ```bash
+# Direct execution (interactive streaming)
 relay exec -w web-app-patches "npm run build"
+relay exec -e node-1 "go test -v ./..."
+
+# Sync local Git workspace changes before executing remote command
+relay exec -w web-app-patches --sync "pytest tests/"
+
+# Detached execution: Run in background (returns Task ID immediately, Docker-like UX)
+relay exec -w web-app-patches -d "npm run dev"
+# Output: t-a1b2c3d4-1718000000
 ```
 
-Forwards a command to the remote side for execution. Requires a backend that supports `Exec` (local, fs_mcp, relay). The `-w` flag sets the working directory to the watch's `local_dir`. When omitted, `-w` is inferred from the cwd when it can be; otherwise `exec` falls back to its no-workspace behavior. Use `-e/--executor <id>` to address a specific executor by its `executor_id` directly (no workspace), rather than going through a workspace's bound executor.
+Forwards a command to the remote side for execution. Requires a backend that supports `Exec` (local, fs_mcp, relay). The `-w` flag sets the working directory to the watch's `local_dir`. When omitted, `-w` is inferred from the cwd when it can be; otherwise `exec` falls back to its no-workspace behavior. Use `-e/--executor <id>` to address a specific executor by its `executor_id` directly (no workspace).
 
-With the **relay** backend, output is **streamed back in real time** (stdout/stderr appear as the remote command runs, e.g. build logs and `tail -f`), and the local exit code mirrors the remote command's exit code. The relay server only forwards the request to the remote executor — if none is registered for the watch, `exec` errors. See [Transparent forwarding](#relay-backend-configuration).
+- `--sync`: Automatically detects uncommitted local Git modifications and untracked files, packs an incremental diff payload, and applies it to the remote workspace before executing the command. Includes base commit drift validation and automatic remote shadow snapshot backup (`refs/relay/backups/*`).
+- `-d, --detach`: Runs the command in the background under the node's **TaskSupervisor**. Process trees are tracked cleanly (no orphaned child processes), stdout/stderr are persisted to `~/.relay/tasks/<task-id>/run.log`, and real-time output is broadcasted to subscribers.
+
+### ps — List Managed Background Tasks
+
+```bash
+# List active running tasks on an executor node
+relay ps -e node-1
+
+# List all tasks (including stopped / exited)
+relay ps -e node-1 -a
+```
+
+Displays tasks managed by the node's TaskSupervisor across macOS, Linux, and Windows:
+```
+TASK ID                 STATUS     PID      UPTIME       COMMAND
+t-a1b2c3d4-1718000000   running    12345    12m34s       npm run dev
+t-e5f6g7h8-1718000500   stopped    -        -            pytest tests/ (exit: 0)
+```
+
+### logs — Stream & Tail Task Logs
+
+```bash
+# Live stream task logs (similar to docker logs -f)
+relay logs -e node-1 t-a1b2c3d4-1718000000 -f
+
+# View recent lines without following
+relay logs -e node-1 t-a1b2c3d4-1718000000 --tail 50
+```
+
+Subscribes to live task output broadcast or retrieves persisted log entries from disk.
+
+### stop — Terminate Background Task
+
+```bash
+relay stop -e node-1 t-a1b2c3d4-1718000000
+```
+
+Stops a running task. The executor cleans up the entire process tree using process groups/signals on Unix or `taskkill /T /F` on Windows, leaving no orphaned server processes behind.
+
+### port-forward (pf) — Port Forwarding & Intranet Service Access
+
+```bash
+# Forward local port 8080 to remote executor port 8080 (similar to kubectl port-forward)
+relay pf 8080 -e node-1
+
+# Map local port 3000 to remote port 8080
+relay pf 3000:8080 -e node-1
+
+# Access an intranet database behind the executor node
+relay pf 5432:db.internal:5432 -e node-1
+
+# Run as background daemon (managed instance: pf-<node>-<port>)
+relay pf 8080 start -e node-1
+relay pf status              # list all active port-forward daemons
+relay pf 8080 stop -e node-1   # stop port-forward daemon
+```
+
+Opens a local TCP listener and pipes data directly through the transit WebSocket to the remote executor using full-duplex binary streams. The destination target is checked against the executor's `network_allow` whitelist (fail-closed security).
+
+### diff — Cross-Node Workspace Drift & Conflict Analysis
+
+```bash
+relay diff -e node-1 [-w web-app-patches]
+```
+
+Inspects and compares local and remote Git statuses before synchronizing:
+- **Base Commit Check**: Verifies if local and remote share the same base commit SHA, warning if base commits have diverged.
+- **Local vs Remote Changes**: Summarizes dirty and untracked files on both sides.
+- **⚡ Conflict Warning**: Flags files that are simultaneously modified on both local and remote, warning of potential overwrites.
+
+### undo — One-Click Recovery of Remote Workspace
+
+```bash
+# List all available shadow snapshots on the remote node
+relay undo -e node-1 --list
+
+# Restore remote workspace to the latest shadow snapshot
+relay undo -e node-1
+
+# Restore to a specific snapshot ref
+relay undo -e node-1 --snapshot refs/relay/backups/1718000000
+```
+
+Whenever `exec --sync` applies changes onto a dirty remote workspace, a shadow snapshot (`refs/relay/backups/<timestamp>`) is automatically created beforehand. If an accidental overwrite occurs or remote tests alter the state, `relay undo` cleanly resets the remote workspace back to its pre-sync state (including unstaged and untracked files). Pre-undo changes are preserved in a safety snapshot to prevent accidental data loss.
 
 ### job run — Run a Config Job Locally
 
