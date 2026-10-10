@@ -36,8 +36,8 @@ var (
 	configPath = kingpin.Flag("config", "Path to config file").Short('c').Default("~/.relay/config.yaml").String()
 	debugFlag  = kingpin.Flag("debug", "Enable debug mode").Bool()
 
-	// Watch command - continuous monitoring
-	watchCmd = kingpin.Command("watch", "Watch remote directory and execute actions continuously")
+	// Watch command - continuous monitoring (legacy)
+	watchCmd = kingpin.Command("watch", "执行端工作区监听守护进程 (建议使用 node 代替)")
 
 	// 位置参数 action:默认前台;run=前台;start/stop/status/restart/upgrade 为 daemon 控制。
 	watchAction = watchCmd.Arg("action", "run|start|stop|status|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "restart", "upgrade").String()
@@ -45,17 +45,17 @@ var (
 	watchUpgradePath = watchCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 
 	// Pull command - download single file (requires filename)
-	pullCmd    = kingpin.Command("pull", "Download single file from remote watch directory")
+	pullCmd    = kingpin.Command("pull", "从远端工作区拉取单个文件")
 	pullWatch  = pullCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
 	pullFile   = pullCmd.Arg("filename", "Remote filename to download").Required().String()
 	pullDelete = pullCmd.Flag("delete", "Delete the remote file after a successful pull").Short('d').Bool()
 
 	// List command - list remote directory
-	listCmd   = kingpin.Command("list", "List files in remote watch directory")
+	listCmd   = kingpin.Command("list", "列出远端监听目录中的文件")
 	listWatch = listCmd.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
 
 	// Push command - upload files, optionally without running workspace jobs
-	pushCmd    = kingpin.Command("push", "Push file to remote (optionally run/wait workspace jobs)")
+	pushCmd    = kingpin.Command("push", "推送文件至远端工作区（可选触发或跳过 workspace jobs）")
 	pushWatch  = pushCmd.Flag("watch", "Target workspace ID (defaults to current directory name); mutually exclusive with --node/--executor").Short('w').String()
 	pushExec   = pushCmd.Flag("executor", "Route directly to this executor (executor_id) without a workspace binding").Short('e').String()
 	pushNode   = pushCmd.Flag("node", "Target node ID (alias for --executor)").String()
@@ -64,33 +64,33 @@ var (
 	pushNoJobs = pushCmd.Flag("no-jobs", "Transfer only; do not run workspace jobs on the remote").Bool()
 
 	// Job command - run config-defined jobs locally
-	jobCmd      = kingpin.Command("job", "Run config-defined jobs on the local machine")
-	jobRun      = jobCmd.Command("run", "Run a config job locally")
+	jobCmd      = kingpin.Command("job", "在本地运行配置定义的 job")
+	jobRun      = jobCmd.Command("run", "在本地手动执行配置中定义的 job")
 	jobRunWatch = jobRun.Flag("watch", "Target watch ID (defaults to current directory name)").Short('w').String()
 	jobRunID    = jobRun.Arg("jobid", "Job ID to run").Required().String()
 	jobRunFile  = jobRun.Arg("file", "Local file to bind to {file_path} and friends").String()
 
-	// Exec command - command forwarding (requires watch running, alias: run)
-	execCmd         = kingpin.Command("exec", "Forward command to remote executor (alias: run)").Alias("run")
+	// Run command - command forwarding & execution (alias: exec)
+	execCmd         = kingpin.Command("run", "在远端节点执行命令（前台流式 / 后台 -d；alias: exec）").Alias("exec")
 	execWatch       = execCmd.Flag("watch", "Target workspace ID (defaults to current directory name); mutually exclusive with --node/--executor").Short('w').String()
 	execExec        = execCmd.Flag("executor", "Route directly to this executor (executor_id) without a workspace binding").Short('e').String()
 	execNode        = execCmd.Flag("node", "Target node ID (alias for --executor)").String()
 	execForceRemote = execCmd.Flag("force-remote", "Force overwrite remote state (creates shadow snapshot on remote first)").Short('f').Bool()
 	execNoSync      = execCmd.Flag("no-sync", "Skip git incremental sync before execution").Bool()
 	execDetach      = execCmd.Flag("detach", "Run command in background as daemon task (returns TaskID)").Short('d').Bool()
-	// 支持多词命令:relay exec git status 会收成 ["git","status"] 再空格 join。
+	// 支持多词命令:relay run git status 会收成 ["git","status"] 再空格 join。
 	// 含以 - 开头参数的命令(如 git log --oneline)仍须整体加引号,避免被当 flag。
 	execCmdStr = execCmd.Arg("command", "Command to execute (multiple words are joined)").Required().Strings()
 
 	// ps command - 查询后台任务
-	psCmd  = kingpin.Command("ps", "List managed background tasks (similar to docker ps)")
+	psCmd  = kingpin.Command("ps", "查看远端托管的后台任务列表 (类似 docker ps)")
 	psAll  = psCmd.Flag("all", "Show all tasks (default shows running only)").Short('a').Bool()
 	psExec = psCmd.Flag("executor", "Filter tasks by executor node").Short('e').String()
 	psNode = psCmd.Flag("node", "Filter tasks by node ID (alias for --executor)").String()
 	psJSON = psCmd.Flag("json", "Output as JSON").Bool()
 
 	// logs command - 查看任务日志
-	logsCmd    = kingpin.Command("logs", "Fetch logs of a background task (similar to docker logs)")
+	logsCmd    = kingpin.Command("logs", "查看或追踪后台任务日志 (类似 docker logs)")
 	logsTaskID = logsCmd.Arg("task-id", "Task ID to view").Required().String()
 	logsFollow = logsCmd.Flag("follow", "Follow log output").Short('f').Bool()
 	logsTail   = logsCmd.Flag("tail", "Number of lines to show from the end").Default("100").Int()
@@ -98,7 +98,7 @@ var (
 	logsNode   = logsCmd.Flag("node", "Target node ID (alias for --executor)").String()
 
 	// stop command - 终止后台任务
-	stopCmd    = kingpin.Command("stop", "Stop a running background task (similar to docker stop)")
+	stopCmd    = kingpin.Command("stop", "终止远端正在运行的后台任务进程树 (类似 docker stop)")
 	stopTaskID = stopCmd.Arg("task-id", "Task ID to stop").Required().String()
 	stopExec   = stopCmd.Flag("executor", "Target executor node").Short('e').String()
 	stopNode   = stopCmd.Flag("node", "Target node ID (alias for --executor)").String()
@@ -109,21 +109,21 @@ var (
 	statusJSONOut = statusCmd.Flag("json", "Output as JSON").Bool()
 
 	// Nodes command - 查看全网节点拓扑状态与角色 (类似 kubectl get nodes / docker node ls)
-	nodesCmd     = kingpin.Command("nodes", "List all peer nodes across topology (alias: node ls)")
+	nodesCmd     = kingpin.Command("nodes", "查看集群对等节点与拓扑状态 (alias: node ls)")
 	nodesJSONOut = nodesCmd.Flag("json", "Output as JSON").Bool()
 
 	// Cleanup command - remove stale command files
-	cleanupCmd   = kingpin.Command("cleanup", "Remove stale command and result files from remote")
+	cleanupCmd   = kingpin.Command("cleanup", "清理远端残留的临时命令与结果文件")
 	cleanupWatch = cleanupCmd.Flag("watch", "Target watch ID").Short('w').Required().String()
 
 	// Sync command - push config to remote watcher for hot reload
-	syncCmd      = kingpin.Command("sync", "Push config to remote watcher for hot reload")
+	syncCmd      = kingpin.Command("sync", "向目标执行节点推送配置以热重载")
 	syncExecutor = syncCmd.Flag("executor", "Target executor's executor_id (default = this config's backend executor_id)").Short('e').String()
 	syncNode     = syncCmd.Flag("node", "Target node ID (alias for --executor)").String()
 
 	// Workspaces command - list configured workspaces from config
 	// (alias: `workspaces`; kingpin v2 doesn't render aliases in --help)
-	wsCmd     = kingpin.Command("ws", "List configured workspaces from config (alias: workspaces)").Alias("workspaces")
+	wsCmd     = kingpin.Command("ws", "查看配置的工作区列表 (alias: workspaces)").Alias("workspaces")
 	wsName    = wsCmd.Flag("name", "Show details for a specific workspace ID").String()
 	wsJSON    = wsCmd.Flag("json", "Output as JSON").Bool()
 	wsVerbose = wsCmd.Flag("verbose", "Show detailed table output").Short('v').Bool()
@@ -138,7 +138,7 @@ var (
 	serverRemoteExpect = serverRemoteCmd.Flag("expect", "Expected transit version after swap (default: this relay's version.String())").String()
 
 	// Tunnel command - 本地 SOCKS5 出网隧道,经所选 executor 出口访问内网白名单目标。
-	tunnelCmd      = kingpin.Command("tunnel", "本地 SOCKS5 出网隧道:经所选 executor 访问其内网白名单")
+	tunnelCmd      = kingpin.Command("tunnel", "本地 SOCKS5 出网隧道:经所选节点访问其内网白名单目标")
 	tunnelListen   = tunnelCmd.Flag("listen", "Local SOCKS5 listen address").Default("127.0.0.1:1080").String()
 	tunnelExecName = tunnelCmd.Flag("executor", "Egress executor's executor_id (see `relay status` -> executors[].executor_id)").Short('w').String()
 	tunnelNodeName = tunnelCmd.Flag("node", "Egress node ID (alias for --executor)").String()
@@ -146,7 +146,7 @@ var (
 	tunnelUpgradePath = tunnelCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 
 	// Port-forward command - 本地端口映射到远端服务 (类似 kubectl port-forward / docker -p)
-	portForwardCmd    = kingpin.Command("port-forward", "Forward local port to remote executor (similar to kubectl port-forward)").Alias("pf")
+	portForwardCmd    = kingpin.Command("port-forward", "映射远端服务端口到本地端口 (alias: pf)").Alias("pf")
 	portForwardPorts  = portForwardCmd.Arg("port", "[local:]remote port (e.g. 8080:8080 or 8080)").String()
 	portForwardAction = portForwardCmd.Arg("action", "run|start|stop|status|restart (default: run)").HintOptions("run", "start", "stop", "status", "restart").String()
 	portForwardExec   = portForwardCmd.Flag("executor", "Target executor node").Short('e').String()
@@ -155,7 +155,7 @@ var (
 	portForwardBind   = portForwardCmd.Flag("bind", "Local IP to bind to").Default("127.0.0.1").String()
 
 	// Undo command - 一键恢复远端工作区影子快照 (防误操作与冲突覆盖)
-	undoCmd      = kingpin.Command("undo", "Restore remote workspace to a shadow snapshot")
+	undoCmd      = kingpin.Command("undo", "一键回退并恢复远端工作区影子快照")
 	undoExec     = undoCmd.Flag("executor", "Target executor node").Short('e').String()
 	undoNode     = undoCmd.Flag("node", "Target node ID (alias for --executor)").String()
 	undoWatch    = undoCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').String()
@@ -163,7 +163,7 @@ var (
 	undoSnapshot = undoCmd.Flag("snapshot", "Specific snapshot ref to restore (default: latest)").String()
 
 	// Diff command - 对比本地与远端 Git 状态及冲突预警
-	diffCmd   = kingpin.Command("diff", "Inspect and compare local and remote workspace Git status")
+	diffCmd   = kingpin.Command("diff", "比对本地与远端工作区 Git 代码差异与冲突预警")
 	diffExec  = diffCmd.Flag("executor", "Target executor node").Short('e').String()
 	diffNode  = diffCmd.Flag("node", "Target node ID (alias for --executor)").String()
 	diffWatch = diffCmd.Flag("watch", "Target workspace ID (infers executor)").Short('w').String()
@@ -171,6 +171,7 @@ var (
 
 func main() {
 	kingpin.CommandLine.HelpFlag.Short('h')
+	setupUsageTemplate()
 
 	// 统一日志基座:timetamps + 可选 verbose。所有端点(server/watch/exec/...)
 	// 的 log/Info 级输出都带日期时间,便于审计;--debug 额外打开 verbose 详情。

@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	nodeCmd = kingpin.Command("node", "Run unified relay node (daemon/agent/hub)")
+	nodeCmd = kingpin.Command("node", "运行统一对等节点守护进程（支持 hub 与 agent 角色）")
 
 	// 位置参数 action: 默认前台 run; start/stop/status/restart/upgrade 为 daemon 控制。
 	nodeAction = nodeCmd.Arg("action", "run|start|stop|status|restart|upgrade (default: run)").HintOptions("run", "start", "stop", "status", "restart", "upgrade").String()
