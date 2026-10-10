@@ -178,7 +178,7 @@ relay watch [run|start|stop|status|restart|upgrade]   # executor (daemon actions
 relay server [run|start|stop|status|restart|upgrade]  # transit (daemon actions)
 relay run [-w <workspace> | --node <node-id>] [--sync] [-d] <cmd...> # direct run / exec alias
 relay exec [-w <workspace> | --node <node-id>] [--sync] [-d] <cmd...>  # --sync = git diff sync; -d = detached
-relay nodes [--json]                                   # cluster-wide peer nodes & topology state
+relay nodes [--json]                                   # cluster-wide peer nodes & topology state (alias: node ls, status)
 relay push [-w <workspace> | --node <node-id>] <file> [--no-jobs] [--dest <abs>]
 relay ps [--node <node-id>] [-a]                       # list tasks (TaskSupervisor)
 relay logs [--node <node-id>] <task-id> [-f] [--tail N] # tail / stream task logs
@@ -189,8 +189,7 @@ relay undo [--node <node-id>] [-w <workspace>] [--list|--snapshot <ref>] # resto
 relay job run [-w <id>] <jobid> [file]
 relay sync  [--node <node-id>]
 relay ws [-v] [--name <id>]                            # alias: relay workspaces
-relay status [--json]                                  # whole deployment health + versions
-relay version [--json]                                 # local build (remote ledger via `status`)
+relay version [--json]                                 # local build version
 relay server-remote [--binary <path>] [--expect <ver+commit>]  # one-command transit self-upgrade
 relay tunnel [--listen 127.0.0.1:1080] -w <egress-executor-id>  # SOCKS5 (egress executor_id)
 relay pull [-w <workspace>] <filename> [-dl]    relay list [-w]    relay cleanup [-w <workspace>]
