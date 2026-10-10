@@ -24,6 +24,7 @@ import (
 	"github.com/user/relay/internal/relay/protocol"
 	_ "github.com/user/relay/internal/relay/server"
 	"github.com/user/relay/internal/sync/git"
+	"github.com/user/relay/internal/sysinfo"
 	"github.com/user/relay/internal/version"
 	"github.com/user/relay/internal/watcher"
 )
@@ -104,8 +105,9 @@ var (
 	stopNode   = stopCmd.Flag("node", "Target node ID (alias for --executor)").String()
 
 	// Nodes command - 查看全网节点拓扑状态与角色 (类似 kubectl get nodes / docker node ls; alias: status)
-	nodesCmd     = kingpin.Command("nodes", "查看集群对等节点与拓扑状态 (alias: node ls, status)").Alias("status")
-	nodesJSONOut = nodesCmd.Flag("json", "Output as JSON").Bool()
+	nodesCmd      = kingpin.Command("nodes", "查看集群对等节点与拓扑状态 (alias: node ls, status)").Alias("status")
+	nodesJSONOut  = nodesCmd.Flag("json", "Output as JSON").Bool()
+	nodesUsageOut = nodesCmd.Flag("usage", "Query dynamic CPU load & memory usage of nodes (heavier probe)").Short('u').Bool()
 
 	// Cleanup command - remove stale command files
 	cleanupCmd   = kingpin.Command("cleanup", "清理远端残留的临时命令与结果文件")
@@ -1442,6 +1444,8 @@ type PeerNodeItem struct {
 	Role     string `json:"role"`
 	Status   string `json:"status"`
 	Platform string `json:"platform"`
+	CPU      string `json:"cpu"`
+	Memory   string `json:"memory"`
 	Version  string `json:"version"`
 	Latency  string `json:"latency"`
 }
@@ -1469,7 +1473,8 @@ func runNodes() {
 	ctx, cancel := context.WithTimeout(context.Background(), statusTimeout)
 	defer cancel()
 
-	st, err := rb.Status(ctx)
+	withUsage := *nodesUsageOut
+	st, err := rb.StatusWithUsage(ctx, withUsage)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to query cluster status: %v\n", err)
 		os.Exit(1)
@@ -1488,11 +1493,22 @@ func runNodes() {
 	} else if cfg.IsAgent() {
 		localRoles = "agent"
 	}
+
+	localRes := sysinfo.CollectResourceInfo(withUsage)
+	localCPU := localRes.FormatCPUSummary()
+	localMem := localRes.FormatMemSummary()
+	if withUsage {
+		localCPU = localRes.FormatCPUUsage()
+		localMem = localRes.FormatMemUsage()
+	}
+
 	nodes = append(nodes, PeerNodeItem{
 		ID:       cfg.NodeID() + " (local)",
 		Role:     localRoles,
 		Status:   "Ready",
 		Platform: localPlatform,
+		CPU:      localCPU,
+		Memory:   localMem,
 		Version:  localVer,
 		Latency:  "-",
 	})
@@ -1502,11 +1518,27 @@ func runNodes() {
 	if st.Transit.GOOS != "" {
 		transitPlatform = fmt.Sprintf("%s/%s", st.Transit.GOOS, st.Transit.GOARCH)
 	}
+	transitSysRes := sysinfo.ResourceInfo{
+		CPUCores:    st.Resource.CPUCores,
+		CPULoad:     st.Resource.CPULoad,
+		MemTotalMB:  st.Resource.MemTotalMB,
+		MemUsedMB:   st.Resource.MemUsedMB,
+		IsContainer: st.Resource.IsContainer,
+	}
+	transitCPU := transitSysRes.FormatCPUSummary()
+	transitMem := transitSysRes.FormatMemSummary()
+	if withUsage {
+		transitCPU = transitSysRes.FormatCPUUsage()
+		transitMem = transitSysRes.FormatMemUsage()
+	}
+
 	nodes = append(nodes, PeerNodeItem{
 		ID:       "hub (transit)",
 		Role:     "hub",
 		Status:   "Ready",
 		Platform: transitPlatform,
+		CPU:      transitCPU,
+		Memory:   transitMem,
 		Version:  ident(st.Transit),
 		Latency:  segmentText(st.Seg1),
 	})
@@ -1521,11 +1553,28 @@ func runNodes() {
 		if e.OS != "" {
 			platform = fmt.Sprintf("%s/%s", e.OS, e.Arch)
 		}
+
+		execSysRes := sysinfo.ResourceInfo{
+			CPUCores:    e.Resource.CPUCores,
+			CPULoad:     e.Resource.CPULoad,
+			MemTotalMB:  e.Resource.MemTotalMB,
+			MemUsedMB:   e.Resource.MemUsedMB,
+			IsContainer: e.Resource.IsContainer,
+		}
+		execCPU := execSysRes.FormatCPUSummary()
+		execMem := execSysRes.FormatMemSummary()
+		if withUsage {
+			execCPU = execSysRes.FormatCPUUsage()
+			execMem = execSysRes.FormatMemUsage()
+		}
+
 		nodes = append(nodes, PeerNodeItem{
 			ID:       e.ExecutorID,
 			Role:     "agent",
 			Status:   stText,
 			Platform: platform,
+			CPU:      execCPU,
+			Memory:   execMem,
 			Version:  identStr(e.Version),
 			Latency:  segmentText(e.Total),
 		})
@@ -1539,9 +1588,16 @@ func runNodes() {
 	}
 
 	// 文本表格输出 (类似 kubectl get nodes)
-	fmt.Printf("%-24s %-14s %-10s %-16s %-16s %s\n", "NAME", "ROLES", "STATUS", "VERSION", "PLATFORM", "LATENCY")
-	for _, n := range nodes {
-		fmt.Printf("%-24s %-14s %-10s %-16s %-16s %s\n", n.ID, n.Role, n.Status, n.Version, n.Platform, n.Latency)
+	if withUsage {
+		fmt.Printf("%-24s %-10s %-8s %-14s %-16s %-24s %-16s %s\n", "NAME", "ROLES", "STATUS", "PLATFORM", "CPU", "MEMORY", "VERSION", "LATENCY")
+		for _, n := range nodes {
+			fmt.Printf("%-24s %-10s %-8s %-14s %-16s %-24s %-16s %s\n", n.ID, n.Role, n.Status, n.Platform, n.CPU, n.Memory, n.Version, n.Latency)
+		}
+	} else {
+		fmt.Printf("%-24s %-10s %-8s %-14s %-12s %-14s %-16s %s\n", "NAME", "ROLES", "STATUS", "PLATFORM", "CPU", "MEMORY", "VERSION", "LATENCY")
+		for _, n := range nodes {
+			fmt.Printf("%-24s %-10s %-8s %-14s %-12s %-14s %-16s %s\n", n.ID, n.Role, n.Status, n.Platform, n.CPU, n.Memory, n.Version, n.Latency)
+		}
 	}
 }
 

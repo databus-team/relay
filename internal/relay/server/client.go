@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/user/relay/internal/relay/protocol"
+	"github.com/user/relay/internal/sysinfo"
 	"github.com/user/relay/internal/version"
 )
 
@@ -500,9 +501,15 @@ func (c *Client) handleRegisterExecutor(msg protocol.Message) {
 	goos := toString(payload["os"])
 	goarch := toString(payload["arch"])
 
+	var res protocol.ResourceStats
+	if rMap, ok := payload["resource"].(map[string]interface{}); ok {
+		b, _ := json.Marshal(rMap)
+		_ = json.Unmarshal(b, &res)
+	}
+
 	switch action {
 	case "add", "":
-		prev, replaced := c.server.RegisterExecutor(executorID, c.id, version, goos, goarch)
+		prev, replaced := c.server.RegisterExecutor(executorID, c.id, version, goos, goarch, res)
 		if replaced {
 			log.Printf("[executor] executor=%s replaced previous executor %s by %s (v=%s %s/%s)", executorID, prev, c.id, version, goos, goarch)
 		} else {
@@ -654,15 +661,30 @@ func (c *Client) handleVersion(msg protocol.Message) {
 	c.SendResponse(msg.ID, protocol.VersionResponse{OK: true, Nodes: c.versionLedger()})
 }
 
-// handleStatus 处理 `relay status` 的连通性体检。status 面向整座部署(不携带 watch):
-// 中转对**所有**已注册执行方各并发探针一次,测「中转→执行方」段时延,连同中转节点信息
-// 组装成 StatusResponse 回给请求方。全部执行方离线时仍成功回执(Executors 为空列表),
-// 语义是「中转在线、远端掉线」——绝不因无执行方而报错。
+// handleStatus 处理 `relay nodes` 的连通性体检与资源发现。
 func (c *Client) handleStatus(msg protocol.Message) {
-	resp := protocol.StatusResponse{OK: true, Transit: c.transitVersion()}
+	withUsage := false
+	if reqMap, ok := msg.Payload.(map[string]interface{}); ok {
+		if u, ok := reqMap["with_usage"].(bool); ok {
+			withUsage = u
+		}
+	}
+
+	// 采集中转 Hub 自身 (如 K8s Pod) 资源
+	hubRes := sysinfo.CollectResourceInfo(withUsage)
+	resp := protocol.StatusResponse{
+		OK:      true,
+		Transit: c.transitVersion(),
+		Resource: protocol.ResourceStats{
+			CPUCores:    hubRes.CPUCores,
+			CPULoad:     hubRes.CPULoad,
+			MemTotalMB:  hubRes.MemTotalMB,
+			MemUsedMB:   hubRes.MemUsedMB,
+			IsContainer: hubRes.IsContainer,
+		},
+	}
 	endpoints := c.server.ExecutorEndpoints()
 	if len(endpoints) == 0 {
-		// 全部执行方离线/未注册:仍回 success + 空执行方列表。
 		c.SendResponse(msg.ID, resp)
 		return
 	}
@@ -674,10 +696,6 @@ func (c *Client) handleStatus(msg protocol.Message) {
 	sort.Strings(executorIDs)
 
 	results := make([]protocol.ExecutorHealth, len(executorIDs))
-	// 各执行方独立连接,并发探针互不争用同一连接的写锁。回包等待放 goroutine,
-	// 避免阻塞请求方连接的读循环(读循环是这台连接的唯一读者,若在此同步等待,该连接上
-	// 其它入站帧——心跳/exec 回包/文件事件——都会被堵住)。连接断开时 `c.closeCh` 关闭,
-	// 各等待方由 defer 关 pending 直接返回,不必等满超时。
 	go func() {
 		var wg sync.WaitGroup
 		for i, eid := range executorIDs {
@@ -691,6 +709,7 @@ func (c *Client) handleStatus(msg protocol.Message) {
 					Version:    ep.Version,
 					OS:         ep.OS,
 					Arch:       ep.Arch,
+					Resource:   ep.Resource,
 					Seg2:       c.probeExecutor(ep.ClientID),
 				}
 			}()

@@ -975,6 +975,11 @@ func (b *RelayBackend) Ping(ctx context.Context, commandDir, watchID string) err
 // Seg2 标不可用、Total 留空,整条命令仍成功;全部执行方离线时空列表,仍输出「中转正常、
 // 执行方为空」。status 不针对单一执行方,故不再有 watch 参数。
 func (b *RelayBackend) Status(ctx context.Context) (protocol.StatusResponse, error) {
+	return b.StatusWithUsage(ctx, false)
+}
+
+// StatusWithUsage 向中转查询整座部署的连通状态与资源 (支持可选 withUsage)
+func (b *RelayBackend) StatusWithUsage(ctx context.Context, withUsage bool) (protocol.StatusResponse, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return protocol.StatusResponse{}, err
 	}
@@ -986,7 +991,7 @@ func (b *RelayBackend) Status(ctx context.Context) (protocol.StatusResponse, err
 	}
 	seg1 := time.Since(seg1Start).Milliseconds()
 
-	st, err := b.client.Status(ctx)
+	st, err := b.client.Status(ctx, withUsage)
 	if err != nil {
 		return protocol.StatusResponse{}, err
 	}

@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/user/relay/internal/relay/protocol"
+	"github.com/user/relay/internal/sysinfo"
 )
 
 type Client struct {
@@ -494,12 +495,18 @@ func (c *Client) failAllPending(reason string) {
 // RegisterExecutor 向服务端注册(或注销,action="remove")本客户端为某执行方。
 // executorID 即执行方节点身份(backend.config.executor_id)。
 func (c *Client) RegisterExecutor(ctx context.Context, executorID, action, buildVersion string) error {
+	res := sysinfo.CollectResourceInfo(false)
 	resp, err := c.Request(ctx, protocol.MsgRegisterExecutor, protocol.RegisterExecutorRequest{
 		ExecutorID: executorID,
 		Action:     action,
 		Version:    buildVersion,
 		OS:         runtime.GOOS,
 		Arch:       runtime.GOARCH,
+		Resource: protocol.ResourceStats{
+			CPUCores:    res.CPUCores,
+			MemTotalMB:  res.MemTotalMB,
+			IsContainer: res.IsContainer,
+		},
 	})
 	if err != nil {
 		return err
@@ -527,12 +534,11 @@ func (c *Client) Version(ctx context.Context) (protocol.VersionResponse, error) 
 	return vr, nil
 }
 
-// Status 向中转查询整座部署的连通状态:中转对每个执行方的探针结果(Executors)与中转节点
-// 信息(Transit)。段1(本地→中转往返)由请求方本地 Ping 计时、各执行方的累计(Total)由
-// 请求方按 段1+段2 求和,故此处只返回中转侧组装的结果。
-func (c *Client) Status(ctx context.Context) (protocol.StatusResponse, error) {
+// Status 向中转查询整座部署的连通状态与节点资源:中转对每个执行方的探针结果(Executors)与中转节点
+// 信息(Transit/Resource)。
+func (c *Client) Status(ctx context.Context, withUsage bool) (protocol.StatusResponse, error) {
 	var st protocol.StatusResponse
-	resp, err := c.Request(ctx, protocol.MsgStatus, protocol.StatusRequest{})
+	resp, err := c.Request(ctx, protocol.MsgStatus, protocol.StatusRequest{WithUsage: withUsage})
 	if err != nil {
 		return st, err
 	}

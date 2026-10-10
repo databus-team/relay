@@ -134,11 +134,12 @@ type ExecChunk struct {
 // RegisterExecutorRequest 向中转注册/注销某 executor(远端执行方)。executor_id 是执行方的
 // 节点身份(其 backend.config.executor_id),与中转 watch 存储目录是两回事。
 type RegisterExecutorRequest struct {
-	ExecutorID string `json:"executor_id"`
-	Action     string `json:"action"`            // "add" / "remove"
-	Version    string `json:"version,omitempty"` // 执行方 relay 构建版本(用于 relay version 对比)
-	OS         string `json:"os,omitempty"`      // 执行方操作系统 (runtime.GOOS)
-	Arch       string `json:"arch,omitempty"`    // 执行方 CPU 架构 (runtime.GOARCH)
+	ExecutorID string        `json:"executor_id"`
+	Action     string        `json:"action"`            // "add" / "remove"
+	Version    string        `json:"version,omitempty"` // 执行方 relay 构建版本(用于 relay version 对比)
+	OS         string        `json:"os,omitempty"`      // 执行方操作系统 (runtime.GOOS)
+	Arch       string        `json:"arch,omitempty"`    // 执行方 CPU 架构 (runtime.GOARCH)
+	Resource   ResourceStats `json:"resource,omitempty"`// 执行方资源基准 (轻量静态规格)
 }
 
 // VersionInfo 描述部署中一个 relay 节点的构建信息,用于 `relay version` 跨机对比。
@@ -170,9 +171,19 @@ type StatusSegment struct {
 }
 
 // StatusRequest 请求对整座中转做连通性体检。不携带 watch:中转对全部已注册执行方
-// 各做一次 中→执行方 探针,请求方再补 本地→中转 段。无 watch 参数,因为 status 面向
-// 整座部署(中转 + 所有执行方),而非单个 workspace/executor。
-type StatusRequest struct{}
+// 各做一次 中→执行方 探针,请求方再补 本地→中转 段。
+type StatusRequest struct {
+	WithUsage bool `json:"with_usage,omitempty"` // 是否请求实时用量与负载 (重载操作)
+}
+
+// ResourceStats 节点资源与负载详情
+type ResourceStats struct {
+	CPUCores    float64 `json:"cpu_cores,omitempty"`
+	CPULoad     float64 `json:"cpu_load,omitempty"`
+	MemTotalMB  int64   `json:"mem_total_mb,omitempty"`
+	MemUsedMB   int64   `json:"mem_used_mb,omitempty"`
+	IsContainer bool    `json:"is_container,omitempty"`
+}
 
 // ExecutorHealth 中转对单个已注册执行方的体检结果。
 //   - ExecutorID: 执行方的节点身份(executor_id)
@@ -186,11 +197,12 @@ type ExecutorHealth struct {
 	Version    string        `json:"version,omitempty"`
 	OS         string        `json:"os,omitempty"`
 	Arch       string        `json:"arch,omitempty"`
+	Resource   ResourceStats `json:"resource,omitempty"`
 	Seg2       StatusSegment `json:"seg2"`
 	Total      StatusSegment `json:"total,omitempty"`
 }
 
-// StatusResponse 中转对 MsgStatus 的应答,承接 `relay status` 的一站式连通性+版本台账。
+// StatusResponse 中转对 MsgStatus 的应答,承接 `relay status/nodes` 的一站式连通性+版本台账。
 // status 面向整座部署:请求方不传 watch,中转对**所有**已注册执行方各探针一次。
 //   - Seg1:      本地→中转 往返 RTT(由请求方本地 `Ping` 计时,中转不填)
 //   - Transit:   中转节点构建信息
@@ -200,6 +212,7 @@ type StatusResponse struct {
 	Error     string           `json:"error,omitempty"`
 	Seg1      StatusSegment    `json:"seg1"`
 	Transit   VersionInfo      `json:"transit,omitempty"`
+	Resource  ResourceStats    `json:"resource,omitempty"` // 中转 Hub 自身资源 (如 K8s Pod 资源)
 	Executors []ExecutorHealth `json:"executors,omitempty"`
 }
 

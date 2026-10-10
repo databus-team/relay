@@ -420,9 +420,9 @@ func (s *Server) UnsubscribeAll(clientID string) {
 	}
 }
 
-// RegisterExecutor 将 clientID 注册为 executorID 的执行方,并记录其 relay 构建版本及平台架构。
+// RegisterExecutor 将 clientID 注册为 executorID 的执行方,并记录其 relay 构建版本、平台与资源信息。
 // 返回(旧执行方连接, 是否发生了覆盖),供上层做替换告警。
-func (s *Server) RegisterExecutor(executorID, clientID, version, goos, goarch string) (prev string, replaced bool) {
+func (s *Server) RegisterExecutor(executorID, clientID, version, goos, goarch string, res protocol.ResourceStats) (prev string, replaced bool) {
 	s.executorMu.Lock()
 	defer s.executorMu.Unlock()
 	prev = s.executors[executorID]
@@ -435,6 +435,7 @@ func (s *Server) RegisterExecutor(executorID, clientID, version, goos, goarch st
 			Version:  version,
 			OS:       goos,
 			Arch:     goarch,
+			Resource: res,
 		}
 	} else {
 		delete(s.executorVers, executorID)
@@ -473,12 +474,13 @@ func (s *Server) GetExecutor(executorID string) (string, bool) {
 	return e, ok
 }
 
-// ExecutorEndpoint 中转记录的单个已注册执行方端点(身份 + 构建版本 + 平台)。
+// ExecutorEndpoint 中转记录的单个已注册执行方端点(身份 + 构建版本 + 平台 + 资源)。
 type ExecutorEndpoint struct {
 	ClientID string
 	Version  string
 	OS       string
 	Arch     string
+	Resource protocol.ResourceStats
 }
 
 // ExecutorEndpoints 返回全部已注册执行方的快照(executorID → 端点)。供 `relay status`
