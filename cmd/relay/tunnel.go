@@ -91,13 +91,15 @@ func runTunnel() {
 			}
 			continue
 		}
-		go handleTunnelConn(ctx, rb, w, conn)
+		go handleTunnelConn(ctx, rb, w, conn, func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "[tunnel] "+format+"\n", args...)
+		})
 	}
 }
 
 // handleTunnelConn 处理一条本地 SOCKS5 连接:SOCKS5 握手解 → TunnelOpen → 建连成功后
 // 双向字节泵(本地 SOCKS ↔ 远端 executor 的真实连接)。任一侧失败时仅向 SOCKS 回失败帧,不建内网流量。
-func handleTunnelConn(ctx context.Context, rb *relaybackend.RelayBackend, watchID string, soc net.Conn) {
+func handleTunnelConn(ctx context.Context, rb *relaybackend.RelayBackend, watchID string, soc net.Conn, logf func(format string, args ...any)) {
 	defer soc.Close()
 
 	// 握手要有界:只连不发/半开的连接在限定时间内结束,不长期占用 fd/goroutine。
@@ -114,7 +116,7 @@ func handleTunnelConn(ctx context.Context, rb *relaybackend.RelayBackend, watchI
 
 	stream, err := rb.TunnelOpen(ctx, watchID, host, port)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[tunnel] %s:%d egress %s: %v\n", host, port, watchID, err)
+		logf("%s:%d egress %s: %v", host, port, watchID, err)
 		socks5Reply(soc, socksRepFailure)
 		return
 	}
