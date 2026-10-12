@@ -14,7 +14,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"unicode/utf8"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/user/relay/internal/backend"
@@ -123,7 +122,7 @@ var (
 
 	// Nodes command - 查看全网节点拓扑状态与角色 (类似 kubectl get nodes / docker node ls; alias: status)
 	nodesCmd      = kingpin.Command("nodes", "List cluster peer nodes and topology (alias: status)").Alias("status")
-	nodesJSONOut  = nodesCmd.Flag("json", "Output as JSON").Bool()
+	nodesJSONOut  = nodesCmd.Flag("json", "Output as JSON (full values, no column ellipsis)").Bool()
 	nodesUsageOut = nodesCmd.Flag("usage", "Query dynamic CPU & memory usage of nodes (heavier probe)").Short('u').Bool()
 	nodesPrune    = nodesCmd.Flag("prune-offline", "Remove known-offline executors from the transit ledger").Bool()
 
@@ -1312,7 +1311,7 @@ func runExec() {
 }
 
 // psRow 是 relay ps 的统一行:本地 node 持有的隧道 + 远端 detach 任务合并呈现。
-// 行是 JSON 的来源,故一律存完整值;列宽裁剪只发生在 psLine 的表格渲染里(--json 必须无损)。
+// 行是 JSON 的来源,故一律存完整值;列宽裁剪只发生在 renderPSTable 的表格渲染里(--json 必须无损)。
 type psRow struct {
 	Type    string `json:"type"` // "task" | "tunnel"
 	ID      string `json:"id"`
@@ -1332,15 +1331,56 @@ type psRow struct {
 	// statusDisplay 仅供表格:STATUS + 出口就绪。JSON 的 status 保持纯状态值(running/stopped),
 	// 免得机器消费者去解析人类文案。
 	statusDisplay string
+	// egressLatency 同样仅供表格的收窄形态:延迟只在 statusDisplay 的人类文案里,收窄时
+	// 重新拼一遍要用的原始值(未导出 = 不进 JSON)。
+	egressLatency string
 }
 
-// psRowFormat 是 relay ps 表格的行格式。独立成常量以便表头与行共用同一列宽(R20 的 RESTART 列
-// 必须与每一行对齐;表头由 psHeader 渲染,行由 psLine 渲染)。
-const psRowFormat = "%-8s %-12s %-16s %-30s %-16s %-8s %-6s %-16s %s\n"
-
-// PORTS 的定宽(与 psRowFormat 里那一段一致):它后面还有列,超宽会把整张表挤歪,只能裁。
-// COMMAND 是末列,裁它不影响对齐、只会丢信息,故不裁。
+// PORTS 的定宽上限:端口列表再长也只占这么多列(它后面还有列,超宽会把整张表挤歪),
+// 更长的部分交给 --json。终端更窄时 renderTable 会继续往下收。
 const psPortWidth = 16
+
+// psColumns 是 relay ps 的列定义。收窄只发生在渲染层(renderTable),psRow 始终是完整值:
+// 它是 --json 的来源,机器消费者按列宽丢信息是不可接受的。
+func psColumns() []tableCol {
+	return []tableCol{
+		{Title: "TYPE", Min: 4},
+		{Title: "TASK ID", Min: 6},
+		{Title: "NODE", Min: 6},
+		{Title: "STATUS", Min: 8},
+		{Title: "PORTS", Min: 6, Max: psPortWidth},
+		{Title: "RESTART", Min: 4},
+		{Title: "EXIT", Min: 3},
+		{Title: "CREATED", Min: 5},
+		{Title: "COMMAND", Min: 8},
+	}
+}
+
+// psCells 把一个行模型投影成表格格子。只有 STATUS 有收窄形态:被截断的 "running (1..." 读者
+// 分不出出口在线与否,故先降级成补充值 "11ms"/"offline",真的放不下才退到省略号。
+func psCells(r psRow) []tableCell {
+	return []tableCell{
+		textCell(r.Type),
+		textCell(r.ID),
+		textCell(r.Node),
+		{Full: r.displayStatus(), Compact: r.compactStatus()},
+		textCell(r.Ports),
+		textCell(r.Restart),
+		textCell(r.Exit),
+		textCell(r.Created),
+		textCell(r.Command),
+	}
+}
+
+// renderPSTable 渲染整张 relay ps 表(表头 + 各行)并报告是否省略过内容。width<=0 表示宽度未知,
+// 按自然宽渲染。整表一次渲染才能让表头与所有行共用同一组列宽(定宽 PORTS 之后的列必须对齐,R20)。
+func renderPSTable(rows []psRow, width int) ([]string, bool) {
+	cells := make([][]tableCell, len(rows))
+	for i, r := range rows {
+		cells[i] = psCells(r)
+	}
+	return renderTable(width, psColumns(), cells)
+}
 
 // relay ps 的出口探测预算:探针预算必须明显短于本地等待上限,否则慢出口会让本地先超时,
 // 隧道行只能退化成语义模糊的 `unknown`,而不是「出口 notready」。
@@ -1349,31 +1389,25 @@ const (
 	psEgressQueryTimeout = 3 * time.Second
 )
 
-// psHeader 渲染 relay ps 的表头行。独立成函数以便单测钉住 R20 的 RESTART 列位置。
-func psHeader() string {
-	return fmt.Sprintf(psRowFormat, "TYPE", "TASK ID", "NODE", "STATUS", "PORTS", "RESTART", "EXIT", "CREATED", "COMMAND")
-}
-
-// psLine 渲染表格里的一行。列宽裁剪只在这里发生:psRow 是 --json 的来源,必须保持完整值。
-func psLine(r psRow) string {
-	return fmt.Sprintf(psRowFormat, r.Type, r.ID, r.Node, r.displayStatus(), fitCell(r.Ports, psPortWidth), r.Restart, r.Exit, r.Created, r.Command)
-}
-
-// fitCell 把单元格收到定宽列的宽度,超出部分以 "..." 结尾。按 rune 裁,避免切断多字节字符
-// (主机名可以是 Unicode,按字节裁会切出非法 UTF-8)。
-func fitCell(s string, width int) string {
-	if utf8.RuneCountInString(s) <= width {
-		return s
-	}
-	return string([]rune(s)[:width-3]) + "..."
-}
-
 // displayStatus 返回表格用的 STATUS 单元格:叠加了出口就绪时用叠加文案,否则用纯 status。
 func (r psRow) displayStatus() string {
 	if r.statusDisplay != "" {
 		return r.statusDisplay
 	}
 	return r.Status
+}
+
+// compactStatus 是 STATUS 的收窄形态:出口叠加本身就是 "running (11ms)" 这种「状态 + 括号补充」
+// 的形态,收窄时只有补充值值得留("11ms"/"offline"),running 是这一列最不缺的信息。
+// 没有出口叠加(任务行、stopped 隧道)时返回空,交给省略号。
+func (r psRow) compactStatus() string {
+	if r.EgressStatus == "" {
+		return ""
+	}
+	if r.EgressStatus == "ready" && r.egressLatency != "" {
+		return r.egressLatency
+	}
+	return r.EgressStatus
 }
 
 // portDisplay 渲染一条端口转发规格用于 ps 的 PORTS 列。历史形态(回环绑定)保持字节一致,
@@ -1509,6 +1543,8 @@ func egressStateOf(e protocol.ExecutorHealth) egressState {
 
 // applyEgressStatus 把出口就绪落到隧道行上:表格 STATUS 追加出口健康,JSON 补 egress_status/egress_ready。
 // 只写 statusDisplay,不改 Status —— JSON 的 status 必须保持纯状态值(running/stopped)。
+// 括号里只留结论本身("egress" 是这一列每一条隧道共有的前缀,说了等于没说):
+// 就绪给延迟 running (11ms),其余给 running (offline)/(notready)/(unknown)。
 // stopped 的隧道没有出口可探,保持原样;探测不可用(m 为 nil)或台账里没有该 egress 时记 unknown。
 // 纯函数,便于单测。
 func applyEgressStatus(r *psRow, m map[string]egressState) {
@@ -1518,21 +1554,22 @@ func applyEgressStatus(r *psRow, m map[string]egressState) {
 	st, ok := m[r.Egress]
 	if !ok {
 		r.EgressStatus = "unknown"
-		r.statusDisplay = r.Status + " (egress unknown)"
+		r.statusDisplay = r.Status + " (unknown)"
 		return
 	}
 	r.EgressStatus = st.Text
 	ready := st.Ready
 	r.EgressReady = &ready
 	if st.Ready {
+		r.egressLatency = st.Latency
 		if st.Latency != "" {
-			r.statusDisplay = fmt.Sprintf("%s (egress ready %s)", r.Status, st.Latency)
+			r.statusDisplay = fmt.Sprintf("%s (%s)", r.Status, st.Latency)
 		} else {
-			r.statusDisplay = fmt.Sprintf("%s (egress ready)", r.Status)
+			r.statusDisplay = fmt.Sprintf("%s (ready)", r.Status)
 		}
 		return
 	}
-	r.statusDisplay = fmt.Sprintf("%s (egress %s)", r.Status, st.Text)
+	r.statusDisplay = fmt.Sprintf("%s (%s)", r.Status, st.Text)
 }
 
 func runPs() {
@@ -1607,9 +1644,13 @@ func runPs() {
 		return
 	}
 
-	fmt.Print(psHeader())
-	for _, r := range rows {
-		fmt.Print(psLine(r))
+	lines, truncated := renderPSTable(rows, outputWidth())
+	for _, l := range lines {
+		fmt.Println(l)
+	}
+	// 省略是为了不换行;被省掉的部分从 --json 取(它是无损的那一面)。
+	if truncated {
+		fmt.Fprintln(os.Stderr, truncationHint("relay ps"))
 	}
 }
 
@@ -2129,6 +2170,49 @@ type PeerNodeItem struct {
 	Version  string   `json:"version"`
 	Latency  string   `json:"latency"`
 	Args     []string `json:"args,omitempty"`
+
+	// 仅供表格的收窄形态(未导出 = 不进 JSON):CPU/MEMORY 收窄时先降级成百分比。
+	cpuCompact string
+	memCompact string
+}
+
+// nodesColumns 是 relay nodes 的列定义。省略只发生在渲染层,PeerNodeItem 始终是完整值
+// (--json 的来源)。
+func nodesColumns() []tableCol {
+	return []tableCol{
+		{Title: "NAME", Min: 10, Max: 24},
+		{Title: "ROLES", Min: 5, Max: 10},
+		{Title: "STATUS", Min: 7, Max: 8},
+		{Title: "PLATFORM", Min: 8, Max: 14},
+		{Title: "CPU", Min: 6},
+		{Title: "MEMORY", Min: 6},
+		{Title: "VERSION", Min: 8, Max: 16},
+		{Title: "LATENCY", Min: 6, Max: 20},
+	}
+}
+
+// nodesCells 把一个节点投影成表格格子。CPU/MEMORY 带 -u 的百分比收窄形态:终端放不下
+// "8c (40%) [pod]" 时,40% 才是 -u 要看的东西,截成 "8c (4..." 等于什么都没说。
+func nodesCells(n PeerNodeItem) []tableCell {
+	return []tableCell{
+		textCell(n.ID),
+		textCell(n.Role),
+		textCell(n.Status),
+		textCell(n.Platform),
+		{Full: n.CPU, Compact: n.cpuCompact},
+		{Full: n.Memory, Compact: n.memCompact},
+		textCell(n.Version),
+		textCell(n.Latency),
+	}
+}
+
+// renderNodesTable 渲染整张 relay nodes 表(表头 + 各行)并报告是否省略过内容。
+func renderNodesTable(nodes []PeerNodeItem, width int) ([]string, bool) {
+	cells := make([][]tableCell, len(nodes))
+	for i, n := range nodes {
+		cells[i] = nodesCells(n)
+	}
+	return renderTable(width, nodesColumns(), cells)
 }
 
 // runNodes 查看全网节点拓扑状态与角色 (类似 kubectl get nodes / docker node ls)
@@ -2187,16 +2271,19 @@ func runNodes() {
 
 	localRes := sysinfo.CollectResourceInfo(withUsage)
 	localCPU, localMem := formatNodeResource(localRes, withUsage)
+	localCPUCompact, localMemCompact := formatNodeResourceCompact(localRes, withUsage)
 
 	nodes = append(nodes, PeerNodeItem{
-		ID:       cfg.NodeID() + " (local)",
-		Role:     localRoles,
-		Status:   "Ready",
-		Platform: localPlatform,
-		CPU:      localCPU,
-		Memory:   localMem,
-		Version:  localVer,
-		Latency:  "-",
+		ID:         cfg.NodeID() + " (local)",
+		Role:       localRoles,
+		Status:     "Ready",
+		Platform:   localPlatform,
+		CPU:        localCPU,
+		Memory:     localMem,
+		Version:    localVer,
+		Latency:    "-",
+		cpuCompact: localCPUCompact,
+		memCompact: localMemCompact,
 	})
 
 	// 2. Hub / Transit 节点
@@ -2212,6 +2299,7 @@ func runNodes() {
 		IsContainer: st.Resource.IsContainer,
 	}
 	transitCPU, transitMem := formatNodeResource(transitSysRes, withUsage)
+	transitCPUCompact, transitMemCompact := formatNodeResourceCompact(transitSysRes, withUsage)
 
 	transitRole := "hub"
 	hasHubAgent := false
@@ -2226,15 +2314,17 @@ func runNodes() {
 	}
 
 	nodes = append(nodes, PeerNodeItem{
-		ID:       "hub (transit)",
-		Role:     transitRole,
-		Status:   "Ready",
-		Platform: transitPlatform,
-		CPU:      transitCPU,
-		Memory:   transitMem,
-		Version:  ident(st.Transit),
-		Latency:  segmentText(st.Seg1),
-		Args:     st.Transit.Args,
+		ID:         "hub (transit)",
+		Role:       transitRole,
+		Status:     "Ready",
+		Platform:   transitPlatform,
+		CPU:        transitCPU,
+		Memory:     transitMem,
+		Version:    ident(st.Transit),
+		Latency:    segmentText(st.Seg1),
+		Args:       st.Transit.Args,
+		cpuCompact: transitCPUCompact,
+		memCompact: transitMemCompact,
 	})
 
 	// 3. 远端 Agent / Executor 节点。本机 node 若以 agent 运行会作为 executor 注册进台账,
@@ -2276,16 +2366,19 @@ func runNodes() {
 			IsContainer: e.Resource.IsContainer,
 		}
 		execCPU, execMem := formatNodeResource(execSysRes, withUsage)
+		execCPUCompact, execMemCompact := formatNodeResourceCompact(execSysRes, withUsage)
 
 		nodes = append(nodes, PeerNodeItem{
-			ID:       e.ExecutorID,
-			Role:     "agent",
-			Status:   stText,
-			Platform: platform,
-			CPU:      execCPU,
-			Memory:   execMem,
-			Version:  identStr(e.Version),
-			Latency:  latency,
+			ID:         e.ExecutorID,
+			Role:       "agent",
+			Status:     stText,
+			Platform:   platform,
+			CPU:        execCPU,
+			Memory:     execMem,
+			Version:    identStr(e.Version),
+			Latency:    latency,
+			cpuCompact: execCPUCompact,
+			memCompact: execMemCompact,
 		})
 	}
 
@@ -2296,17 +2389,13 @@ func runNodes() {
 		return
 	}
 
-	// 文本表格输出 (类似 kubectl get nodes)
-	if withUsage {
-		fmt.Printf("%-24s %-10s %-8s %-14s %-16s %-24s %-16s %s\n", "NAME", "ROLES", "STATUS", "PLATFORM", "CPU", "MEMORY", "VERSION", "LATENCY")
-		for _, n := range nodes {
-			fmt.Printf("%-24s %-10s %-8s %-14s %-16s %-24s %-16s %s\n", n.ID, n.Role, n.Status, n.Platform, n.CPU, n.Memory, n.Version, n.Latency)
-		}
-	} else {
-		fmt.Printf("%-24s %-10s %-8s %-14s %-12s %-14s %-16s %s\n", "NAME", "ROLES", "STATUS", "PLATFORM", "CPU", "MEMORY", "VERSION", "LATENCY")
-		for _, n := range nodes {
-			fmt.Printf("%-24s %-10s %-8s %-14s %-12s %-14s %-16s %s\n", n.ID, n.Role, n.Status, n.Platform, n.CPU, n.Memory, n.Version, n.Latency)
-		}
+	// 文本表格输出 (类似 kubectl get nodes):整表一次渲染,列宽随终端宽度自适应,绝不换行。
+	lines, truncated := renderNodesTable(nodes, outputWidth())
+	for _, l := range lines {
+		fmt.Println(l)
+	}
+	if truncated {
+		fmt.Fprintln(os.Stderr, truncationHint("relay nodes"))
 	}
 }
 
@@ -2342,6 +2431,14 @@ func formatNodeResource(res sysinfo.ResourceInfo, withUsage bool) (cpu, mem stri
 		return res.FormatCPUUsage(), res.FormatMemUsage()
 	}
 	return res.FormatCPUSummary(), res.FormatMemSummary()
+}
+
+// formatNodeResourceCompact 给出资源列的收窄形态:只留百分比(空串 = 没有更短的形态,交给省略号)。
+func formatNodeResourceCompact(res sysinfo.ResourceInfo, withUsage bool) (cpu, mem string) {
+	if !withUsage {
+		return "", ""
+	}
+	return res.FormatCPUPercentCompact(), res.FormatMemPercentCompact()
 }
 
 // runVersion 打印纯本机构建信息。跨机版本台账职责已归一到 `relay status`;`--json` 仍保留。

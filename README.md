@@ -201,10 +201,14 @@ relay ps -e node-1 -a
 
 Displays tasks managed by the node's TaskSupervisor across macOS, Linux, and Windows:
 ```
-TYPE     TASK ID                 NODE             STATUS                         PORTS            RESTART  EXIT   CREATED          COMMAND
-task     t-a1b2c3d4-1718000000   node-1           running                        8080             always   -      12m34s ago       npm run dev
-task     t-e5f6g7h8-1718000500   node-1           stopped                        -                no       0      3h ago           pytest tests/ (exit: 0)
+TYPE   TASK ID               NODE   STATUS  PORTS          RESTART EXIT CREATED COMMAND
+task   t-a1b2c3d4-1718000000 node-1 running 8080           always  -    12m ago npm run dev
+task   t-e5f6g7h8-1718000500 node-1 exited  -              no      0    3h ago  pytest tests/ (exit: 0)
+tunnel site-a                site-a running 127.0.0.1:1080 always  -    3m ago  egress site-a
 ```
+
+Column widths come from the content, and the table adapts to the terminal: when the output is wider than
+the window it is narrowed (never wrapped) and over-long cells end in `...`. `--json` is lossless.
 
 Rows come in two kinds, distinguished by the `TYPE` column: `task` rows are remote detach tasks and
 `tunnel` rows are node-held tunnels (egress in `COMMAND`, listen address in `PORTS`).
@@ -291,21 +295,26 @@ relay nodes --usage
 
 Displays cluster topology with node identities, roles (`hub`, `agent`), operational readiness, platform architecture, and end-to-end latency:
 ```
-NAME                     ROLES          STATUS     VERSION          PLATFORM         LATENCY
-CT-MBP.local (local)     agent          Ready      feae97f+feae97f  darwin/arm64     -
-hub (transit)            hub            Ready      feae97f+feae97f  linux/amd64      9 ms
-extranet                 agent          Ready      feae97f+feae97f  -                12 ms
-intranet                 agent          Ready      feae97f+feae97f  -                13 ms
+NAME                 ROLES STATUS PLATFORM      CPU      MEMORY      VERSION        LATENCY
+CT-MBP.local (local) agent Ready  darwin/arm64  8c       16.0G       v0.4.5+13f288f -
+hub (transit)        hub   Ready  linux/amd64   8c [pod] 16.0G [pod] v0.4.5+13f288f 9 ms
+extranet             agent Ready  windows/amd64 4c       12.0G       v0.4.5+13f288f 12 ms
+intranet             agent Ready  linux/amd64   4c       8.0G        v0.4.5+13f288f 13 ms
 ```
 
-With `-u` / `--usage` two more columns appear, both expressed as a percentage of what that node is allowed to use:
+With `-u` / `--usage` the `CPU` and `MEMORY` columns switch to live usage, both expressed as a percentage of what that node is allowed to use:
 ```
-NAME                     ROLES      STATUS   PLATFORM       CPU              MEMORY                   VERSION          LATENCY
-CT-MBP.local (local)     agent      Ready    darwin/arm64   8c (24%)         2.2G/16.0G (14%)         v0.4.4+420028d   -
-hub (transit)            hub, agent Ready    linux/amd64    8c (0%) [pod]    0.3G/16.0G (2%) [pod]    v0.4.4+420028d   6 ms
-extranet                 agent      Ready    windows/amd64  4c (5%)          5.7G/12.0G (47%)         v0.4.4+420028d   111 ms
+NAME                 ROLES      STATUS PLATFORM      CPU           MEMORY                VERSION        LATENCY
+CT-MBP.local (local) agent      Ready  darwin/arm64  8c (24%)      2.2G/16.0G (14%)      v0.4.5+13f288f -
+hub (transit)        hub, agent Ready  linux/amd64   8c (0%) [pod] 0.3G/16.0G (2%) [pod] v0.4.5+13f288f 6 ms
+extranet             agent      Ready  windows/amd64 4c (5%)       5.7G/12.0G (47%)      v0.4.5+13f288f 111 ms
 ```
 `CPU` reads as `<quota> (<used>)`: the quota is the cgroup CPU limit inside a container, otherwise the machine's core count. `MEMORY` is `used/total (percent)`. The `[pod]` suffix marks values read from the container's own cgroup rather than the host's — including in the CPU column, which on a pod is sampled from `cpu.stat` so a busy host can't be mistaken for a busy pod. Nodes running a build older than this protocol change report no percentage and simply show their static quota until they are redeployed; a genuinely idle node shows `(0%)` instead of dropping the column.
+
+Both tables adapt to the terminal width instead of wrapping (a half-screen pane is the common case for
+`relay nodes -u`): columns are laid out from their content and narrowed when needed, and a cell that still
+does not fit is elided with `...`. The usage columns degrade to just the percentage (`24%`) before any
+ellipsis, because the percentage is what `-u` was asked for. `relay nodes --json` stays lossless.
 
 Nodes that registered before but are currently disconnected show `STATUS Offline` and `LATENCY -`. The transit keeps a **known-executor ledger** so offline nodes stay visible (persisted to `server.watch_root/known_executors.json`; everything loads as offline until the node re-registers). To remove offline entries for good, prune them:
 
@@ -548,9 +557,10 @@ workspace mapping. `-w` is **not** accepted in tunnel mode — it means workspac
 workspace-scoped.
 
 The tunnel row's STATUS carries egress reachability, because a live local listener says nothing about the
-far end of the three-hop chain (local → transit → egress): `running (egress ready 11ms)`,
-`running (egress offline)`, `running (egress notready)`, or `running (egress unknown)` when the transit
-can't be queried.
+far end of the three-hop chain (local → transit → egress): `running (11ms)` when the egress answers,
+`running (ready)` when it answers without a measured latency, `running (offline)`, `running (notready)`,
+or `running (unknown)` when the transit can't be queried. The parenthesised value is the whole point of
+the column, so `egress` is not repeated in it.
 
 **Restart policy (`--restart=always|no`, default `no`).** The recovery event is the node's next start
 (tunnels are goroutines inside the node process). `always` reopens the listener when the node starts; `no`
@@ -570,17 +580,22 @@ relay stop site-a        # close + forget the tunnel
 relay logs site-a -f     # streams the tunnel's lines from ~/.relay/node.log (prefix `[tunnel site-a]`)
 ```
 
-A tunnel row's STATUS also reports egress reachability (`running (egress ready 11ms)` / `(egress offline)`
-/ `(egress notready)` / `(egress unknown)`), from the same cluster ledger `relay nodes` uses — one extra
-transit query, issued only when a tunnel is actually running, bounded by an 800ms per-egress probe budget
-and degrading to `unknown` rather than failing. `--json` exposes it as `egress_status` / `egress_ready`.
+A tunnel row's STATUS also reports egress reachability (`running (11ms)` / `(ready)` / `(offline)` /
+`(notready)` / `(unknown)`), from the same cluster ledger `relay nodes` uses — one extra transit query,
+issued only when a tunnel is actually running, bounded by an 800ms per-egress probe budget and degrading
+to `unknown` rather than failing. `--json` exposes it as `egress_status` / `egress_ready`.
 
 `relay ps` still lists tunnels when the transit is unreachable — only the remote task list degrades.
 
-The table narrows the fixed-width `PORTS` cell (a long port list shows as `8080:9000,909...`) because the
-columns after it must stay aligned; `COMMAND` is the last column and is never truncated. `--json` is
-lossless either way: it always carries the complete command line and the full port list, so it is the
-surface to parse when a command is too long to read in the table.
+The table adapts to the terminal width and never wraps: columns are laid out from their content, then
+narrowed proportionally (a column never drops below its header), and anything that still does not fit is
+elided with `...` — the last column being the one that gives up the most room, since it is a free-form
+command line. A long port list therefore shows as `8080:9000,909...`, and a tunnel STATUS keeps the
+parenthesised verdict (`(11ms)`) even when it can no longer afford the `running` prefix. On a narrow
+terminal (a half-screen pane) long commands are elided rather than wrapped; `--json` is lossless either
+way and always carries the complete command line and the full port list, so it is the surface to parse
+when a command is too long to read in the table. Eliding only happens when a width is known: with stdout
+redirected or piped there is no terminal to measure (unless `COLUMNS` is set) and nothing is omitted.
 
 **Two behaviours that are easy to misread:**
 

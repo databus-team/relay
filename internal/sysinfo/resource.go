@@ -92,14 +92,39 @@ func (r *ResourceInfo) FormatMemUsage() string {
 	totalGB := float64(r.MemTotalMB) / 1024.0
 	if r.MemUsedMB > 0 {
 		usedGB := float64(r.MemUsedMB) / 1024.0
-		pct := int(float64(r.MemUsedMB) * 100.0 / float64(r.MemTotalMB))
-		res := fmt.Sprintf("%.1fG/%.1fG (%d%%)", usedGB, totalGB, pct)
+		res := fmt.Sprintf("%.1fG/%.1fG (%s)", usedGB, totalGB, r.memPercent())
 		if r.IsContainer {
 			res += " [pod]"
 		}
 		return res
 	}
 	return r.FormatMemSummary()
+}
+
+// FormatCPUPercentCompact 只渲染 CPU 用量百分比(如 "40%"),供终端过窄时的降级展示:
+// 完整形态 "8c (40%) [pod]" 一旦被截断,百分比最先丢掉,而它才是 --usage 要看的东西。
+// 没采到用量时返回空串,让调用方退到省略号,而不是展示一个假的 0%。
+func (r *ResourceInfo) FormatCPUPercentCompact() string {
+	if r.CPUPercent == nil {
+		return ""
+	}
+	return fmt.Sprintf("%.0f%%", *r.CPUPercent)
+}
+
+// FormatMemPercentCompact 只渲染内存用量百分比(如 "26%"),理由同 FormatCPUPercentCompact。
+func (r *ResourceInfo) FormatMemPercentCompact() string {
+	if r.MemUsedMB <= 0 {
+		return ""
+	}
+	return r.memPercent()
+}
+
+// memPercent 渲染内存用量百分比,与 FormatMemUsage 里的百分比同源(截断而非四舍五入)。
+func (r *ResourceInfo) memPercent() string {
+	if r.MemTotalMB <= 0 {
+		return "0%"
+	}
+	return fmt.Sprintf("%d%%", int(float64(r.MemUsedMB)*100.0/float64(r.MemTotalMB)))
 }
 
 // parseProcStatCPU 累加 /proc/stat 首行(所有核)的计数,返回忙时与总时(jiffies)。

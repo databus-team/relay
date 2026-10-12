@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/portfwd"
@@ -88,7 +87,7 @@ func TestTaskToPSRow(t *testing.T) {
 		t.Errorf("Created = %q, want relative time", running.Created)
 	}
 
-	// 端口串保留完整值:裁剪只发生在表格渲染(见 TestPSLineTruncatesPortsNotCommand)。
+	// 端口串保留完整值:裁剪只发生在表格渲染(见 TestPSRowKeepsFullCommandAndJSON)。
 	multi := taskToPSRow(backend.TaskInfo{ID: "t-4", Status: "running", StartTime: now, Ports: []portfwd.Spec{
 		{BindHost: "127.0.0.1", LocalPort: 8080, RemoteHost: "127.0.0.1", RemotePort: 9000},
 		{BindHost: "127.0.0.1", LocalPort: 9090, RemoteHost: "127.0.0.1", RemotePort: 10000},
@@ -154,9 +153,10 @@ func TestTaskToPSRow(t *testing.T) {
 	}
 }
 
-// TestPSRowKeepsFullCommand 覆盖“命令太长看不全”的回归:行模型(即 --json 的字段来源)保留完整
-// 命令行,表格也不裁 COMMAND —— 它是末列,收窄不影响对齐、只会丢信息。定宽 PORTS 列照旧收窄。
-func TestPSRowKeepsFullCommand(t *testing.T) {
+// TestPSRowKeepsFullCommandAndJSON 覆盖“命令太长看不全”的回归:表格渲染不改变行模型,
+// 行模型(即 --json 的字段来源)始终保留完整命令行与完整端口列表;PORTS 的定宽上限只在
+// 表格里生效。
+func TestPSRowKeepsFullCommandAndJSON(t *testing.T) {
 	longCmd := "python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4"
 	row := taskToPSRow(backend.TaskInfo{
 		ID:        "t-1",
@@ -170,8 +170,17 @@ func TestPSRowKeepsFullCommand(t *testing.T) {
 		},
 	})
 
-	line := psLine(row)
-	if !strings.HasSuffix(line, longCmd+"\n") {
+	if row.Command != longCmd || row.Ports != "8080:9000,9090:10000" {
+		t.Fatalf("row model lost data: command=%q ports=%q", row.Command, row.Ports)
+	}
+
+	// 宽度未知(重定向/管道):按自然宽渲染,一个字符都不省,但 PORTS 的定宽上限照旧。
+	lines, truncated := renderPSTable([]psRow{row}, 0)
+	if truncated {
+		t.Errorf("width=0 must not truncate, got %v", lines)
+	}
+	line := lines[1]
+	if !strings.HasSuffix(line, longCmd) {
 		t.Errorf("table line = %q, want it to end with the full command %q", line, longCmd)
 	}
 	if !strings.Contains(line, "8080:9000,909...") {
@@ -197,25 +206,66 @@ func TestPSRowKeepsFullCommand(t *testing.T) {
 	}
 }
 
-// TestFitCell 覆盖单元格收窄:够宽原样返回,超宽按 rune 裁剪(Windows 主机名可以是 Unicode,
-// 按字节裁会切出非法 UTF-8)。
-func TestFitCell(t *testing.T) {
-	if got := fitCell("8080:9000", psPortWidth); got != "8080:9000" {
-		t.Errorf("fitCell(short) = %q, want unchanged", got)
+// TestPSTableFitsHalfScreen 钉住这次的核心诉求:左右半屏(窄终端)下 relay ps 不换行 ——
+// 每一行的显示宽度都不超过终端宽度,超长的 COMMAND 以省略号收尾,而 --json 仍是完整值。
+func TestPSTableFitsHalfScreen(t *testing.T) {
+	longCmd := "python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4"
+	rows := []psRow{
+		taskToPSRow(backend.TaskInfo{
+			ID:        "t-a1b2c3d4-1718000000",
+			Node:      "gpu-node-01.internal",
+			Status:    "running",
+			StartTime: time.Now().Unix(),
+			Cmd:       longCmd,
+			Ports: []portfwd.Spec{
+				{BindHost: "127.0.0.1", LocalPort: 8080, RemoteHost: "127.0.0.1", RemotePort: 9000},
+				{BindHost: "127.0.0.1", LocalPort: 9090, RemoteHost: "127.0.0.1", RemotePort: 10000},
+			},
+		}),
+		tunnelToPSRow(tunnelState{
+			Egress:  "site-a-egress-node",
+			Listen:  "127.0.0.1:1080",
+			Restart: tunRestartAlways,
+			State:   "running",
+			Started: time.Now().Add(-3 * time.Minute),
+		}),
 	}
-	if got := fitCell("8080:9000,9090:10000", psPortWidth); got != "8080:9000,909..." {
-		t.Errorf("fitCell(long) = %q, want %q", got, "8080:9000,909...")
+	applyEgressStatus(&rows[1], map[string]egressState{"site-a-egress-node": {Ready: true, Text: "ready", Latency: "11ms"}})
+
+	const width = 80
+	lines, truncated := renderPSTable(rows, width)
+	if !truncated {
+		t.Fatalf("expected truncation at width %d, got %q", width, lines)
 	}
-	got := fitCell(strings.Repeat("中文主机", 5)+":8080", psPortWidth)
-	if !utf8.ValidString(got) || utf8.RuneCountInString(got) != psPortWidth {
-		t.Errorf("fitCell(unicode) = %q, want %d valid runes", got, psPortWidth)
+	for _, l := range lines {
+		if w := cellWidth(l); w > width {
+			t.Errorf("line %d cells wide, terminal is %d: %q", w, width, l)
+		}
+	}
+	if !strings.HasSuffix(lines[0], "COMMAND") {
+		t.Errorf("header = %q, want the COMMAND column last", lines[0])
+	}
+	if !strings.Contains(lines[1], "...") {
+		t.Errorf("long command row = %q, want an ellipsis", lines[1])
+	}
+	if strings.Contains(lines[1], longCmd) {
+		t.Errorf("row = %q, want the command shortened to fit", lines[1])
+	}
+	// 出口就绪的结论必须活下来:STATUS 收窄时先退到括号里的补充值("11ms"),而不是把整格
+	// 截成 "running..." —— 那就分不出出口在线与否了。
+	if !strings.Contains(lines[2], "11ms") {
+		t.Errorf("tunnel row = %q, want the compacted egress verdict", lines[2])
+	}
+	if strings.Contains(lines[2], "(11ms)") {
+		t.Errorf("tunnel row = %q, want the compacted (not full) status at this width", lines[2])
 	}
 }
 
-// TestPSHeaderContainsRestart 钉住 R20 的 RESTART 列:表头与行共用 psRowFormat,列必须出现在 PORTS
-// 与 EXIT 之间,否则对齐会错位。
+// TestPSHeaderContainsRestart 钉住 R20 的 RESTART 列:表头与各行共用同一组列宽(整表一次渲染),
+// 列必须出现在 PORTS 与 EXIT 之间,否则对齐会错位。
 func TestPSHeaderContainsRestart(t *testing.T) {
-	h := psHeader()
+	lines, _ := renderPSTable(nil, 0)
+	h := lines[0]
 	if !strings.Contains(h, "RESTART") {
 		t.Fatalf("ps header %q missing RESTART column", h)
 	}
@@ -362,7 +412,7 @@ func TestApplyEgressStatus(t *testing.T) {
 			name:        "ready",
 			row:         psRow{Type: "tunnel", Egress: "eg", Status: "running"},
 			m:           ready,
-			wantDisplay: "running (egress ready 11ms)",
+			wantDisplay: "running (11ms)",
 			wantText:    "ready",
 			wantReady:   boolPtr(true),
 		},
@@ -370,7 +420,7 @@ func TestApplyEgressStatus(t *testing.T) {
 			name:        "ready 无延迟",
 			row:         psRow{Type: "tunnel", Egress: "eg", Status: "running"},
 			m:           map[string]egressState{"eg": {Ready: true, Text: "ready"}},
-			wantDisplay: "running (egress ready)",
+			wantDisplay: "running (ready)",
 			wantText:    "ready",
 			wantReady:   boolPtr(true),
 		},
@@ -378,7 +428,7 @@ func TestApplyEgressStatus(t *testing.T) {
 			name:        "offline",
 			row:         psRow{Type: "tunnel", Egress: "eg", Status: "running"},
 			m:           map[string]egressState{"eg": {Text: "offline"}},
-			wantDisplay: "running (egress offline)",
+			wantDisplay: "running (offline)",
 			wantText:    "offline",
 			wantReady:   boolPtr(false),
 		},
@@ -386,7 +436,7 @@ func TestApplyEgressStatus(t *testing.T) {
 			name:        "notready",
 			row:         psRow{Type: "tunnel", Egress: "eg", Status: "running"},
 			m:           map[string]egressState{"eg": {Text: "notready"}},
-			wantDisplay: "running (egress notready)",
+			wantDisplay: "running (notready)",
 			wantText:    "notready",
 			wantReady:   boolPtr(false),
 		},
@@ -394,14 +444,14 @@ func TestApplyEgressStatus(t *testing.T) {
 			name:        "探测不可用(m 为 nil) → unknown",
 			row:         psRow{Type: "tunnel", Egress: "eg", Status: "running"},
 			m:           nil,
-			wantDisplay: "running (egress unknown)",
+			wantDisplay: "running (unknown)",
 			wantText:    "unknown",
 		},
 		{
 			name:        "台账里没有该 egress → unknown",
 			row:         psRow{Type: "tunnel", Egress: "eg", Status: "running"},
 			m:           map[string]egressState{"other": {Ready: true, Text: "ready"}},
-			wantDisplay: "running (egress unknown)",
+			wantDisplay: "running (unknown)",
 			wantText:    "unknown",
 		},
 		{
