@@ -81,6 +81,11 @@ func (s *Supervisor) loadExistingTasks() {
 			}
 		}
 
+		// 旧的记录没有首次创建时间，回退到最近一次启动时间（KTD3，无需迁移脚本）。
+		if meta.CreatedAt.IsZero() {
+			meta.CreatedAt = meta.StartTime
+		}
+
 		t := &Task{
 			meta:      meta,
 			dir:       taskDir,
@@ -164,10 +169,18 @@ func (s *Supervisor) StartTaskWithPorts(cmdStr, cwd string, ports []string, env 
 	}
 
 	task := newTaskWithPorts(id, cmdStr, cwd, ports, taskDir)
+	if err := s.launch(task, env); err != nil {
+		return nil, err
+	}
+	return task, nil
+}
 
+// launch 打开任务日志、解析 shell、启动进程并挂上日志管道与生命周期收尾。调用方必须持有 s.mu。
+// env 只随首次创建传入；重启按 R10 不重放首次运行的环境。
+func (s *Supervisor) launch(task *Task, env []string) error {
 	logFile, err := os.OpenFile(task.meta.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("open task log: %w", err)
+		return fmt.Errorf("open task log: %w", err)
 	}
 	task.logFile = logFile
 
@@ -175,14 +188,14 @@ func (s *Supervisor) StartTaskWithPorts(cmdStr, cwd string, ports []string, env 
 	var args []string
 	if len(shellPrefix) > 0 {
 		args = append(args, shellPrefix...)
-		args = append(args, cmdStr)
+		args = append(args, task.meta.Cmd)
 	} else {
-		args = []string{"-c", cmdStr}
+		args = []string{"-c", task.meta.Cmd}
 	}
 
 	cmd := exec.Command(shell, args...)
-	if cwd != "" {
-		cmd.Dir = cwd
+	if task.meta.Cwd != "" {
+		cmd.Dir = task.meta.Cwd
 	}
 	cmd.Env = append(os.Environ(), env...)
 	prepareCmdAttr(cmd)
@@ -190,17 +203,17 @@ func (s *Supervisor) StartTaskWithPorts(cmdStr, cwd string, ports []string, env 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		logFile.Close()
-		return nil, fmt.Errorf("stdout pipe: %w", err)
+		return fmt.Errorf("stdout pipe: %w", err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		logFile.Close()
-		return nil, fmt.Errorf("stderr pipe: %w", err)
+		return fmt.Errorf("stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
-		return nil, fmt.Errorf("start process: %w", err)
+		return fmt.Errorf("start process: %w", err)
 	}
 
 	task.cmd = cmd
@@ -208,10 +221,10 @@ func (s *Supervisor) StartTaskWithPorts(cmdStr, cwd string, ports []string, env 
 	if err := task.persist(); err != nil {
 		_ = killProcessTree(cmd.Process.Pid)
 		logFile.Close()
-		return nil, fmt.Errorf("persist task meta: %w", err)
+		return fmt.Errorf("persist task meta: %w", err)
 	}
 
-	s.tasks[id] = task
+	s.tasks[task.meta.ID] = task
 
 	// 异步读取管道
 	var wg sync.WaitGroup
@@ -254,12 +267,91 @@ func (s *Supervisor) StartTaskWithPorts(cmdStr, cwd string, ports []string, env 
 			_ = task.logFile.Close()
 			task.logFile = nil
 		}
-		_ = task.persist()
+		// 已被同 id 新实例取代:收尾照做(日志同步关闭、完成信号关闭),但不写回记录 ——
+		// 否则这份旧实例的 status/pid/end_time 会盖掉新实例刚写下的运行态。
+		if !task.superseded {
+			_ = task.persist()
+		}
 		close(task.done)
 		task.mu.Unlock()
 	}()
 
+	return nil
+}
+
+// restartStopTimeout 是重启前等待旧实例退出的上限。对启动时认领的遗留进程不能等完成信号
+// （那个信号只在本进程启动的任务上才会关闭），因此只做有界存活探测（KTD2、KTD10）。
+const restartStopTimeout = 3 * time.Second
+
+// RestartTask 在同一个 id、同一个任务目录上以记录中的命令、工作目录与端口重新运行任务（R9–R11）。
+// 停掉旧实例与有界等待都在 s.mu 之外进行 —— 那一步最长可拖到 4.5s（1.5s 杀进程树 + 3s 有界等待），
+// 不该把 ListTasks/StartTask 一起堵住。
+func (s *Supervisor) RestartTask(id string) (*Task, error) {
+	s.mu.RLock()
+	prev, ok := s.tasks[id]
+	s.mu.RUnlock()
+	if !ok {
+		return nil, ErrTaskNotFound
+	}
+
+	meta := prev.Meta()
+
+	if meta.Cwd != "" {
+		info, err := os.Stat(meta.Cwd)
+		if err != nil || !info.IsDir() {
+			return nil, fmt.Errorf("cannot restart task %s: working directory no longer exists: %s", id, meta.Cwd)
+		}
+	}
+
+	// 该对象即将被替代:它的收尾不得再写回记录(A1)。
+	prev.markSuperseded()
+
+	// 仍在运行的实例（含执行方崩溃后认领的遗留进程）先停掉并有界等待其退出（R11）。
+	if isProcessAlive(meta.PID) {
+		_ = prev.Stop()
+		waitProcessGone(meta.PID, restartStopTimeout)
+	}
+
+	taskDir := filepath.Join(s.baseDir, id)
+	task := newTaskWithPorts(id, meta.Cmd, meta.Cwd, meta.Ports, taskDir)
+	task.meta.Restart = meta.Restart
+	task.meta.CreatedAt = meta.CreatedAt
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 上一个实例不能被并发重启悄悄替换掉:装新实例前确认时间线上没有别的赢家。
+	cur, ok := s.tasks[id]
+	if !ok || cur != prev {
+		return nil, fmt.Errorf("task %s was replaced by a concurrent restart", id)
+	}
+	if err := s.launch(task, nil); err != nil {
+		return nil, err
+	}
 	return task, nil
+}
+
+// waitProcessGone 以有界轮询等待进程退出。超时返回 false 后调用方仍以新进程继续。
+// 轮询间隔按 ×1.5 退避到 200ms 上限:一次 3s 等待只需十余次探测,而不是 Windows 上每 20ms
+// 一次 tasklist 的百来次。
+func waitProcessGone(pid int, timeout time.Duration) bool {
+	if pid <= 0 {
+		return true
+	}
+	deadline := time.Now().Add(timeout)
+	interval := 20 * time.Millisecond
+	for {
+		if !isProcessAlive(pid) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(interval)
+		interval = time.Duration(float64(interval) * 1.5)
+		if interval > 200*time.Millisecond {
+			interval = 200 * time.Millisecond
+		}
+	}
 }
 
 // StopTask 终止指定任务

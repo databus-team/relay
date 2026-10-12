@@ -33,6 +33,10 @@ type TaskMeta struct {
 	StartTime time.Time  `json:"start_time"`
 	EndTime   *time.Time `json:"end_time,omitempty"`
 	LogPath   string     `json:"log_path"`
+	// Restart 是任务的 restart 策略（always|no）；空值按 no 读。首次运行或重启都保留记录。
+	Restart string `json:"restart,omitempty"`
+	// CreatedAt 是首次创建时间，重启时保持不变；StartTime 表示最近一次启动。
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Task 托管的后台运行任务
@@ -44,6 +48,10 @@ type Task struct {
 	logFile   *os.File
 	listeners map[chan string]struct{}
 	done      chan struct{}
+	// superseded 标记该任务对象已被同 id 的新实例取代:它的收尾不再写回记录。旧实例的收尾
+	// goroutine 在新实例落盘之后才 persist 时,会把 status/pid/end_time 覆盖回旧值,而两个
+	// Task 各持自己的锁,没有任何东西能给这两次写排序。
+	superseded bool
 }
 
 func newTask(id, cmdStr, cwd string, dir string) *Task {
@@ -51,6 +59,7 @@ func newTask(id, cmdStr, cwd string, dir string) *Task {
 }
 
 func newTaskWithPorts(id, cmdStr, cwd string, ports []string, dir string) *Task {
+	now := time.Now()
 	return &Task{
 		meta: TaskMeta{
 			ID:        id,
@@ -58,7 +67,8 @@ func newTaskWithPorts(id, cmdStr, cwd string, ports []string, dir string) *Task 
 			Cwd:       cwd,
 			Ports:     ports,
 			Status:    StatusRunning,
-			StartTime: time.Now(),
+			StartTime: now,
+			CreatedAt: now,
 			LogPath:   filepath.Join(dir, "run.log"),
 		},
 		dir:       dir,
@@ -71,6 +81,14 @@ func (t *Task) Meta() TaskMeta {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.meta
+}
+
+// markSuperseded 声明该任务对象已被同 id 的新实例取代,其生命周期收尾不再写回 meta.json。
+// 仅由同 id 重启路径在拉起替代实例之前调用。
+func (t *Task) markSuperseded() {
+	t.mu.Lock()
+	t.superseded = true
+	t.mu.Unlock()
 }
 
 func (t *Task) broadcast(line string) {
