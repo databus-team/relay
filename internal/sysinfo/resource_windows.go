@@ -11,7 +11,7 @@ import (
 
 var (
 	kernel32               = syscall.NewLazyDLL("kernel32.dll")
-	procGlobalMemoryStatus  = kernel32.NewProc("GlobalMemoryStatusEx")
+	procGlobalMemoryStatus = kernel32.NewProc("GlobalMemoryStatusEx")
 	procGetSystemTimes     = kernel32.NewProc("GetSystemTimes")
 )
 
@@ -31,7 +31,8 @@ func filetimeToUint64(ft syscall.Filetime) uint64 {
 	return (uint64(ft.HighDateTime) << 32) | uint64(ft.LowDateTime)
 }
 
-func getCPULoad() float64 {
+// getCPUPercent 采样一个窗口内的系统忙时占比,返回 0-100。
+func getCPUPercent() *float64 {
 	var idle1, kernel1, user1 syscall.Filetime
 	ret, _, _ := procGetSystemTimes.Call(
 		uintptr(unsafe.Pointer(&idle1)),
@@ -39,10 +40,10 @@ func getCPULoad() float64 {
 		uintptr(unsafe.Pointer(&user1)),
 	)
 	if ret == 0 {
-		return 0
+		return nil
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(cpuSampleInterval)
 
 	var idle2, kernel2, user2 syscall.Filetime
 	ret, _, _ = procGetSystemTimes.Call(
@@ -51,32 +52,19 @@ func getCPULoad() float64 {
 		uintptr(unsafe.Pointer(&user2)),
 	)
 	if ret == 0 {
-		return 0
+		return nil
 	}
 
-	i1 := filetimeToUint64(idle1)
-	k1 := filetimeToUint64(kernel1)
-	u1 := filetimeToUint64(user1)
+	idle := filetimeToUint64(idle2) - filetimeToUint64(idle1)
+	kernel := filetimeToUint64(kernel2) - filetimeToUint64(kernel1)
+	user := filetimeToUint64(user2) - filetimeToUint64(user1)
 
-	i2 := filetimeToUint64(idle2)
-	k2 := filetimeToUint64(kernel2)
-	u2 := filetimeToUint64(user2)
-
-	idle := i2 - i1
-	kernel := k2 - k1
-	user := u2 - u1
-
-	// 在 Windows API 中，kernel 时间已经包含了 idle 时间
+	// 在 Windows API 中,kernel 时间已经包含了 idle 时间
 	total := kernel + user
 	if total == 0 || total < idle {
-		return 0
+		return nil
 	}
-
-	busy := total - idle
-	cores := float64(runtime.NumCPU())
-	// 换算为类 Unix load 指标 (busy / total * cores)，例如 8 核满载为 8.0，与 Linux/macOS 保持统一标准
-	load := (float64(busy) / float64(total)) * cores
-	return load
+	return percentPtr(ratioPercent(int64(total-idle), int64(total)))
 }
 
 // CollectResourceInfo 收集 Windows 平台资源
@@ -97,9 +85,8 @@ func CollectResourceInfo(withUsage bool) ResourceInfo {
 	}
 
 	if withUsage {
-		info.CPULoad = getCPULoad()
+		info.CPUPercent = getCPUPercent()
 	}
 
 	return info
 }
-

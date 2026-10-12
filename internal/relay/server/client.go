@@ -698,7 +698,7 @@ func (c *Client) handleStatus(msg protocol.Message) {
 		Transit: c.transitVersion(),
 		Resource: protocol.ResourceStats{
 			CPUCores:    hubRes.CPUCores,
-			CPULoad:     hubRes.CPULoad,
+			CPUPercent:  hubRes.CPUPercent,
 			MemTotalMB:  hubRes.MemTotalMB,
 			MemUsedMB:   hubRes.MemUsedMB,
 			IsContainer: hubRes.IsContainer,

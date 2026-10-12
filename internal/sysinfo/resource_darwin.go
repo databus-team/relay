@@ -23,17 +23,7 @@ func CollectResourceInfo(withUsage bool) ResourceInfo {
 	}
 
 	if withUsage {
-		// CPU 负载 (vm.loadavg)
-		if out, err := exec.Command("sysctl", "-n", "vm.loadavg").Output(); err == nil {
-			// 格式: { 2.59 3.60 3.69 }
-			cleaned := strings.Trim(strings.TrimSpace(string(out)), "{ }")
-			fields := strings.Fields(cleaned)
-			if len(fields) > 0 {
-				if load, err := strconv.ParseFloat(fields[0], 64); err == nil {
-					info.CPULoad = load
-				}
-			}
-		}
+		info.CPUPercent = collectCPUPercent()
 
 		// 内存使用量 (通过 vm_stat 粗略估算 active + wired 内存)
 		if out, err := exec.Command("vm_stat").Output(); err == nil {
@@ -62,4 +52,29 @@ func CollectResourceInfo(withUsage bool) ResourceInfo {
 	}
 
 	return info
+}
+
+// collectCPUPercent 用 iostat 取一个采样窗口内的系统忙时占比(user+sys)。
+// macOS 无 cgroup,且 Apple Silicon 上没有 kern.cp_time,纯 Go 取不到瞬时利用率;
+// loadavg 既含不可中断睡眠、又只有 1 分钟均值,实测会明显高于真实占用,故不用它。
+// iostat 首行是开机至今的均值,只能取末行;-n 0 去掉磁盘列,让 us/sy 落在行首。
+func collectCPUPercent() *float64 {
+	out, err := exec.Command("iostat", "-c", "2", "-w", "1", "-n", "0").Output()
+	if err != nil {
+		return nil
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) < 2 {
+		return nil
+	}
+	fields := strings.Fields(lines[len(lines)-1])
+	if len(fields) < 2 {
+		return nil
+	}
+	user, uErr := strconv.ParseFloat(fields[0], 64)
+	sys, sErr := strconv.ParseFloat(fields[1], 64)
+	if uErr != nil || sErr != nil {
+		return nil
+	}
+	return percentPtr(user + sys)
 }

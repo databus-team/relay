@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // CollectResourceInfo 收集 Linux 平台资源。
@@ -113,18 +114,66 @@ func CollectResourceInfo(withUsage bool) ResourceInfo {
 			info.MemUsedMB = memTotalFromProc - memAvailFromProc
 		}
 
-		// CPU 负载 (读取 /proc/loadavg)
-		if data, err := os.ReadFile("/proc/loadavg"); err == nil {
-			fields := strings.Fields(string(data))
-			if len(fields) > 0 {
-				if load, err := strconv.ParseFloat(fields[0], 64); err == nil {
-					info.CPULoad = load
-				}
-			}
-		}
+		// CPU 使用率
+		info.CPUPercent = collectCPUPercent(isContainer, info.CPUCores)
 	}
 
 	return info
+}
+
+// collectCPUPercent 采样 CPU 使用率(占配额的百分比)。
+// 容器内必须用 cgroup 自身计数: /proc/stat 与 /proc/loadavg 都不做 namespace 隔离,
+// 读到的整机口径拿去跟 cgroup 配额相除,会把宿主机负载算到 Pod 头上。
+func collectCPUPercent(isContainer bool, cores float64) *float64 {
+	if isContainer {
+		start := time.Now()
+		used0, ok := cgroupCPUUsec()
+		if !ok {
+			return nil
+		}
+		time.Sleep(cpuSampleInterval)
+		used1, ok := cgroupCPUUsec()
+		if !ok {
+			return nil
+		}
+		elapsedUs := time.Since(start).Microseconds()
+		return percentPtr(ratioPercent(used1-used0, int64(float64(elapsedUs)*cores)))
+	}
+
+	busy0, total0, ok := readProcStatCPU()
+	if !ok {
+		return nil
+	}
+	time.Sleep(cpuSampleInterval)
+	busy1, total1, ok := readProcStatCPU()
+	if !ok {
+		return nil
+	}
+	return percentPtr(ratioPercent(busy1-busy0, total1-total0))
+}
+
+// cgroupCPUUsec 读本 cgroup 的累计 CPU 用时(微秒),即"用了多少核·微秒"。
+func cgroupCPUUsec() (int64, bool) {
+	if data, err := os.ReadFile("/sys/fs/cgroup/cpu.stat"); err == nil {
+		if usec, ok := parseCgroupCPUUsec(data); ok {
+			return usec, true
+		}
+	}
+	// cgroup v1: cpuacct.usage 单位纳秒
+	if data, err := os.ReadFile("/sys/fs/cgroup/cpuacct/cpuacct.usage"); err == nil {
+		if ns, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			return ns / 1000, true
+		}
+	}
+	return 0, false
+}
+
+func readProcStatCPU() (busy, total int64, ok bool) {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, 0, false
+	}
+	return parseProcStatCPU(data)
 }
 
 func readProcMeminfo() (totalMB int64, availMB int64) {

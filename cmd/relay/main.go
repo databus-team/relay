@@ -124,7 +124,7 @@ var (
 	// Nodes command - 查看全网节点拓扑状态与角色 (类似 kubectl get nodes / docker node ls; alias: status)
 	nodesCmd      = kingpin.Command("nodes", "List cluster peer nodes and topology (alias: status)").Alias("status")
 	nodesJSONOut  = nodesCmd.Flag("json", "Output as JSON").Bool()
-	nodesUsageOut = nodesCmd.Flag("usage", "Query dynamic CPU load & memory usage of nodes (heavier probe)").Short('u').Bool()
+	nodesUsageOut = nodesCmd.Flag("usage", "Query dynamic CPU & memory usage of nodes (heavier probe)").Short('u').Bool()
 	nodesPrune    = nodesCmd.Flag("prune-offline", "Remove known-offline executors from the transit ledger").Bool()
 
 	// Cleanup command - remove stale command files
@@ -2206,7 +2206,7 @@ func runNodes() {
 	}
 	transitSysRes := sysinfo.ResourceInfo{
 		CPUCores:    st.Resource.CPUCores,
-		CPULoad:     st.Resource.CPULoad,
+		CPUPercent:  st.Resource.CPUPercent,
 		MemTotalMB:  st.Resource.MemTotalMB,
 		MemUsedMB:   st.Resource.MemUsedMB,
 		IsContainer: st.Resource.IsContainer,
@@ -2270,7 +2270,7 @@ func runNodes() {
 
 		execSysRes := sysinfo.ResourceInfo{
 			CPUCores:    e.Resource.CPUCores,
-			CPULoad:     e.Resource.CPULoad,
+			CPUPercent:  e.Resource.CPUPercent,
 			MemTotalMB:  e.Resource.MemTotalMB,
 			MemUsedMB:   e.Resource.MemUsedMB,
 			IsContainer: e.Resource.IsContainer,

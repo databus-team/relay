@@ -406,7 +406,7 @@ func (c *Client) handleMessage(msg protocol.Message) {
 				res := sysinfo.CollectResourceInfo(true)
 				pongPayload = protocol.ResourceStats{
 					CPUCores:    res.CPUCores,
-					CPULoad:     res.CPULoad,
+					CPUPercent:  res.CPUPercent,
 					MemTotalMB:  res.MemTotalMB,
 					MemUsedMB:   res.MemUsedMB,
 					IsContainer: res.IsContainer,

@@ -189,13 +189,13 @@ type StatusRequest struct {
 	ProbeTimeoutMS int      `json:"probe_timeout_ms,omitempty"` // 单次探针等待上限(毫秒);0=中转默认
 }
 
-// ResourceStats 节点资源与负载详情
+// ResourceStats 节点资源与用量详情
 type ResourceStats struct {
-	CPUCores    float64 `json:"cpu_cores,omitempty"`
-	CPULoad     float64 `json:"cpu_load,omitempty"`
-	MemTotalMB  int64   `json:"mem_total_mb,omitempty"`
-	MemUsedMB   int64   `json:"mem_used_mb,omitempty"`
-	IsContainer bool    `json:"is_container,omitempty"`
+	CPUCores    float64  `json:"cpu_cores,omitempty"`
+	CPUPercent  *float64 `json:"cpu_percent,omitempty"`
+	MemTotalMB  int64    `json:"mem_total_mb,omitempty"`
+	MemUsedMB   int64    `json:"mem_used_mb,omitempty"`
+	IsContainer bool     `json:"is_container,omitempty"`
 }
 
 // ExecutorHealth 中转对单个已注册执行方的体检结果。
