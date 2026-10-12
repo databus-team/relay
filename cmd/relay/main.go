@@ -1235,9 +1235,13 @@ func runExec() {
 		}
 	}
 
-	// 增量同步准备:当未指定 --no-sync 时,检测本地对应工作区目录是否为 git 仓库且有 dirty 改动
+	// 增量同步准备:当未指定 --no-sync 时,检测本地对应工作区目录是否为 git 仓库且有 dirty 改动。
+	// 仅在工作区已解析(w != "")时同步——同步源是工作区的 local_dir。
+	// 直接按节点寻址(--executor/--node,无 -w)时没有工作区,也就没有有意义的同步源;
+	// 此时回落到 os.Getwd()(如部署脚本在仓库根执行)+ 远端 execDir 会把本地脏 diff 强推到
+	// 无关目录,产生 "is not a git repository on target node" 之类误报,故跳过。
 	var gitSyncPayload *backend.GitSyncPayload
-	if !*execNoSync {
+	if !*execNoSync && w != "" {
 		localSyncDir := execCwd
 		if localSyncDir == "" {
 			if curDir, err := os.Getwd(); err == nil {

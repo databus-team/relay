@@ -47,7 +47,8 @@ command -v relay >/dev/null || die "未找到 relay CLI(先 make install)"
 
 # 在指定执行器上执行一条命令。直接按 executor_id 寻址(--executor 节点直连,不再依赖
 # workspace 绑定;未绑定 workspace 的执行器同样可被部署/操作)。
-remote_cmd() { "$(command -v relay)" exec -c "$CONFIG" --executor "$1" "${@:2}" 2>&1 | sed -E 's/^Checking remote watcher\.\.\. OK//'; }
+# 远端只跑探测/换装这类命令,绝不 git-sync(否则会把本地脏工作区 diff 强推远端 execDir)。
+remote_cmd() { "$(command -v relay)" exec --no-sync -c "$CONFIG" --executor "$1" "${@:2}" 2>&1 | sed -E 's/^Checking remote watcher\.\.\. OK//'; }
 
 # 枚举在线执行器:`relay nodes --json` 里 Ready 状态且不含 "(local)" 和 "(transit)" 的节点 id。
 list_online_executors() {
@@ -144,7 +145,8 @@ restart_binary() {
   # 整段在远端以 detached 后台(nohup … &)触发,让本条 exec 立即返回。
   # 若在前台跑,stop 会先杀掉服务本 exec 的旧 daemon,导致本地 relay
   # exec 永等其回包而卡死;换装本身并不依赖该连接,由 verify 兜底核对即可。
-  relay exec -c "$CONFIG" --executor "$e" "nohup sh -c '$swap' >/dev/null 2>&1 &" \
+  # 换装同样不做 git-sync:该 exec 只是触发远端后台换装,无需也不该同步本地 diff。
+  relay exec --no-sync -c "$CONFIG" --executor "$e" "nohup sh -c '$swap' >/dev/null 2>&1 &" \
     || warn "换装已在远端后台触发;结果以 verify (relay status) 为准"
   log "换装已后台触发;远端日志: ~/.relay/node.log"
 }
