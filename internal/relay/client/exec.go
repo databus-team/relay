@@ -517,13 +517,13 @@ type ExecSession struct {
 }
 
 // Cmd / Cwd / Timeout / ExecutorID 返回本次入站请求的命令、工作目录、超时秒数与目标执行方。
-func (e *ExecSession) Cmd() string                      { return e.req.Cmd }
-func (e *ExecSession) Cwd() string                      { return e.req.Cwd }
-func (e *ExecSession) Timeout() int                     { return e.req.Timeout }
-func (e *ExecSession) ExecutorID() string               { return e.req.ExecutorID }
+func (e *ExecSession) Cmd() string                       { return e.req.Cmd }
+func (e *ExecSession) Cwd() string                       { return e.req.Cwd }
+func (e *ExecSession) Timeout() int                      { return e.req.Timeout }
+func (e *ExecSession) ExecutorID() string                { return e.req.ExecutorID }
 func (e *ExecSession) GitSync() *protocol.GitSyncPayload { return e.req.GitSync }
-func (e *ExecSession) Detach() bool                     { return e.req.Detach }
-func (e *ExecSession) Ports() []string                  { return e.req.Ports }
+func (e *ExecSession) Detach() bool                      { return e.req.Detach }
+func (e *ExecSession) Ports() []string                   { return e.req.Ports }
 
 // SetExecHandler 设置入站 exec 处理回调。设置后,该客户端成为可被中转转发 exec 的执行方。
 func (c *Client) SetExecHandler(fn func(*ExecSession)) {
@@ -676,6 +676,32 @@ func (c *Client) handleInboundTaskList(msg protocol.Message) {
 	go h(sess)
 }
 
+// taskRequestAck 是 task-* 一次性请求的写回:错误走 MsgError,成功回一个 ACK。
+// MsgTaskStop 与 MsgTaskRestart 的答复形态一致,共用同一份写回。跨机协议代码,形态不要分叉。
+func (c *Client) taskRequestAck(requestID string, err error) error {
+	if err != nil {
+		return c.sendMessage(&protocol.Message{
+			Type:      protocol.MsgError,
+			RequestID: requestID,
+			Payload:   err.Error(),
+		})
+	}
+	return c.sendMessage(&protocol.Message{
+		Type:      protocol.MsgResponse,
+		RequestID: requestID,
+		ID:        uuid.New().String(),
+		Payload:   map[string]interface{}{"ok": true},
+	})
+}
+
+// decodeTaskPayload 把入站 task-* 请求的载荷解成具体的请求结构。
+func decodeTaskPayload[T any](msg protocol.Message) T {
+	data, _ := json.Marshal(msg.Payload)
+	var req T
+	_ = json.Unmarshal(data, &req)
+	return req
+}
+
 // TaskStopSession 是一次入站 task-stop(执行方视角)的写回句柄
 type TaskStopSession struct {
 	client    *Client
@@ -686,19 +712,7 @@ type TaskStopSession struct {
 func (s *TaskStopSession) TaskID() string { return s.req.TaskID }
 
 func (s *TaskStopSession) Done(err error) error {
-	if err != nil {
-		return s.client.sendMessage(&protocol.Message{
-			Type:      protocol.MsgError,
-			RequestID: s.requestID,
-			Payload:   err.Error(),
-		})
-	}
-	return s.client.sendMessage(&protocol.Message{
-		Type:      protocol.MsgResponse,
-		RequestID: s.requestID,
-		ID:        uuid.New().String(),
-		Payload:   map[string]interface{}{"ok": true},
-	})
+	return s.client.taskRequestAck(s.requestID, err)
 }
 
 // SetTaskStopHandler 设置入站 task-stop 回调 (执行方视角)
@@ -709,9 +723,7 @@ func (c *Client) SetTaskStopHandler(fn func(*TaskStopSession)) {
 }
 
 func (c *Client) handleInboundTaskStop(msg protocol.Message) {
-	data, _ := json.Marshal(msg.Payload)
-	var req protocol.TaskStopRequest
-	_ = json.Unmarshal(data, &req)
+	req := decodeTaskPayload[protocol.TaskStopRequest](msg)
 
 	c.taskHandlerM.RLock()
 	h := c.taskStopHandler
@@ -725,6 +737,41 @@ func (c *Client) handleInboundTaskStop(msg protocol.Message) {
 	go h(sess)
 }
 
+// TaskRestartSession 是一次入站 task-restart(执行方视角)的写回句柄
+type TaskRestartSession struct {
+	client    *Client
+	requestID string
+	req       protocol.TaskRestartRequest
+}
+
+func (s *TaskRestartSession) TaskID() string { return s.req.TaskID }
+
+func (s *TaskRestartSession) Done(err error) error {
+	return s.client.taskRequestAck(s.requestID, err)
+}
+
+// SetTaskRestartHandler 设置入站 task-restart 回调 (执行方视角)
+func (c *Client) SetTaskRestartHandler(fn func(*TaskRestartSession)) {
+	c.taskHandlerM.Lock()
+	c.taskRestartHandler = fn
+	c.taskHandlerM.Unlock()
+}
+
+func (c *Client) handleInboundTaskRestart(msg protocol.Message) {
+	req := decodeTaskPayload[protocol.TaskRestartRequest](msg)
+
+	c.taskHandlerM.RLock()
+	h := c.taskRestartHandler
+	c.taskHandlerM.RUnlock()
+
+	sess := &TaskRestartSession{client: c, requestID: msg.ID, req: req}
+	if h == nil {
+		_ = sess.Done(fmt.Errorf("task restart handler not set"))
+		return
+	}
+	go h(sess)
+}
+
 // TaskLogsSession 是一次入站 task-logs(执行方视角)的写回句柄
 type TaskLogsSession struct {
 	client    *Client
@@ -733,9 +780,9 @@ type TaskLogsSession struct {
 	seq       atomic.Int64
 }
 
-func (s *TaskLogsSession) TaskID() string    { return s.req.TaskID }
-func (s *TaskLogsSession) Follow() bool      { return s.req.Follow }
-func (s *TaskLogsSession) TailLines() int    { return s.req.TailLines }
+func (s *TaskLogsSession) TaskID() string { return s.req.TaskID }
+func (s *TaskLogsSession) Follow() bool   { return s.req.Follow }
+func (s *TaskLogsSession) TailLines() int { return s.req.TailLines }
 
 func (s *TaskLogsSession) Write(chunk string) error {
 	msg := &protocol.Message{
@@ -821,6 +868,21 @@ func (c *Client) TaskStop(ctx context.Context, targetExecutor, taskID string) er
 	}
 	if !resp.OK {
 		return fmt.Errorf("task stop failed: %s", resp.Error)
+	}
+	return nil
+}
+
+// TaskRestart 向目标执行方请求在原 task id 上重启任务
+func (c *Client) TaskRestart(ctx context.Context, targetExecutor, taskID string) error {
+	resp, err := c.Request(ctx, protocol.MsgTaskRestart, protocol.TaskRestartRequest{
+		ExecutorID: targetExecutor,
+		TaskID:     taskID,
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("task restart failed: %s", resp.Error)
 	}
 	return nil
 }

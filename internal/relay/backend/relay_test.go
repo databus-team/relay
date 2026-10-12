@@ -3,6 +3,7 @@ package backend
 import (
 	"bytes"
 	"context"
+	"errors"
 	"math/rand"
 	"net"
 	"net/http/httptest"
@@ -845,6 +846,144 @@ func TestEndToEnd_TaskSupervisor(t *testing.T) {
 	}
 	if !stoppedFound {
 		t.Fatalf("task %s not found in all tasks list", taskID)
+	}
+}
+
+// 端到端:测试任务重启 (relay restart)。请求经中转按 ExecutorID 路由到指定执行方,
+// 由执行方在原 id 上重跑记录中的命令;对不存在的任务 id、错误的执行方与离线执行方
+// 都必须在超时内返回可读错误,而不是挂起。
+func TestEndToEnd_TaskRestart(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
+	defer client.CloseAll()
+
+	watchDir := t.TempDir()
+	ts, wsURL := newTestHub(t, watchDir)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// 1. 两个执行方在线:node-1 持有任务,node-2 用于验证请求不会误投。
+	for _, id := range []string{"node-1", "node-2"} {
+		if _, err := NewRelayBackend(map[string]interface{}{
+			"url":         wsURL,
+			"token":       "tok-exe",
+			"executor_id": id,
+			"watch_dir":   ".",
+			"executor":    true,
+		}); err != nil {
+			t.Fatalf("executor %s backend: %v", id, err)
+		}
+	}
+
+	// 2. 请求方
+	reqBackend, err := NewRelayBackend(map[string]interface{}{
+		"url":         wsURL,
+		"token":       "tok-req",
+		"executor_id": "node-1",
+		"watch_dir":   ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+
+	tb, ok := reqBackend.(bk.TaskSupervisorBackend)
+	if !ok {
+		t.Fatalf("requester does not implement TaskSupervisorBackend")
+	}
+	gb, ok := reqBackend.(bk.GitSyncExecBackend)
+	if !ok {
+		t.Fatalf("requester does not implement GitSyncExecBackend")
+	}
+
+	// 3. 先让 node-2 的 supervisor 完成一次任务列表查询再创建任务。两台进程内执行方在
+	// 同一台机器上共享 ~/.relay/tasks,若不预热,node-2 之后懒加载会把 node-1 刚创建的任务
+	// 也认领进内存,路由断言就失去意义;真实部署里任务只存在于创建它的执行方。
+	if _, err := tb.TaskList(ctx, "node-2", true); err != nil {
+		t.Fatalf("warm up node-2 task list: %v", err)
+	}
+
+	// 4. 在 node-1 上后台起一个长命任务
+	var taskIDOut strings.Builder
+	exit, err := gb.ExecStreamWithPorts(ctx, "node-1", "printf 'restart_me\n'; sleep 30", "", 10, nil, true, nil, func(c bk.ExecChunk) {
+		taskIDOut.WriteString(c.Data)
+	})
+	if err != nil {
+		t.Fatalf("exec detach failed: %v", err)
+	}
+	if exit != 0 {
+		t.Fatalf("detach exit code: %d", exit)
+	}
+	taskID := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(taskIDOut.String()), protocol.ForwardTaskIDMarker))
+	if !strings.HasPrefix(taskID, "t-") {
+		t.Fatalf("invalid taskID output: %q", taskIDOut.String())
+	}
+	// defer 晚于函数的客户端关闭注册,按 LIFO 先于 client.CloseAll() 执行。
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tb.TaskStop(stopCtx, "node-1", taskID)
+	}()
+
+	// 4. 重启运行中的任务:收到成功应答,任务仍以原 id 处于运行态
+	if err := tb.TaskRestart(ctx, "node-1", taskID); err != nil {
+		t.Fatalf("task restart: %v", err)
+	}
+	tasks, err := tb.TaskList(ctx, "node-1", false)
+	if err != nil {
+		t.Fatalf("task list after restart: %v", err)
+	}
+	var running bool
+	for _, tk := range tasks {
+		if tk.ID == taskID {
+			running = true
+			if tk.Status != "running" {
+				t.Errorf("expected task running after restart, got: %s", tk.Status)
+			}
+			break
+		}
+	}
+	if !running {
+		t.Fatalf("task %s not running after restart (identity must be preserved)", taskID)
+	}
+
+	// 5. 不存在的 task id:失败应答且错误可读,不挂起
+	missingCtx, cancelMissing := context.WithTimeout(ctx, 3*time.Second)
+	defer cancelMissing()
+	err = tb.TaskRestart(missingCtx, "node-1", "t-does-not-exist")
+	if err == nil {
+		t.Fatalf("expected error for unknown task id")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("unknown task id should fail fast, got timeout: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected readable 'not found' error, got: %v", err)
+	}
+
+	// 6. 路由:地址指向 node-2 时不得投到持有该任务的 node-1
+	otherCtx, cancelOther := context.WithTimeout(ctx, 3*time.Second)
+	defer cancelOther()
+	err = tb.TaskRestart(otherCtx, "node-2", taskID)
+	if err == nil {
+		t.Fatalf("request addressed to node-2 must not reach node-1")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("misrouted request should fail fast, got timeout: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected node-2's 'not found' error, got: %v", err)
+	}
+
+	// 7. 执行方离线:在超时内拿到错误而不是一直等待
+	offlineCtx, cancelOffline := context.WithTimeout(ctx, 3*time.Second)
+	defer cancelOffline()
+	err = tb.TaskRestart(offlineCtx, "node-ghost", taskID)
+	if err == nil {
+		t.Fatalf("expected error for offline executor")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("offline executor should fail fast, got timeout: %v", err)
 	}
 }
 

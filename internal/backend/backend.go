@@ -79,6 +79,7 @@ type TaskInfo struct {
 type TaskSupervisorBackend interface {
 	TaskList(ctx context.Context, targetExecutor string, all bool) ([]TaskInfo, error)
 	TaskStop(ctx context.Context, targetExecutor, taskID string) error
+	TaskRestart(ctx context.Context, targetExecutor, taskID string) error
 	TaskLogs(ctx context.Context, targetExecutor, taskID string, follow bool, tailLines int, onChunk func(ExecChunk)) error
 }
 

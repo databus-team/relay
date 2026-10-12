@@ -480,6 +480,36 @@ type TunnelEnd  struct { StreamID string `json:"stream_id"`; Reason string `json
 `--executor` 必填。`relay status` 不需要 `-w`:它报告整座部署。多台 executor 在线时,本地可并排多条
 `relay tunnel`(不同 `--listen` 端口、各自 `--executor`),分别经各自执行方访问各自内网白名单目标,互不干扰。
 
+### 4.11 任务生命周期消息 (task_list / task_stop / task_restart / task_logs)
+
+长命后台任务由执行方的 TaskSupervisor 持有;中转不保存任何任务状态,只按请求中的
+`executor_id` 原样转发给已注册的执行方(`forwardToExecutor`),答复再按请求方归属回投。
+错误一律走 `MsgError`(`request_id` 对应请求),成功回 `MsgResponse` ACK。
+
+| 消息 | 请求体 | 应答 |
+|---|---|---|
+| `task_list` | `TaskListRequest{executor_id, all}` | `TaskListResponse{ok, error, tasks}`;`executor_id` 为空时由中转并发聚合整网 |
+| `task_stop` | `TaskStopRequest{executor_id, task_id}` | ACK(`{ok:true}`)或 `MsgError` |
+| `task_restart` | `TaskRestartRequest{executor_id, task_id}` | ACK(`{ok:true}`)或 `MsgError` |
+| `task_logs` | `TaskLogsRequest{executor_id, task_id, follow, tail_lines}` | 流式 `MsgExecOutput` 分块,末帧 `MsgResponse` |
+
+**`task_restart`** 请求执行方在**原 task id、原任务目录**上重跑记录中的命令与工作目录
+(端口等元数据一并沿用),因此任务身份与端口转发规则在重启后保持不变。执行方的新进程
+起不来、或该 id 在本地不存在时,应答 `MsgError` 并携带可读原因(如 `task not found`),
+请求方据此报错而不重试。这是一次性请求应答,不走 `task_logs` 的流式路径。
+
+```json
+// 请求 (Client → Transit → Executor)
+{
+  "type": "task_restart",
+  "id": "<请求 id, 也是回投的 request_id>",
+  "payload": { "executor_id": "node-1", "task_id": "t-1a2b3c4d" }
+}
+```
+
+调用方必须自带超时 context:老执行方不认识该消息(不做跨版本协议兼容)时,
+超时是唯一的兜底,避免无限等待。
+
 ---
 
 ## 5. 心跳与健康检测

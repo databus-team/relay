@@ -448,6 +448,7 @@ func (b *RelayBackend) enableExecutor() {
 	b.client.SetTunnelHandler(func(sess *client.TunnelSession) { b.handleInboundTunnelConnect(sess) })
 	b.client.SetTaskListHandler(func(sess *client.TaskListSession) { b.handleInboundTaskList(sess) })
 	b.client.SetTaskStopHandler(func(sess *client.TaskStopSession) { b.handleInboundTaskStop(sess) })
+	b.client.SetTaskRestartHandler(func(sess *client.TaskRestartSession) { b.handleInboundTaskRestart(sess) })
 	b.client.SetTaskLogsHandler(func(sess *client.TaskLogsSession) { b.handleInboundTaskLogs(sess) })
 	b.client.SetGitStatusHandler(func(sess *client.GitStatusSession) { b.handleInboundGitStatus(sess) })
 	b.client.SetGitUndoHandler(func(sess *client.GitUndoSession) { b.handleInboundGitUndo(sess) })
@@ -795,6 +796,16 @@ func (b *RelayBackend) handleInboundTaskStop(sess *client.TaskStopSession) {
 	_ = sess.Done(err)
 }
 
+func (b *RelayBackend) handleInboundTaskRestart(sess *client.TaskRestartSession) {
+	sup := b.getSupervisor()
+	if sup == nil {
+		_ = sess.Done(fmt.Errorf("supervisor not enabled"))
+		return
+	}
+	_, err := sup.RestartTask(sess.TaskID())
+	_ = sess.Done(err)
+}
+
 func (b *RelayBackend) handleInboundTaskLogs(sess *client.TaskLogsSession) {
 	sup := b.getSupervisor()
 	if sup == nil {
@@ -891,6 +902,14 @@ func (b *RelayBackend) TaskStop(ctx context.Context, targetExecutor, taskID stri
 		return err
 	}
 	return b.client.TaskStop(ctx, targetExecutor, taskID)
+}
+
+// TaskRestart 向目标执行方请求在原 task id 上重启任务
+func (b *RelayBackend) TaskRestart(ctx context.Context, targetExecutor, taskID string) error {
+	if err := b.ensureConnected(ctx); err != nil {
+		return err
+	}
+	return b.client.TaskRestart(ctx, targetExecutor, taskID)
 }
 
 // PruneOfflineExecutors 向中转请求清理「已知但离线」的 executor 台账条目,返回清理数。

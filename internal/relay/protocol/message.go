@@ -36,6 +36,7 @@ const (
 	MsgTunnelEnd        MessageType = "tunnel_end"
 	MsgTaskList         MessageType = "task_list"
 	MsgTaskStop         MessageType = "task_stop"
+	MsgTaskRestart      MessageType = "task_restart"
 	MsgTaskLogs         MessageType = "task_logs"
 	MsgGitStatus        MessageType = "git_status"
 	MsgGitUndo          MessageType = "git_undo"
@@ -384,6 +385,12 @@ type TaskListResponse struct {
 
 // TaskStopRequest 停止任务请求
 type TaskStopRequest struct {
+	ExecutorID string `json:"executor_id,omitempty"`
+	TaskID     string `json:"task_id"`
+}
+
+// TaskRestartRequest 重启任务请求:由执行方在原 task id 上按记录的命令/工作目录/端口重跑。
+type TaskRestartRequest struct {
 	ExecutorID string `json:"executor_id,omitempty"`
 	TaskID     string `json:"task_id"`
 }
