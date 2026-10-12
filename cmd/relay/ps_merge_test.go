@@ -1,6 +1,9 @@
 package main
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -137,27 +140,82 @@ func TestTunnelLogLineMatches(t *testing.T) {
 	}
 }
 
-// TestFilterTunnelsForPS 覆盖 ps 的隧道过滤:未加 -a 只留 running;target 按 egress 精确过滤。
-func TestFilterTunnelsForPS(t *testing.T) {
+// TestFilterTunnels 覆盖隧道过滤:未加 -a 只留 running;target 按 egress 精确过滤。
+func TestFilterTunnels(t *testing.T) {
 	states := []tunnelState{
 		{Egress: "eg-a", State: "running"},
 		{Egress: "eg-b", State: "stopped"},
 		{Egress: "eg-c", State: "running"},
 	}
 
-	if got := filterTunnelsForPS(states, "", false); len(got) != 2 || got[0].Egress != "eg-a" || got[1].Egress != "eg-c" {
+	if got := filterTunnels(states, "", false); len(got) != 2 || got[0].Egress != "eg-a" || got[1].Egress != "eg-c" {
 		t.Errorf("without -a = %+v, want only running eg-a/eg-c", got)
 	}
-	if got := filterTunnelsForPS(states, "", true); len(got) != 3 {
+	if got := filterTunnels(states, "", true); len(got) != 3 {
 		t.Errorf("with -a = %+v, want all 3", got)
 	}
-	if got := filterTunnelsForPS(states, "eg-b", false); len(got) != 0 {
+	if got := filterTunnels(states, "eg-b", false); len(got) != 0 {
 		t.Errorf("target stopped without -a = %+v, want empty", got)
 	}
-	if got := filterTunnelsForPS(states, "eg-b", true); len(got) != 1 || got[0].Egress != "eg-b" {
+	if got := filterTunnels(states, "eg-b", true); len(got) != 1 || got[0].Egress != "eg-b" {
 		t.Errorf("target stopped with -a = %+v, want [eg-b]", got)
 	}
-	if got := filterTunnelsForPS(nil, "", false); len(got) != 0 {
+	if got := filterTunnels(nil, "", false); len(got) != 0 {
 		t.Errorf("nil input = %+v, want empty", got)
+	}
+}
+
+// TestReadTunnelLogTail 覆盖 node.log 的有界尾部读取:末 N 行、窗口不足以命中时翻倍扩张、缺失文件报错。
+func TestReadTunnelLogTail(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "node.log")
+
+	// 1. 交错命中:tail 应取最后 3 条属于 eg-x 的行。
+	var b strings.Builder
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&b, "noise line %d\n", i)
+		if i%50 == 0 {
+			fmt.Fprintf(&b, "[tunnel eg-x] event %d\n", i)
+		}
+	}
+	fmt.Fprintf(&b, "[tunnel eg-other] should-not-match\n")
+	if err := os.WriteFile(logPath, []byte(b.String()), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	got, err := readTunnelLogTail(logPath, "eg-x", 3)
+	if err != nil {
+		t.Fatalf("readTunnelLogTail: %v", err)
+	}
+	want := []string{"[tunnel eg-x] event 50", "[tunnel eg-x] event 100", "[tunnel eg-x] event 150"}
+	if len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("tail 3 = %v, want %v", got, want)
+	}
+
+	// 2. 命中集中在文件头部,后面是大段噪声(> 64KB 初始窗口):必须靠窗口翻倍才能读到。
+	var big strings.Builder
+	big.WriteString("[tunnel eg-y] first\n")
+	big.WriteString("[tunnel eg-y] second\n")
+	big.WriteString("[tunnel eg-y] third\n")
+	for i := 0; i < 4000; i++ {
+		big.WriteString("padding padding padding padding padding padding padding\n")
+	}
+	bigPath := filepath.Join(dir, "big.log")
+	if err := os.WriteFile(bigPath, []byte(big.String()), 0o644); err != nil {
+		t.Fatalf("write big log: %v", err)
+	}
+	if fi, _ := os.Stat(bigPath); fi.Size() <= 64*1024 {
+		t.Fatalf("big log too small (%d bytes) to exercise window growth", fi.Size())
+	}
+	gotBig, err := readTunnelLogTail(bigPath, "eg-y", 2)
+	if err != nil {
+		t.Fatalf("readTunnelLogTail big: %v", err)
+	}
+	if len(gotBig) != 2 || gotBig[0] != "[tunnel eg-y] second" || gotBig[1] != "[tunnel eg-y] third" {
+		t.Fatalf("big tail 2 = %v, want last two eg-y lines", gotBig)
+	}
+
+	// 3. 缺失文件 → 返回 os.IsNotExist 可识别的错误(供 showTunnelLogs 决定是否补提示)。
+	if _, err := readTunnelLogTail(filepath.Join(dir, "absent.log"), "eg-x", 3); !os.IsNotExist(err) {
+		t.Fatalf("missing file err = %v, want IsNotExist", err)
 	}
 }

@@ -98,20 +98,14 @@ func daemonStatusTunnel() error {
 		return fmt.Errorf("list tunnels: %s", resp.Error)
 	}
 
-	states := resp.Tunnels
 	// 指定了目标节点时按 egress 过滤（保留 stopped 条目，与 docker ps -a 语义一致）。
-	if targetNode != "" {
-		filtered := make([]tunnelState, 0, len(states))
-		for _, st := range states {
-			if st.Egress == targetNode {
-				filtered = append(filtered, st)
-			}
-		}
-		states = filtered
-	}
+	states := filterTunnels(resp.Tunnels, targetNode, true)
 
-	// 并发/快速探测中转节点在线台账 (超时 1.5s，断网则为 nil)
-	clusterStatus := queryClusterStatusSafe()
+	// 有隧道时才做全网探测(1.5s 超时、断网降级为 nil);空列表直接进空态,不做无谓的 relay 往返。
+	var clusterStatus map[string]protocol.StatusSegment
+	if len(states) > 0 {
+		clusterStatus = queryClusterStatusSafe()
+	}
 
 	rows := make([]TunnelInstanceInfo, 0, len(states))
 	for _, st := range states {

@@ -1371,22 +1371,6 @@ func tunnelToPSRow(ts tunnelState) psRow {
 	}
 }
 
-// filterTunnelsForPS 按 ps 语义过滤隧道:指定 target 时只留该 egress;未加 -a 时只留 running
-// (加 -a 连 stopped 意图一并展示,与 docker ps -a 一致)。
-func filterTunnelsForPS(states []tunnelState, target string, all bool) []tunnelState {
-	out := make([]tunnelState, 0, len(states))
-	for _, st := range states {
-		if target != "" && st.Egress != target {
-			continue
-		}
-		if !all && st.State != "running" {
-			continue
-		}
-		out = append(out, st)
-	}
-	return out
-}
-
 func runPs() {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -1422,7 +1406,7 @@ func runPs() {
 		case !resp.OK:
 			fmt.Fprintf(os.Stderr, "Warning: list local tunnels: %s\n", resp.Error)
 		default:
-			tunnels = filterTunnelsForPS(resp.Tunnels, targetNode, *psAll)
+			tunnels = filterTunnels(resp.Tunnels, targetNode, *psAll)
 		}
 	}
 
@@ -1478,24 +1462,23 @@ func runLogs() {
 		os.Exit(1)
 	}
 
-	b, err := getBackendWithAdaptiveLoopback(cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
-		os.Exit(1)
-	}
-
-	tb, ok := b.(backend.TaskSupervisorBackend)
-	if !ok {
-		fmt.Fprintf(os.Stderr, "Backend does not support task supervisor\n")
-		os.Exit(1)
-	}
-
 	ctx := context.Background()
 	targetNode := resolveNodeTarget(*logsNode, *logsExec)
-	// 显式给了 -e/-w 时按任务直接寻址(与 runStop 同构),不再做任务名解析;
+
+	// 后端建不出来(中转不可达)时降级:隧道日志完全在本地、不经中转,应仍可查看。
+	var tb backend.TaskSupervisorBackend
+	if b, berr := getBackendWithAdaptiveLoopback(cfg); berr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: create backend: %v\n", berr)
+	} else if x, ok := b.(backend.TaskSupervisorBackend); ok {
+		tb = x
+	} else {
+		fmt.Fprintf(os.Stderr, "Warning: backend does not support task supervisor\n")
+	}
+
+	// 显式给了 -e/-w 且后端可用时按任务直接寻址(与 runStop 同构),不做任务名解析;
 	// 只有在未指定目标时才在任务台账里反查节点,查不到即回退到本地隧道日志。
-	knownTask := targetNode != ""
-	if targetNode == "" {
+	knownTask := targetNode != "" && tb != nil
+	if targetNode == "" && tb != nil {
 		if tasks, err := tb.TaskList(ctx, "", true); err == nil {
 			for _, t := range tasks {
 				if t.ID == *logsTaskID {
@@ -1533,45 +1516,84 @@ func tunnelLogLineMatches(line, egress string) bool {
 	return strings.Contains(line, "[tunnel "+egress+"]")
 }
 
-// readTunnelLogLines 全量读取 node 日志中属于 egress 的行(隧道已并入 node 进程,日志同文件)。
-func readTunnelLogLines(logPath, egress string) ([]string, error) {
+// readTunnelLogTail 有界读取 node 日志中属于 egress 的最后至多 tailLines 行:从文件末尾按窗口
+// 回退读取,命中不足时窗口翻倍(上限为文件大小)。node.log 无轮转、无上限增长,故避免整文件扫描。
+func readTunnelLogTail(logPath, egress string, tailLines int) ([]string, error) {
 	f, err := os.Open(logPath)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-
-	var out []string
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		if line := sc.Text(); tunnelLogLineMatches(line, egress) {
-			out = append(out, line)
-		}
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
 	}
-	return out, sc.Err()
+	size := fi.Size()
+	if size == 0 {
+		return nil, nil
+	}
+
+	window := int64(64 * 1024)
+	if w := int64(tailLines) * 512; w > window {
+		window = w
+	}
+	for {
+		if window > size {
+			window = size
+		}
+		start := size - window
+		buf := make([]byte, window)
+		if _, err := f.ReadAt(buf, start); err != nil && err != io.EOF {
+			return nil, err
+		}
+		text := string(buf)
+		if start > 0 {
+			// 窗口首行可能是被截断的半行,丢弃到第一个换行之后。
+			if i := strings.IndexByte(text, '\n'); i >= 0 {
+				text = text[i+1:]
+			} else {
+				text = ""
+			}
+		}
+		var matched []string
+		for _, line := range strings.Split(text, "\n") {
+			if line != "" && tunnelLogLineMatches(line, egress) {
+				matched = append(matched, line)
+			}
+		}
+		if len(matched) >= tailLines || start == 0 {
+			if len(matched) > tailLines {
+				matched = matched[len(matched)-tailLines:]
+			}
+			return matched, nil
+		}
+		window *= 2
+	}
 }
 
 // showTunnelLogs 把 `relay logs <egress>` 落到 node 日志上,只呈现该隧道的行。返回 false 表示
-// 没有可展示的内容(node 未运行/日志文件不存在/无匹配行),由调用方决定报错文案。
+// 没有可展示的内容,由调用方决定报错文案。node 前台运行时隧道日志走 stderr、不落 node.log,
+// 故仅当日志文件缺失才补一条提示,避免把普通任务名的未命中误读成隧道。
 func showTunnelLogs(egress string, follow bool, tailLines int) bool {
 	if tailLines <= 0 {
 		tailLines = 100
 	}
 	logPath := daemon.LogFile("node")
-	lines, err := readTunnelLogLines(logPath, egress)
-	if err != nil || len(lines) == 0 {
-		fmt.Fprintf(os.Stderr, "node log has no lines for tunnel %q (the node may be running in the foreground; its tunnel logs go to stderr, not %s).\n", egress, shortenPath(logPath))
+	lines, err := readTunnelLogTail(logPath, egress, tailLines)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "node log %s not found (the node may be running in the foreground; its tunnel logs go to stderr).\n", shortenPath(logPath))
+		}
 		return false
 	}
-
-	start := 0
-	if len(lines) > tailLines {
-		start = len(lines) - tailLines
+	if len(lines) == 0 {
+		return false
 	}
-	for _, l := range lines[start:] {
-		fmt.Println(l)
+	w := bufio.NewWriter(os.Stdout)
+	for _, l := range lines {
+		fmt.Fprintln(w, l)
 	}
+	_ = w.Flush()
 
 	if follow {
 		followTunnelLog(logPath, egress)
@@ -1580,54 +1602,50 @@ func showTunnelLogs(egress string, follow bool, tailLines int) bool {
 }
 
 // followTunnelLog 轮询 node 日志新增内容,只打印属于 egress 的行,直到收到 SIGINT/SIGTERM。
+// 打开一次并持有 fd,每 tick 仅 Stat + 续读;仅在出错或日志被截断时重新定位。
 func followTunnelLog(logPath, egress string) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-	go func() {
-		<-sigCh
-		cancel()
-	}()
+	f, err := os.Open(logPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "follow tunnel log: %v\n", err)
+		return
+	}
+	defer f.Close()
 
 	// 从当前文件末尾起追,避免重复打印刚刚 tail 过的内容。
 	var offset int64
-	if fi, err := os.Stat(logPath); err == nil {
+	if fi, err := f.Stat(); err == nil {
 		offset = fi.Size()
 	}
 	pending := "" // 跨轮次的半行缓冲
 
 	ticker := time.NewTicker(300 * time.Millisecond)
 	defer ticker.Stop()
+	buf := make([]byte, 32*1024)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			f, err := os.Open(logPath)
-			if err != nil {
-				continue
-			}
 			fi, err := f.Stat()
 			if err != nil {
-				_ = f.Close()
-				continue
+				return
 			}
 			if fi.Size() < offset { // rotate/truncate:从头再读
+				if _, err := f.Seek(0, io.SeekStart); err != nil {
+					return
+				}
 				offset, pending = 0, ""
 			}
 			if fi.Size() == offset {
-				_ = f.Close()
 				continue
 			}
 			if _, err := f.Seek(offset, io.SeekStart); err != nil {
-				_ = f.Close()
-				continue
+				return
 			}
-			buf := make([]byte, 32*1024)
-			chunk := make([]byte, 0, 4096)
+			var chunk []byte
 			for {
 				n, rerr := f.Read(buf)
 				if n > 0 {
@@ -1638,8 +1656,6 @@ func followTunnelLog(logPath, egress string) {
 					break
 				}
 			}
-			_ = f.Close()
-
 			pending += string(chunk)
 			for {
 				idx := strings.IndexByte(pending, '\n')

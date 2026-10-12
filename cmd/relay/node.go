@@ -129,31 +129,28 @@ func runNode() error {
 			}
 			w.SetPushJobHandler(runLocalJobsForPush)
 
-			// 端口转发持有者:本机 node 作为 dockerd,接收 CLI 的 register 控制以维持
-			// `relay run -d -p` 的本地转发,即使发起 CLI 已退出仍保持监听。
+			// 端口转发 + SOCKS5 隧道两个常驻持有者(本机 node 作为 dockerd,接收 CLI 控制以维持
+			// 本地监听,即使发起 CLI 已退出)。二者共用同一个 relay backend:客户端池按
+			// url|token|executor_id 复用,本就是同一底层连接;由本 goroutine 独占其生命周期,
+			// 避免任一 holder 早退(如控制 socket 绑定失败)连带拆掉另一个的传输与 executor 注册。
 			go func() {
 				rb, err := getRelayBackend(cfg)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "[Node] Port-forward holder disabled: %v\n", err)
+					fmt.Fprintf(os.Stderr, "[Node] Holders disabled: %v\n", err)
 					return
 				}
 				defer rb.Close()
-				holder := newForwardHolder(ctx, rb, forwardSockPath())
-				if err := holder.Run(); err != nil && err != context.Canceled {
-					fmt.Fprintf(os.Stderr, "[Node] Port-forward holder error: %v\n", err)
-				}
-			}()
 
-			// 隧道持有者:本机 node 作为 dockerd,接收 CLI 的 open/close/restart/list 控制以维持
-			// 各条 SOCKS5 出网隧道的本地监听;意图持久化到 ~/.relay/tunnels.json,node 重启时按
-			// restart 策略回放(与 port-forward holder 并列)。
-			go func() {
-				rb, err := getRelayBackend(cfg)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "[Node] Tunnel holder disabled: %v\n", err)
-					return
-				}
-				defer rb.Close()
+				// 端口转发持有者:`relay run -d -p` 的本地转发。
+				go func() {
+					holder := newForwardHolder(ctx, rb, forwardSockPath())
+					if err := holder.Run(); err != nil && err != context.Canceled {
+						fmt.Fprintf(os.Stderr, "[Node] Port-forward holder error: %v\n", err)
+					}
+				}()
+
+				// 隧道持有者:各条 SOCKS5 出网隧道;意图持久化到 ~/.relay/tunnels.json,node 重启时
+				// 按 restart 策略回放。
 				holder := newTunnelHolder(ctx, rb, tunnelSockPath())
 				if err := holder.Run(); err != nil && err != context.Canceled {
 					fmt.Fprintf(os.Stderr, "[Node] Tunnel holder error: %v\n", err)

@@ -20,17 +20,11 @@ import (
 // 复用 daemon.SockFile 与 node.pid/node.log 共用同一 baseDir,避免路径分叉。
 func tunnelSockPath() string { return daemon.SockFile("tunnel") }
 
-// relayBaseDir 返回 node daemon 的 baseDir `~/.relay`(与 daemon.baseDir 一致,但其未导出)。
-func relayBaseDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "."
-	}
-	return filepath.Join(home, ".relay")
+// tunnelStatePath 返回隧道意图持久化文件 `~/.relay/tunnels.json`。目录复用 daemon 的
+// baseDir(经 daemon.SockFile 取其父目录),与 node 的 pid/sock/log 同源,避免路径分叉。
+func tunnelStatePath() string {
+	return filepath.Join(filepath.Dir(daemon.SockFile("tunnel")), "tunnels.json")
 }
-
-// tunnelStatePath 返回隧道意图持久化文件 `~/.relay/tunnels.json`。
-func tunnelStatePath() string { return filepath.Join(relayBaseDir(), "tunnels.json") }
 
 // 隧道控制 socket 的操作码常量 + 重启策略常量:避免裸字符串在多处出现。
 const (
@@ -68,18 +62,41 @@ type tunnelState struct {
 	Started time.Time `json:"started,omitempty"`
 }
 
+// filterTunnels 按 target 精确过滤 egress(空 target = 不过滤);all=false 时仅保留 running。
+// relay ps 与 relay tunnel status 共用同一语义。
+func filterTunnels(states []tunnelState, target string, all bool) []tunnelState {
+	out := make([]tunnelState, 0, len(states))
+	for _, st := range states {
+		if target != "" && st.Egress != target {
+			continue
+		}
+		if !all && st.State != "running" {
+			continue
+		}
+		out = append(out, st)
+	}
+	return out
+}
+
 // tunnelEntry 是常驻 node 进程内一条活跃隧道(内存态)。conns 记录在途的已被 Accept 的连接,
-// 供关闭时连同监听器一起回收。设计上 holder 拥有唯一一把 mu,entry 自身不加锁。
+// 供关闭时连同监听器一起回收。运行态由 listener 是否非 nil 表达(见 toState),不再另行冗余存储。
+// 设计上 holder 拥有唯一一把 mu,entry 自身不加锁。
 type tunnelEntry struct {
 	egress   string
 	listen   string
 	restart  string
 	listener net.Listener
 	conns    map[net.Conn]struct{}
-	state    string
 	started  time.Time
 
 	logf func(format string, args ...any) // 连接级错误经此路由到调用方的日志器,前缀 [tunnel <egress>]
+}
+
+// entryLogf 返回带 `[tunnel <egress>]` 前缀的日志器;relay logs 的回退据此前缀过滤该隧道的行。
+func (h *tunnelHolder) entryLogf(egress string) func(format string, args ...any) {
+	return func(format string, args ...any) {
+		fmt.Fprintf(h.logw, "[tunnel "+egress+"] "+format+"\n", args...)
+	}
 }
 
 // toState 把内存条目投影为可序列化的 tunnelState,state 由监听器是否存活决定。
@@ -196,7 +213,6 @@ func (h *tunnelHolder) closeEntryLocked(entry *tunnelEntry) {
 		_ = conn.Close()
 	}
 	entry.conns = make(map[net.Conn]struct{})
-	entry.state = "stopped"
 }
 
 // openEntryLocked 绑定一条隧道:非 loopback 绑定发出与前台 tunnel 一致的告警,监听成功后
@@ -218,11 +234,8 @@ func (h *tunnelHolder) openEntryLocked(egress, listen, restart string) error {
 		restart:  restart,
 		listener: ln,
 		conns:    make(map[net.Conn]struct{}),
-		state:    "running",
 		started:  time.Now(),
-		logf: func(format string, args ...any) {
-			fmt.Fprintf(h.logw, "[tunnel "+egress+"] "+format+"\n", args...)
-		},
+		logf:     h.entryLogf(egress),
 	}
 	h.byEgress[egress] = entry
 	go h.serveEntry(entry) // accept 循环不触碰 h.mu,可在锁内安全启动
@@ -306,12 +319,7 @@ func (h *tunnelHolder) opRestart(msg tunControlMsg) tunControlResp {
 func (h *tunnelHolder) opList(msg tunControlMsg) tunControlResp {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-
-	states := make([]tunnelState, 0, len(h.byEgress))
-	for _, entry := range h.byEgress {
-		states = append(states, entry.toState())
-	}
-	return tunControlResp{OK: true, Tunnels: states}
+	return tunControlResp{OK: true, Tunnels: h.snapshotLocked()}
 }
 
 // serveEntry 接收来自本地监听端口的连接,并将其登记到 entry.conns 后启动双向泵。
@@ -325,8 +333,8 @@ func (h *tunnelHolder) serveEntry(entry *tunnelEntry) {
 			return
 		}
 		h.mu.Lock()
-		// 竞态防御:close/restart 可能刚好关闭了监听或替换了条目,此时丢弃已 accept 的连接。
-		if entry.state != "running" || h.byEgress[entry.egress] != entry {
+		// 竞态防御:close/restart 可能刚好关闭了监听并从 byEgress 移除/替换了条目,此时丢弃已 accept 的连接。
+		if h.byEgress[entry.egress] != entry {
 			h.mu.Unlock()
 			_ = conn.Close()
 			return
@@ -347,13 +355,18 @@ func (h *tunnelHolder) pumpTunnelConn(entry *tunnelEntry, conn net.Conn) {
 	_ = conn.Close()
 }
 
-// persistLocked 把当前全部条目投影为意图写入 statePath。调用方须已持有 h.mu。
-func (h *tunnelHolder) persistLocked() error {
+// snapshotLocked 把当前全部条目投影为 tunnelState 列表。调用方须已持有 h.mu。
+func (h *tunnelHolder) snapshotLocked() []tunnelState {
 	states := make([]tunnelState, 0, len(h.byEgress))
 	for _, entry := range h.byEgress {
 		states = append(states, entry.toState())
 	}
-	return persistTunnels(h.statePath, states)
+	return states
+}
+
+// persistLocked 把当前全部条目投影为意图写入 statePath。调用方须已持有 h.mu。
+func (h *tunnelHolder) persistLocked() error {
+	return persistTunnels(h.statePath, h.snapshotLocked())
 }
 
 // loadTunnels 读取持久化的隧道意图列表;文件不存在时返回空列表(不视为错误)。
@@ -423,11 +436,8 @@ func (h *tunnelHolder) restore() {
 				listen:  st.Listen,
 				restart: st.Restart,
 				conns:   make(map[net.Conn]struct{}),
-				state:   "stopped",
 				started: st.Started,
-				logf: func(format string, args ...any) {
-					fmt.Fprintf(h.logw, "[tunnel "+st.Egress+"] "+format+"\n", args...)
-				},
+				logf:    h.entryLogf(st.Egress),
 			}
 			fmt.Fprintf(h.logw, "[tunnel %s] restored (stopped)\n", st.Egress)
 		}
