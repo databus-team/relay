@@ -14,6 +14,7 @@ A Go-based daemon for monitoring remote directories and executing actions when f
 - **Remote Exec & Git Sync**: Forward commands via WebSocket with real-time streaming; incremental Git diff sync runs **by default** before execution (opt out with `--no-sync`), with shadow snapshot protection
 - **Task Supervisor (Docker-style UX)**: Detached background execution (`exec -d`), task listing (`ps`), live log tailing (`logs -f`), and process group termination (`stop`)
 - **Port Forwarding (Docker-style -p)**: Forward local ports to remote command/service (`relay run -p 8080:8080`) over full-duplex tunnel stream without requiring network allowlist rules
+- **SOCKS5 Egress Tunnel (node-held)**: `relay tunnel start` opens a local SOCKS5 endpoint whose egress runs on a chosen executor's network (`network_allow` enforced executor-side, deny by default); held by the local `relay node` like `docker run`, persisted to `~/.relay/tunnels.json`, replayed on node restart (`--restart=always|no`), and listed by `relay ps`/`stop`/`logs`
 - **One-Click Undo & Drift Diff**: Restore overwritten remote workspaces instantly (`relay undo`) and inspect cross-node drift & file conflicts (`relay diff`)
 - **Config Hot-Reload**: Push config to a running watcher without restart
 - **Pluggable Backends**: Local filesystem, native relay (WebSocket), MCP SDK (HTTP SSE), JumpServer API
@@ -453,46 +454,64 @@ connects to the target; the transit only forwards bytes (never lands, never pars
 Whitelist is enforced **executor-side** and **deny by default**; an empty/missing `network_allow` rejects
 every tunnel connect.
 
+Tunnels are **held by the local `relay node`** (agent role): the node plays the dockerd role and owns the
+local listener, while the CLI only sends control messages over a unix socket (`~/.relay/tunnel.sock`). A
+tunnel therefore survives the launching shell/SSH session, and its intent is persisted to
+`~/.relay/tunnels.json` (`docker run` runtime state, not config) so the node can replay it on its next start.
+
 ```sh
-relay tunnel --listen 127.0.0.1:1080 --executor site-a   # egress via executor site-a
+relay tunnel start -w site-a --listen 127.0.0.1:1080   # open; ensures the local node is running
 curl --socks5-hostname 127.0.0.1:1080 http://intra.a.internal/ping
+
+relay tunnel status              # table of node-held tunnels + egress readiness (--json for machines)
+relay tunnel status -w site-a    # one egress
+relay tunnel restart -w site-a   # reopen the same egress without retyping --listen/--restart
+relay tunnel stop -w site-a      # close + forget the tunnel (docker rm semantics)
 ```
 
-**Daemon mode (like `relay server`/`relay watch`):** run the tunnel as a detached background process so it
-survives the launching shell/SSH session, managed per-executor. Foreground (`relay tunnel -w site-a`, the
-default) stays unchanged. Control actions:
+**Restart policy (`--restart=always|no`, default `no`).** The recovery event is the node's next start
+(tunnels are goroutines inside the node process). `always` reopens the listener when the node starts; `no`
+keeps the entry but shows it `stopped` (visible under `relay ps -a`). `--no-restart` is a shortcut for
+`--restart=no`. Because **restarting the node drops every tunnel** (they live in that one process, as do the
+detached `-p` port-forwards), use `--restart=always` if you depend on a tunnel, or reopen it per-tunnel with
+`relay tunnel restart -w <egress>`.
+
+**Unified control plane.** Node-held tunnels appear alongside remote detach tasks:
 
 ```sh
-relay tunnel -w site-a start      # detached daemon, log ~/.relay/tunnel-site-a.log
-relay tunnel -w site-a status     # one instance's status
-relay tunnel status               # list ALL tunnel instances (multi-executor) + their pid/log
-relay tunnel -w site-a restart    # reboot one
-relay tunnel -w site-a stop       # stop one
-relay tunnel -w site-a upgrade <bin>   # swap binary & restart one
+relay ps                 # TYPE column: `tunnel` rows (egress in COMMAND, listen in PORTS) + `task` rows
+relay ps -a              # also lists `stopped` tunnels
+relay stop site-a        # stops a tunnel by its egress (also still stops a task by task ID)
+relay logs site-a -f     # streams the tunnel's lines from ~/.relay/node.log (prefix `[tunnel site-a]`)
 ```
 
-Each executor maps to its own daemon instance (`tunnel-<executor>`, independent pid/log under `~/.relay`),
-so tunnels for different egress executors run side-by-side and `relay tunnel status` (no `--executor`)
-reports them all at once.
+`relay ps` still lists local tunnels when the transit is unreachable — only the remote task list degrades.
 
 - `--executor` (`-w` alias) selects the egress executor by its node identity **executor_id** (the
-  `executors[].executor_id` shown by `relay status --json`) — required. It is passed straight through to the
-  transit and routed to the target executor by executor_id (no workspace mapping).
+  `executors[].executor_id` shown by `relay status --json`) — required for `start`/`restart`/`stop`. It is
+  passed straight through to the transit and routed to the target executor by executor_id (no workspace mapping).
 - Default bind is loopback `127.0.0.1`; binding a non-loopback address prints a loud warning (no auth).
 - Server must enable the tunnel channel (`tunnel_enabled: true` in the `server:` section); otherwise
   tunnel requests are rejected.
-- Optionally bound the concurrent-tunnel cap with `server.max_tunnels` (CLI `--max-tunnels`; default 256).
+- Optionally bound the concurrent-tunnel cap with `server.max_tunnels`; default 256.
+
+**Upgrading from the old per-egress daemon model.** Earlier releases ran one detached `tunnel-<executor>`
+daemon per egress. That is retired. Stop any leftover daemon first — `relay tunnel stop -w <egress>`, or
+`kill $(cat ~/.relay/tunnel-<egress>.pid)` — otherwise it still holds the local port and the new node-held
+`relay tunnel start` fails to bind (it detects the stale daemon and reports the exact cleanup command).
+`relay tunnel run` (foreground) and `relay tunnel upgrade` (use `relay node upgrade`) are removed; tunnel
+logs now go through `relay logs`.
 
 **Dual-executor / concurrent tunnels (multi-executor):** one transit can host **two (or more)** remote
-executors at once, each on its own watch/workspace. Run two `relay tunnel`s in parallel, each binding its
-own local port and selecting its own egress — access each executor's intranet targets independently
-without interference. Closing one tunnel never affects the others; `relay status` / the version ledger
-list every online executor per watch so you can see which egresses are available:
+executors at once, each on its own watch/workspace. Start two tunnels, each binding its own local port and
+selecting its own egress — access each executor's intranet targets independently without interference.
+Closing one tunnel never affects the others; `relay status` / the version ledger list every online executor
+per watch so you can see which egresses are available:
 
 ```sh
 # executor M1 (watch site-a) and M2 (watch site-b) both online on the same transit
-relay tunnel --listen 127.0.0.1:1080 --executor site-a   # egress M1
-relay tunnel --listen 127.0.0.1:1081 --executor site-b   # egress M2, independent
+relay tunnel start -w site-a --listen 127.0.0.1:1080   # egress M1
+relay tunnel start -w site-b --listen 127.0.0.1:1081   # egress M2, independent
 
 curl --socks5-hostname 127.0.0.1:1080 http://a-intra.pvt/00
 curl --socks5-hostname 127.0.0.1:1081 https://b-intra.pvt/api
@@ -500,7 +519,7 @@ curl --socks5-hostname 127.0.0.1:1081 https://b-intra.pvt/api
 
 **`network_allow` is per-executor.** Each executor's `backend.config` carries the allowlist for the
 egress it may reach. In a multi-executor deployment put each executor's own whitelist in that executor's
-config (so `relay tunnel --executor site-a` is gated by site-a's allowlist, `--executor site-b` by site-b's).
+config (so `relay tunnel start -w site-a` is gated by site-a's allowlist, `-w site-b` by site-b's).
 Format: `host|IP|CIDR[@port]` — `@` port is optional (`443`, `80,443`, `8000-9000`); missing `@` = any port.
 The transit and local CLI never need `network_allow`; only the executor enforces it.
 
