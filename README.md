@@ -284,6 +284,9 @@ relay nodes
 
 # Output in JSON format
 relay nodes --json
+
+# Include live CPU / memory usage (heavier probe: one sampling window per node)
+relay nodes --usage
 ```
 
 Displays cluster topology with node identities, roles (`hub`, `agent`), operational readiness, platform architecture, and end-to-end latency:
@@ -294,6 +297,15 @@ hub (transit)            hub            Ready      feae97f+feae97f  linux/amd64 
 extranet                 agent          Ready      feae97f+feae97f  -                12 ms
 intranet                 agent          Ready      feae97f+feae97f  -                13 ms
 ```
+
+With `-u` / `--usage` two more columns appear, both expressed as a percentage of what that node is allowed to use:
+```
+NAME                     ROLES      STATUS   PLATFORM       CPU              MEMORY                   VERSION          LATENCY
+CT-MBP.local (local)     agent      Ready    darwin/arm64   8c (24%)         2.2G/16.0G (14%)         v0.4.4+420028d   -
+hub (transit)            hub, agent Ready    linux/amd64    8c (0%) [pod]    0.3G/16.0G (2%) [pod]    v0.4.4+420028d   6 ms
+extranet                 agent      Ready    windows/amd64  4c (5%)          5.7G/12.0G (47%)         v0.4.4+420028d   111 ms
+```
+`CPU` reads as `<quota> (<used>)`: the quota is the cgroup CPU limit inside a container, otherwise the machine's core count. `MEMORY` is `used/total (percent)`. The `[pod]` suffix marks values read from the container's own cgroup rather than the host's — including in the CPU column, which on a pod is sampled from `cpu.stat` so a busy host can't be mistaken for a busy pod. Nodes running a build older than this protocol change report no percentage and simply show their static quota until they are redeployed; a genuinely idle node shows `(0%)` instead of dropping the column.
 
 Nodes that registered before but are currently disconnected show `STATUS Offline` and `LATENCY -`. The transit keeps a **known-executor ledger** so offline nodes stay visible (persisted to `server.watch_root/known_executors.json`; everything loads as offline until the node re-registers). To remove offline entries for good, prune them:
 
