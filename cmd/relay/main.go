@@ -146,19 +146,15 @@ var (
 	tunnelExecName = tunnelCmd.Flag("executor", "Egress executor's executor_id (see `relay status` -> executors[].executor_id)").Short('w').HintAction(getNodeHints).String()
 	tunnelNodeName = tunnelCmd.Flag("node", "Egress node ID (alias for --executor)").HintAction(getNodeHints).String()
 
-	// tunnel 子命令
-	_                 = tunnelCmd.Command("run", "Run SOCKS5 egress tunnel in foreground")
-	_                 = tunnelCmd.Command("start", "Start tunnel daemon in background")
-	_                 = tunnelCmd.Command("stop", "Stop running tunnel daemon")
-	tunnelStatusCmd   = tunnelCmd.Command("status", "Show status of tunnel daemon and egress readiness")
-	tunnelJSON        = tunnelStatusCmd.Flag("json", "Output as JSON").Bool()
-	tunnelLogsCmd     = tunnelCmd.Command("logs", "Tail or stream tunnel daemon logs")
-	tunnelFollow      = tunnelLogsCmd.Flag("follow", "Follow log output").Short('f').Bool()
-	tunnelTail        = tunnelLogsCmd.Flag("tail", "Number of lines to show from the end").Default("100").Int()
-	tunnelLogsTarget  = tunnelLogsCmd.Arg("target", "Target node ID").HintAction(getNodeHints).String()
-	_                 = tunnelCmd.Command("restart", "Restart tunnel daemon")
-	tunnelUpgradeCmd  = tunnelCmd.Command("upgrade", "Upgrade tunnel daemon binary")
-	tunnelUpgradePath = tunnelUpgradeCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
+	// tunnel 子命令:隧道由本地 node 持有(类比 dockerd),CLI 仅作控制面经 unix socket 下发
+	// open/close/restart/list。故没有 run(常驻进程已并入 node),也没有独立的 logs/upgrade。
+	tunnelStartCmd      = tunnelCmd.Command("start", "Start a SOCKS5 tunnel held by the local node")
+	tunnelRestartPolicy = tunnelStartCmd.Flag("restart", "Restart policy on node restart: always|no").Default("no").String()
+	tunnelNoRestart     = tunnelStartCmd.Flag("no-restart", "Shortcut for --restart=no").Bool()
+	_                   = tunnelCmd.Command("stop", "Stop a node-held tunnel")
+	tunnelStatusCmd     = tunnelCmd.Command("status", "Show status of node-held tunnels and egress readiness")
+	tunnelJSON          = tunnelStatusCmd.Flag("json", "Output as JSON").Bool()
+	_                   = tunnelCmd.Command("restart", "Restart a node-held tunnel (reopen without retyping flags)")
 
 	// Undo command - 一键恢复远端工作区影子快照 (防误操作与冲突覆盖)
 	undoCmd      = kingpin.Command("undo", "Restore remote workspace shadow snapshot")
@@ -284,28 +280,22 @@ func main() {
 		sub := strings.TrimSpace(strings.TrimPrefix(selectedCmd, "tunnel"))
 		switch sub {
 		case "start":
-			if err := daemonStartTunnel(); err != nil {
+			if err := runTunnelStart(); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
 		case "stop":
-			daemonStopTunnel()
+			runTunnelStop()
 		case "status":
 			if err := daemonStatusTunnel(); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
-		case "logs":
-			if err := daemonLogsTunnel(); err != nil {
+		case "restart":
+			if err := runTunnelRestart(); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
-		case "restart":
-			daemonRestartTunnel()
-		case "upgrade":
-			daemonUpgradeTunnel(*tunnelUpgradePath)
-		case "run":
-			runTunnel()
 		default:
 			app.Usage(os.Args[1:])
 		}
@@ -451,9 +441,9 @@ func daemonStatus(name string) error {
 	return nil
 }
 
-// tunnelInstanceName 由 executor 派生隧道 daemon 的实例名(pid/log 文件名用,形如
-// `tunnel-<executor>`)。executor 是执行方注册的身份,可能含非法文件名字符,做净化后作后缀,
-// 保证每条隧道一个独立 pid/log 文件、可多开;status 按 `ListInstances("tunnel")` 枚举它们。
+// tunnelInstanceName 由 executor 派生旧式独立隧道 daemon 的实例名(pid/log 文件名用,形如
+// `tunnel-<executor>`)。隧道现已由本地 node 持有,该名字仅用于识别并清理残留的旧 daemon
+// (它们可能仍占着监听地址);executor 是执行方注册的身份,可能含非法文件名字符,做净化后作后缀。
 func tunnelInstanceName(executor string) string {
 	var b strings.Builder
 	b.WriteString("tunnel-")
@@ -468,14 +458,6 @@ func tunnelInstanceName(executor string) string {
 	return b.String()
 }
 
-// tunnelDaemonArgs 构造隧道 daemon 子进程的启动参数:`tunnel run` 后透传 -w/--listen/-c,
-// 使子进程与前台 `relay tunnel -w <executor> --listen <addr>` 行为一致。
-// 注意 --listen 未定义 `-l` 短旗标,须用长旗标全名。
-func tunnelDaemonArgs() []string {
-	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
-	return []string{"tunnel", "run", "-w", target, "--listen", *tunnelListen, "-c", *configPath}
-}
-
 // tunnelRequireExecutor 校验隧道控制类操作(启动/停止/重启/升级)必须携带 node/executor 并返回目标节点 ID。
 func tunnelRequireExecutor() (string, error) {
 	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
@@ -483,45 +465,6 @@ func tunnelRequireExecutor() (string, error) {
 		return "", fmt.Errorf("Specify --node or --executor with the egress node ID (see `relay status` -> `executors[].executor_id`)")
 	}
 	return target, nil
-}
-
-// daemonStartTunnel 以 executor 命名的实例 detached 启动隧道 daemon。
-func daemonStartTunnel() error {
-	target, err := tunnelRequireExecutor()
-	if err != nil {
-		return err
-	}
-	return daemonStartArgs(tunnelInstanceName(target), tunnelDaemonArgs())
-}
-
-// daemonStopTunnel 停止指定 executor 的隧道实例。
-func daemonStopTunnel() {
-	target, err := tunnelRequireExecutor()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return
-	}
-	daemonStop(tunnelInstanceName(target))
-}
-
-// daemonRestartTunnel 重启指定 executor 的隧道实例。
-func daemonRestartTunnel() {
-	target, err := tunnelRequireExecutor()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return
-	}
-	daemonRestartArgs(tunnelInstanceName(target), tunnelDaemonArgs())
-}
-
-// daemonUpgradeTunnel 升级重启指定 executor 的隧道实例。
-func daemonUpgradeTunnel(newBin string) {
-	target, err := tunnelRequireExecutor()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return
-	}
-	daemonUpgradeArgs(tunnelInstanceName(target), newBin, tunnelDaemonArgs())
 }
 
 func runWatch() {

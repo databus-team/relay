@@ -9,13 +9,12 @@ import (
 	"io"
 	"net"
 	"os"
-	"os/signal"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/user/relay/internal/config"
+	"github.com/user/relay/internal/daemon"
 	relaybackend "github.com/user/relay/internal/relay/backend"
 )
 
@@ -30,71 +29,128 @@ const (
 	handshakeTimeout = 10 * time.Second
 )
 
-// runTunnel 本地 SOCKS5 出网隧道:监听本地端口,把每个客户端 CONNECT 目标的访问经中转转发到
-// 所选 executor,由其白名单校验 + 真实连接后双向字节流往返。每隧道一进程、互不阻塞。
-func runTunnel() {
+// tunnelRestartPolicyValue 把 --restart/--no-restart 解析为标准策略值(always|no)。
+// --no-restart 是 --restart=no 的快捷方式(且优先);缺省与空值都归一为 no。
+func tunnelRestartPolicyValue() (string, error) {
+	if *tunnelNoRestart {
+		return tunRestartNo, nil
+	}
+	switch policy := strings.ToLower(strings.TrimSpace(*tunnelRestartPolicy)); policy {
+	case "", tunRestartNo:
+		return tunRestartNo, nil
+	case tunRestartAlways:
+		return tunRestartAlways, nil
+	default:
+		return "", fmt.Errorf("invalid --restart %q (want always|no)", policy)
+	}
+}
+
+// runTunnelStart 启动一条由本地 node 持有的 SOCKS5 隧道:先确保 node(agent 角色)在线,
+// 再经 holder unix socket 下发 open 消息(携带 egress/listen/restart 策略)。只有 start 会
+// 自动拉起 node;stop/restart 只控制既有隧道,不隐式启动常驻进程。
+func runTunnelStart() error {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("load config: %w", err)
 	}
 	if cfg.Backend.Type != "relay" {
-		fmt.Fprintf(os.Stderr, "Error: tunnel requires backend.type=relay, got %q\n", cfg.Backend.Type)
-		os.Exit(1)
+		return fmt.Errorf("tunnel requires backend.type=relay, got %q", cfg.Backend.Type)
 	}
 
-	// 出口 node/executor 选择:`-w` 是「执行方注册的节点身份 executor_id」(见 `relay status` 的
-	// `executors[].executor_id`),不是本地工作区名。因此不走 resolveWorkspaceID 的 cwd 推断、也
-	// 不要求命中 cfg.Workspaces(那是 workspace,与执行方 watch 是两个命名空间)。中转按该
-	// watch 解析已注册 exec 的 executor;无在线执行方 → 建连即失败。
-	w := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
-	if w == "" {
-		fmt.Fprintf(os.Stderr, "Specify --node or --executor with the egress node's ID (see `relay status --json` -> `executors[].executor_id`).\n")
-		os.Exit(1)
+	// 出口 node 选择:`-w` 是「执行方注册的节点身份 executor_id」(见 `relay status` 的
+	// `executors[].executor_id`),不是本地工作区名。
+	target, err := tunnelRequireExecutor()
+	if err != nil {
+		return err
 	}
 
-	rb, err := getRelayBackend(cfg)
+	policy, err := tunnelRestartPolicyValue()
+	if err != nil {
+		return err
+	}
+
+	if err := ensureLocalRelayNode(cfg, tunnelSockPath()); err != nil {
+		return err
+	}
+
+	resp, err := sendTunnelControl(tunnelSockPath(), tunControlMsg{
+		Op:      tunOpOpen,
+		Egress:  target,
+		Listen:  *tunnelListen,
+		Restart: policy,
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		// 最常见的失败是 holder 绑不上监听地址——多半是残留的旧 `tunnel-<egress>` 独立 daemon
+		// 还占着同一端口,附上可操作的清理提示。
+		return fmt.Errorf("start tunnel %s: %s%s", target, resp.Error, tunnelLegacyDaemonHint(target))
+	}
+	fmt.Printf("tunnel %s started: SOCKS5 on %s -> egress %s (restart=%s)\n", target, *tunnelListen, target, policy)
+	return nil
+}
+
+// tunnelLegacyDaemonHint 探测是否仍有旧的每出口独立 `tunnel-<egress>` daemon 在跑(已废弃的部署
+// 形态)。若在跑,它很可能占着同一监听地址导致 holder 绑定失败;返回一段清理提示,否则返回空串。
+func tunnelLegacyDaemonHint(egress string) string {
+	inst := tunnelInstanceName(egress)
+	st := daemon.Get(daemon.PidFile(inst))
+	if !st.Running {
+		return ""
+	}
+	return fmt.Sprintf("; a legacy tunnel daemon %s is still running (pid %d) and may hold the listen address — remove it with `relay tunnel stop -w %s` or `kill %d`", inst, st.Pid, egress, st.Pid)
+}
+
+// runTunnelStop 停止一条由本地 node 持有的隧道。node 未运行时视为「已经没有该隧道可停」,
+// 幂等成功;最后总是顺带清理可能残留的旧独立 tunnel daemon。
+func runTunnelStop() {
+	target, err := tunnelRequireExecutor()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return
 	}
 
-	ln, err := net.Listen("tcp", *tunnelListen)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Tunnel listen: %v\n", err)
-		os.Exit(1)
-	}
-	defer ln.Close()
-
-	// 非 loopback 绑定会把这个「经执行方出内网」的能力暴露给任何能到达该端口的人,醒目警告。
-	if !isLoopbackAddr(*tunnelListen) {
-		fmt.Fprintf(os.Stderr, "WARNING: listening on %q (non-loopback). This tunnel has no auth; any host that can reach this port can use it to reach the executor's network.\n", *tunnelListen)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		fmt.Fprintln(os.Stderr, "\nShutting down tunnel...")
-		cancel()
-		ln.Close()
-	}()
-
-	fmt.Printf("tunnel: SOCKS5 on %s -> egress %s (Ctrl-C to stop)\n", *tunnelListen, w)
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			continue
+	if !daemon.Get(daemon.PidFile("node")).Running {
+		fmt.Printf("node not running; no tunnel for %s to stop\n", target)
+	} else {
+		resp, err := sendTunnelControl(tunnelSockPath(), tunControlMsg{Op: tunOpClose, Egress: target})
+		switch {
+		case err != nil:
+			fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
+		case !resp.OK:
+			fmt.Fprintf(os.Stderr, "Warning: stop tunnel %s: %s\n", target, resp.Error)
+		default:
+			fmt.Printf("tunnel %s stopped\n", target)
 		}
-		go handleTunnelConn(ctx, rb, w, conn, func(format string, args ...any) {
-			fmt.Fprintf(os.Stderr, "[tunnel] "+format+"\n", args...)
-		})
 	}
+
+	// 旧部署形态的独立隧道 daemon(已废弃):若还在跑,一并清理,避免它继续占用监听地址。
+	if legacy := daemon.Get(daemon.PidFile(tunnelInstanceName(target))); legacy.Running {
+		daemonStop(tunnelInstanceName(target))
+	}
+}
+
+// runTunnelRestart 重启一条 node 持有的隧道(按原 egress/listen/restart 策略重开,无需重敲旗标)。
+// node 未运行时直接报错而不自动拉起:restart 只对既有隧道有意义。
+func runTunnelRestart() error {
+	target, err := tunnelRequireExecutor()
+	if err != nil {
+		return err
+	}
+	if !daemon.Get(daemon.PidFile("node")).Running {
+		return fmt.Errorf("local node is not running; nothing to restart for %s (start it with `relay node start`, then `relay tunnel start -w %s`)", target, target)
+	}
+
+	resp, err := sendTunnelControl(tunnelSockPath(), tunControlMsg{Op: tunOpRestart, Egress: target})
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("restart tunnel %s: %s", target, resp.Error)
+	}
+	fmt.Printf("tunnel %s restarted\n", target)
+	return nil
 }
 
 // handleTunnelConn 处理一条本地 SOCKS5 连接:SOCKS5 握手解 → TunnelOpen → 建连成功后

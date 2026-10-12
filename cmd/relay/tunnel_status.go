@@ -1,17 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
-	"os/signal"
 	"os/user"
-	"regexp"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/user/relay/internal/config"
@@ -29,44 +24,6 @@ type TunnelInstanceInfo struct {
 	EgressReady bool   `json:"egress_ready"`
 	EgressText  string `json:"egress_status"`
 	LogFile     string `json:"log_file"`
-}
-
-var tunnelHeaderRe = regexp.MustCompile(`tunnel:\s+SOCKS5\s+on\s+([^\s]+)\s+->\s+egress\s+([^\s]+)`)
-
-// parseTunnelMeta 从实例名、日志文件及运行环境提取 listen 地址与 egress 节点
-func parseTunnelMeta(instName, logFile string, defaultListen string) (listen, egress string) {
-	// 1. egress 节点优先从实例名获取（形如 tunnel-<egress>）
-	egress = instName
-	if strings.HasPrefix(instName, "tunnel-") {
-		egress = strings.TrimPrefix(instName, "tunnel-")
-	}
-
-	listen = defaultListen
-	if listen == "" {
-		listen = "127.0.0.1:1080"
-	}
-
-	// 2. 尝试从 logFile 的前若干行提取真实启动参数
-	if logFile != "" {
-		if f, err := os.Open(logFile); err == nil {
-			defer f.Close()
-			scanner := bufio.NewScanner(f)
-			count := 0
-			for scanner.Scan() && count < 20 {
-				line := scanner.Text()
-				if m := tunnelHeaderRe.FindStringSubmatch(line); len(m) == 3 {
-					listen = m[1]
-					if m[2] != "" {
-						egress = m[2]
-					}
-					break
-				}
-				count++
-			}
-		}
-	}
-
-	return listen, egress
 }
 
 // shortenPath 把家目录替换为 ~ 缩短显示
@@ -108,59 +65,61 @@ func queryClusterStatusSafe() map[string]protocol.StatusSegment {
 	return nodesMap
 }
 
-// daemonStatusTunnel 展示隧道实例状态（支持表格与 --json 输出）
+// daemonStatusTunnel 展示隧道实例状态（支持表格与 --json 输出）。事实来源是本地 node 的
+// 隧道持有者 socket（list 操作），而非扫描 pid 文件/日志——隧道已并入 node 进程，PID 与日志
+// 都归属该 node。node 未运行时不去隐式拉起，直接报告无隧道。
 func daemonStatusTunnel() error {
-	insts, err := daemon.ListInstances("tunnel")
-	if err != nil {
+	// 先校验配置可读：全网探测（queryClusterStatusSafe）对配置错误是静默降级的，
+	// 这里显式暴露，避免用户把「配置坏了」误读成「所有出口都下线」。
+	if _, err := config.Load(*configPath); err != nil {
 		return err
 	}
 
 	targetNode := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
 
-	// 若指定了目标节点，过滤对应实例
-	if targetNode != "" {
-		var filtered []daemon.Instance
-		for _, in := range insts {
-			if in.Name == targetNode || in.Name == tunnelInstanceName(targetNode) || strings.TrimPrefix(in.Name, "tunnel-") == targetNode {
-				filtered = append(filtered, in)
-			}
-		}
-		insts = filtered
+	nodeStatus := daemon.Get(daemon.PidFile("node"))
+	if nodeStatus.Err != nil {
+		return nodeStatus.Err
 	}
-
-	if len(insts) == 0 {
+	if !nodeStatus.Running {
 		if *tunnelJSON {
 			fmt.Println("[]")
 			return nil
 		}
-		if targetNode != "" {
-			fmt.Printf("No tunnel instance found for node %q.\n", targetNode)
-		} else {
-			fmt.Println("No active tunnel instances found.")
-		}
+		fmt.Println("node not running; no tunnel instances.")
 		return nil
+	}
+
+	resp, err := sendTunnelControl(tunnelSockPath(), tunControlMsg{Op: tunOpList})
+	if err != nil {
+		return fmt.Errorf("query tunnels: %w", err)
+	}
+	if !resp.OK {
+		return fmt.Errorf("list tunnels: %s", resp.Error)
+	}
+
+	states := resp.Tunnels
+	// 指定了目标节点时按 egress 过滤（保留 stopped 条目，与 docker ps -a 语义一致）。
+	if targetNode != "" {
+		filtered := make([]tunnelState, 0, len(states))
+		for _, st := range states {
+			if st.Egress == targetNode {
+				filtered = append(filtered, st)
+			}
+		}
+		states = filtered
 	}
 
 	// 并发/快速探测中转节点在线台账 (超时 1.5s，断网则为 nil)
 	clusterStatus := queryClusterStatusSafe()
 
-	var rows []TunnelInstanceInfo
-	for _, in := range insts {
-		st := "stopped"
-		pid := 0
-		if in.Status.Running {
-			st = "running"
-			pid = in.Status.Pid
-		}
-
-		cleanName := strings.TrimPrefix(in.Name, "tunnel-")
-		listenAddr, egressNode := parseTunnelMeta(in.Name, in.LogFile, *tunnelListen)
-
+	rows := make([]TunnelInstanceInfo, 0, len(states))
+	for _, st := range states {
 		egressReady := false
 		egressStatusText := "unknown"
 
 		if clusterStatus != nil {
-			if seg, exists := clusterStatus[egressNode]; exists {
+			if seg, exists := clusterStatus[st.Egress]; exists {
 				if seg.Unavailable != "" {
 					egressStatusText = "Offline"
 				} else if seg.LatencyMS != nil {
@@ -176,14 +135,14 @@ func daemonStatusTunnel() error {
 		}
 
 		rows = append(rows, TunnelInstanceInfo{
-			Name:        cleanName,
-			Status:      st,
-			PID:         pid,
-			Listen:      listenAddr,
-			Egress:      egressNode,
+			Name:        st.Egress,
+			Status:      st.State,
+			PID:         nodeStatus.Pid,
+			Listen:      st.Listen,
+			Egress:      st.Egress,
 			EgressReady: egressReady,
 			EgressText:  egressStatusText,
-			LogFile:     in.LogFile,
+			LogFile:     daemon.LogFile("node"),
 		})
 	}
 
@@ -194,7 +153,17 @@ func daemonStatusTunnel() error {
 		return enc.Encode(rows)
 	}
 
-	// 2. 对齐表格格式输出
+	// 2. 空态:node 在跑但没有任何隧道意图时,给出明确提示而非只打表头。
+	if len(rows) == 0 {
+		if targetNode != "" {
+			fmt.Printf("No tunnel found for egress %q.\n", targetNode)
+		} else {
+			fmt.Println("No tunnel instances found.")
+		}
+		return nil
+	}
+
+	// 3. 对齐表格格式输出
 	fmt.Printf("%-16s %-10s %-8s %-18s %-16s %-18s %s\n",
 		"NAME", "STATUS", "PID", "LISTEN", "EGRESS", "EGRESS STATUS", "LOG")
 
@@ -210,154 +179,3 @@ func daemonStatusTunnel() error {
 
 	return nil
 }
-
-// daemonLogsTunnel 查看/跟踪指定隧道实例的日志
-func daemonLogsTunnel() error {
-	insts, err := daemon.ListInstances("tunnel")
-	if err != nil {
-		return err
-	}
-
-	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
-	if target == "" && tunnelLogsTarget != nil && *tunnelLogsTarget != "" {
-		target = *tunnelLogsTarget
-	}
-
-	// 若未显式指定目标，且本地恰好只有 1 个实例，自动推断
-	if target == "" {
-		if len(insts) == 1 {
-			target = strings.TrimPrefix(insts[0].Name, "tunnel-")
-		} else if len(insts) == 0 {
-			return fmt.Errorf("no active tunnel instances found")
-		} else {
-			var names []string
-			for _, in := range insts {
-				names = append(names, strings.TrimPrefix(in.Name, "tunnel-"))
-			}
-			return fmt.Errorf("multiple tunnel instances found (%s); please specify target node via `relay tunnel logs <node>` or `-w <node>`", strings.Join(names, ", "))
-		}
-	}
-
-	// 定位日志文件
-	instName := tunnelInstanceName(target)
-	logFile := daemon.LogFile(instName)
-
-	f, err := os.Open(logFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("log file not found for tunnel %q (%s)", target, logFile)
-		}
-		return fmt.Errorf("open log file: %w", err)
-	}
-	defer f.Close()
-
-	tailLines := *tunnelTail
-	if tailLines <= 0 {
-		tailLines = 100
-	}
-
-	// 读取末尾 tailLines 行
-	lines, err := readTailLines(f, tailLines)
-	if err != nil {
-		return fmt.Errorf("read tail lines: %w", err)
-	}
-	for _, l := range lines {
-		fmt.Println(l)
-	}
-
-	if !*tunnelFollow {
-		return nil
-	}
-
-	// Follow 模式持续输出
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		cancel()
-	}()
-
-	// 移至文件当前末尾
-	offset, err := f.Seek(0, io.SeekEnd)
-	if err != nil {
-		return err
-	}
-
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
-
-	buf := make([]byte, 4096)
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			fi, err := f.Stat()
-			if err != nil {
-				continue
-			}
-			if fi.Size() < offset {
-				// 文件可能被 rotate 或清空，重新从头读
-				offset = 0
-				_, _ = f.Seek(0, io.SeekStart)
-			}
-			for {
-				n, err := f.Read(buf)
-				if n > 0 {
-					os.Stdout.Write(buf[:n])
-					offset += int64(n)
-				}
-				if err != nil {
-					break
-				}
-			}
-		}
-	}
-}
-
-// readTailLines 高效读取文件末尾最多 N 行
-func readTailLines(f *os.File, n int) ([]string, error) {
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-
-	size := fi.Size()
-	if size == 0 {
-		return nil, nil
-	}
-
-	// 预估每行约 128 字节，先向前定位
-	chunkSize := int64(n * 256)
-	if chunkSize > size {
-		chunkSize = size
-	}
-	if chunkSize > 1024*1024 {
-		chunkSize = 1024 * 1024
-	}
-
-	buf := make([]byte, chunkSize)
-	start := size - chunkSize
-	if _, err := f.Seek(start, io.SeekStart); err != nil {
-		return nil, err
-	}
-	if _, err := io.ReadFull(f, buf); err != nil {
-		return nil, err
-	}
-
-	scanner := bufio.NewScanner(strings.NewReader(string(buf)))
-	var lines []string
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-
-	// 如果末尾块中的行数超过 n，取最后 n 行
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
-	}
-	return lines, nil
-}
-

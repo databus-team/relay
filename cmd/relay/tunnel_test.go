@@ -3,8 +3,6 @@ package main
 import (
 	"bufio"
 	"net"
-	"os"
-	"reflect"
 	"testing"
 )
 
@@ -15,7 +13,7 @@ func TestTunnelInstanceName(t *testing.T) {
 	}{
 		{"node-a", "tunnel-node-a"},
 		{"a/b:c d", "tunnel-a_b_c_d"}, // 路径分隔/冒号/空格 → 下划线
-		{"中文字符", "tunnel-____"}, // 4 个非 [A-Za-z0-9._-] 全净化(前缀连字符保留)
+		{"中文字符", "tunnel-____"},       // 4 个非 [A-Za-z0-9._-] 全净化(前缀连字符保留)
 	}
 	for _, c := range cases {
 		if got := tunnelInstanceName(c.executor); got != c.want {
@@ -24,15 +22,44 @@ func TestTunnelInstanceName(t *testing.T) {
 	}
 }
 
-// tunnelDaemonArgs 应产出 `tunnel run` 的子进程参数,透传 executor/--listen/config,
-// 与前台用法对齐(--listen 用长旗标,因未定义 `-l` 短旗标)。
-func TestTunnelDaemonArgs(t *testing.T) {
-	*tunnelExecName = "node-a"
-	*tunnelListen = "127.0.0.1:9999"
-	*configPath = "~/.relay/config.yaml"
-	want := []string{"tunnel", "run", "-w", "node-a", "--listen", "127.0.0.1:9999", "-c", "~/.relay/config.yaml"}
-	if got := tunnelDaemonArgs(); !reflect.DeepEqual(got, want) {
-		t.Errorf("tunnelDaemonArgs() = %v, want %v", got, want)
+// tunnelRestartPolicyValue 应把 --restart/--no-restart 归一为 always|no,--no-restart 优先,
+// 缺省为 no,非法值报错。直接置位包级旗标指针并在 defer 中还原。
+func TestTunnelRestartPolicyValue(t *testing.T) {
+	origPolicy, origNoRestart := *tunnelRestartPolicy, *tunnelNoRestart
+	defer func() { *tunnelRestartPolicy, *tunnelNoRestart = origPolicy, origNoRestart }()
+
+	cases := []struct {
+		name      string
+		policy    string
+		noRestart bool
+		want      string
+		wantErr   bool
+	}{
+		{name: "no-restart flag", policy: "always", noRestart: true, want: tunRestartNo},
+		{name: "default empty", policy: "", want: tunRestartNo},
+		{name: "always", policy: "always", want: tunRestartAlways},
+		{name: "no", policy: "no", want: tunRestartNo},
+		{name: "trim and lowercase", policy: "  ALWAYS ", want: tunRestartAlways},
+		{name: "invalid", policy: "bogus", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			*tunnelRestartPolicy = tc.policy
+			*tunnelNoRestart = tc.noRestart
+			got, err := tunnelRestartPolicyValue()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("tunnelRestartPolicyValue(%q, noRestart=%v) = %q, want error", tc.policy, tc.noRestart, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("tunnelRestartPolicyValue(%q, noRestart=%v): %v", tc.policy, tc.noRestart, err)
+			}
+			if got != tc.want {
+				t.Errorf("tunnelRestartPolicyValue(%q, noRestart=%v) = %q, want %q", tc.policy, tc.noRestart, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -140,32 +167,3 @@ func TestIsLoopbackAddr(t *testing.T) {
 		}
 	}
 }
-
-func TestParseTunnelMeta(t *testing.T) {
-	// 1. 无日志文件，直接根据实例名推导
-	listen, egress := parseTunnelMeta("tunnel-node-b", "", "127.0.0.1:1085")
-	if egress != "node-b" {
-		t.Errorf("expected egress node-b, got %s", egress)
-	}
-	if listen != "127.0.0.1:1085" {
-		t.Errorf("expected listen 127.0.0.1:1085, got %s", listen)
-	}
-
-	// 2. 模拟日志头部含有实际 listen 地址
-	tmpFile, err := os.CreateTemp("", "tunnel-log-*.log")
-	if err != nil {
-		t.Fatalf("create temp log: %v", err)
-	}
-	defer os.Remove(tmpFile.Name())
-	_, _ = tmpFile.WriteString("tunnel: SOCKS5 on 127.0.0.1:2088 -> egress node-custom (Ctrl-C to stop)\n")
-	tmpFile.Close()
-
-	listen2, egress2 := parseTunnelMeta("tunnel-fallback", tmpFile.Name(), "127.0.0.1:1080")
-	if egress2 != "node-custom" {
-		t.Errorf("expected egress node-custom, got %s", egress2)
-	}
-	if listen2 != "127.0.0.1:2088" {
-		t.Errorf("expected listen 127.0.0.1:2088, got %s", listen2)
-	}
-}
-
