@@ -293,3 +293,302 @@ func TestTunnelHolder_NonLoopbackWarning(t *testing.T) {
 		t.Fatalf("restore non-loopback warning not emitted; got:\n%s", restoreLogs.String())
 	}
 }
+
+// nonBindableListen 是一个本机绑不上的地址(TEST-NET-1 保留段,非本机接口地址),
+// 用于确定性地制造 net.Listen 失败(EADDRNOTAVAIL),避免依赖端口占用这类易漂移的条件。
+const nonBindableListen = "192.0.2.1:0"
+
+// waitDialable 轮询直到 listen 可建立 TCP 连接(监听已就绪),超时即失败。
+func waitDialable(t *testing.T, listen string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if c, err := net.DialTimeout("tcp", listen, 200*time.Millisecond); err == nil {
+			_ = c.Close()
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("address %s never became dialable", listen)
+}
+
+// TestTunnelHolder_Restart 验证 `relay tunnel restart`(tunOpRestart)在原地址上关闭后重开:
+// 应答 OK、list 中仍是同一条 running 条目(不重复累加)、地址重新可连、持久化意图保持。
+func TestTunnelHolder_Restart(t *testing.T) {
+	holder, cancel, sock := startTestHolder(t, "", nil)
+	defer cancel()
+
+	port := freeTCPPort(t)
+	listen := fmt.Sprintf("127.0.0.1:%d", port)
+	openTunnel(t, sock, "eg-restart", listen, tunRestartAlways)
+	waitDialable(t, listen)
+
+	resp := sendTunControl(t, sock, tunControlMsg{Op: tunOpRestart, Egress: "eg-restart"})
+	if !resp.OK {
+		t.Fatalf("restart failed: %s", resp.Error)
+	}
+
+	listResp := sendTunControl(t, sock, tunControlMsg{Op: tunOpList})
+	if !listResp.OK {
+		t.Fatalf("list failed: %s", listResp.Error)
+	}
+	if len(listResp.Tunnels) != 1 {
+		t.Fatalf("list after restart = %+v, want exactly one entry", listResp.Tunnels)
+	}
+	got := listResp.Tunnels[0]
+	if got.Egress != "eg-restart" || got.Listen != listen || got.State != "running" || got.Restart != tunRestartAlways {
+		t.Fatalf("list after restart = %+v, want egress=eg-restart listen=%s state=running restart=always", got, listen)
+	}
+
+	// 原地址重新可连(重启后新监听接管)。
+	waitDialable(t, listen)
+
+	states, err := loadTunnels(holder.statePath)
+	if err != nil {
+		t.Fatalf("loadTunnels: %v", err)
+	}
+	if len(states) != 1 || states[0].Egress != "eg-restart" || states[0].State != "running" {
+		t.Fatalf("persisted state after restart = %+v, want one running eg-restart", states)
+	}
+}
+
+// TestTunnelHolder_RestartBindFailureKeepsStoppedEntry 验证 restart 重绑失败时的语义:
+// 应答 OK=false、条目仍以 stopped 留在内存(list 可见,可再次 restart),且意图文件保持原样不被改写。
+func TestTunnelHolder_RestartBindFailureKeepsStoppedEntry(t *testing.T) {
+	holder, cancel, sock := startTestHolder(t, "", nil)
+	defer cancel()
+
+	port := freeTCPPort(t)
+	listen := fmt.Sprintf("127.0.0.1:%d", port)
+	openTunnel(t, sock, "eg-rfail", listen, tunRestartAlways)
+	waitDialable(t, listen)
+
+	before, err := os.ReadFile(holder.statePath)
+	if err != nil {
+		t.Fatalf("read state before restart: %v", err)
+	}
+
+	// 白盒:把条目的 listen 改成一个本机绑不上的地址,确定性地制造重绑失败。
+	holder.mu.Lock()
+	holder.byEgress["eg-rfail"].listen = nonBindableListen
+	holder.mu.Unlock()
+
+	resp := sendTunControl(t, sock, tunControlMsg{Op: tunOpRestart, Egress: "eg-rfail"})
+	if resp.OK {
+		t.Fatalf("restart with unbindable listen unexpectedly succeeded: %+v", resp)
+	}
+
+	// 条目仍在,但降为 stopped(可被再次 restart 恢复)。
+	listResp := sendTunControl(t, sock, tunControlMsg{Op: tunOpList})
+	if len(listResp.Tunnels) != 1 || listResp.Tunnels[0].Egress != "eg-rfail" || listResp.Tunnels[0].State != "stopped" {
+		t.Fatalf("list after failed restart = %+v, want one stopped eg-rfail", listResp.Tunnels)
+	}
+
+	// 失败路径不落盘:tunnels.json 与 restart 前逐字节一致。
+	after, err := os.ReadFile(holder.statePath)
+	if err != nil {
+		t.Fatalf("read state after failed restart: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("state file changed on failed restart:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// TestTunnelHolder_OpenReplaceBindFailureKeepsRunning 验证 replace 的原子性:重复 open 同一 egress
+// 时若新监听绑不上,原有 running 隧道必须原样存活(不能被一条失败的命令杀掉),且不进 stopped。
+func TestTunnelHolder_OpenReplaceBindFailureKeepsRunning(t *testing.T) {
+	_, cancel, sock := startTestHolder(t, "", nil)
+	defer cancel()
+
+	port := freeTCPPort(t)
+	listen := fmt.Sprintf("127.0.0.1:%d", port)
+	openTunnel(t, sock, "eg-keep", listen, tunRestartAlways)
+	waitDialable(t, listen)
+
+	resp := sendTunControl(t, sock, tunControlMsg{Op: tunOpOpen, Egress: "eg-keep", Listen: nonBindableListen, Restart: tunRestartAlways})
+	if resp.OK {
+		t.Fatalf("open with unbindable listen unexpectedly succeeded: %+v", resp)
+	}
+
+	listResp := sendTunControl(t, sock, tunControlMsg{Op: tunOpList})
+	if len(listResp.Tunnels) != 1 || listResp.Tunnels[0].Egress != "eg-keep" ||
+		listResp.Tunnels[0].Listen != listen || listResp.Tunnels[0].State != "running" {
+		t.Fatalf("list after failed replace = %+v, want the original running eg-keep on %s", listResp.Tunnels, listen)
+	}
+
+	// 旧监听未被拆除,端口仍可连。
+	waitDialable(t, listen)
+}
+
+// TestTunnelHolder_PersistFailureSurfacesWarning 验证持久化失败不再被吞成静默成功:应答仍 OK
+// (监听器确实已开),但必须携带 Warning 让 CLI 能打到 stderr。复用 LogPrefix 的不可写路径构造。
+func TestTunnelHolder_PersistFailureSurfacesWarning(t *testing.T) {
+	notadir := filepath.Join(t.TempDir(), "notadir")
+	if err := os.WriteFile(notadir, []byte("x"), 0o644); err != nil {
+		t.Fatalf("create notadir: %v", err)
+	}
+	logs := &syncBuffer{}
+	_, cancel, sock := startTestHolder(t, filepath.Join(notadir, "tunnels.json"), logs)
+	defer cancel()
+
+	resp := sendTunControl(t, sock, tunControlMsg{Op: tunOpOpen, Egress: "eg-warn-persist", Listen: "127.0.0.1:0", Restart: tunRestartAlways})
+	if !resp.OK {
+		t.Fatalf("open failed: %s", resp.Error)
+	}
+	if resp.Warning == "" {
+		t.Fatalf("persist failure was swallowed: resp.Warning is empty (%+v); logs:\n%s", resp, logs.String())
+	}
+
+	// close 的持久化失败同样必须带后果说明(意图仍在盘上 -> 下次 node 启动会复活它)。
+	closeResp := sendTunControl(t, sock, tunControlMsg{Op: tunOpClose, Egress: "eg-warn-persist"})
+	if !closeResp.OK {
+		t.Fatalf("close failed: %s", closeResp.Error)
+	}
+	if !strings.Contains(closeResp.Warning, "reappear") {
+		t.Fatalf("close persist warning does not state the consequence: %q", closeResp.Warning)
+	}
+}
+
+// errListener 是一个只用于单测的监听器替身:Accept 立即返回固定错误,用于模拟非主动关闭的
+// Accept 失败(EMFILE/ENOBUFS/ECONNABORTED 这类真实故障)。
+type errListener struct {
+	err    error
+	addr   net.Addr
+	closed bool
+}
+
+func (l *errListener) Accept() (net.Conn, error) { return nil, l.err }
+func (l *errListener) Close() error              { l.closed = true; return nil }
+func (l *errListener) Addr() net.Addr {
+	if l.addr == nil {
+		return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
+	}
+	return l.addr
+}
+
+// TestTunnelHolder_AcceptErrorMarksStopped 验证非主动关闭的 Accept 失败不会让条目继续谎报 running:
+// serveEntry 记一条日志并把 listener 置空,toState 随之降为 stopped(可被 restart 重新拉起)。
+func TestTunnelHolder_AcceptErrorMarksStopped(t *testing.T) {
+	logs := &syncBuffer{}
+	holder := newTunnelHolder(context.Background(), nil, filepath.Join(t.TempDir(), "tunnel.sock"))
+	holder.logw = logs
+
+	ln := &errListener{err: fmt.Errorf("accept tcp: too many open files")}
+	entry := &tunnelEntry{
+		egress:   "eg-accept",
+		listen:   "127.0.0.1:0",
+		restart:  tunRestartNo,
+		listener: ln,
+		conns:    make(map[net.Conn]struct{}),
+		started:  time.Now(),
+		logf:     holder.entryLogf("eg-accept"),
+	}
+	holder.mu.Lock()
+	holder.byEgress["eg-accept"] = entry
+	holder.mu.Unlock()
+
+	go holder.serveEntry(entry)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		holder.mu.Lock()
+		down := entry.listener == nil
+		holder.mu.Unlock()
+		if down {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	holder.mu.Lock()
+	stillRegistered := holder.byEgress["eg-accept"] == entry
+	state := entry.toState()
+	holder.mu.Unlock()
+
+	if !stillRegistered {
+		t.Fatalf("entry was dropped from byEgress after an accept failure")
+	}
+	if state.State != "stopped" {
+		t.Fatalf("entry still reports %q after accept failure, want stopped", state.State)
+	}
+	if !ln.closed {
+		t.Fatalf("listener was not closed after the permanent accept failure")
+	}
+	if !strings.Contains(logs.String(), "[tunnel eg-accept] accept failed") {
+		t.Fatalf("accept failure not logged via entry.logf; got:\n%s", logs.String())
+	}
+}
+
+// TestTunnelHolder_RestoreBindFailureKeepsStoppedEntry 验证 restore 时 restart=always 重绑失败
+// 不再直接丢弃条目:仍以 stopped 登记(ps/status 可见,relay tunnel restart 可重开)。
+func TestTunnelHolder_RestoreBindFailureKeepsStoppedEntry(t *testing.T) {
+	logs := &syncBuffer{}
+	h := newTunnelHolder(context.Background(), nil, filepath.Join(t.TempDir(), "tunnel.sock"))
+	h.logw = logs
+	h.statePath = filepath.Join(t.TempDir(), "tunnels.json")
+	started := time.Date(2024, 5, 6, 7, 8, 9, 0, time.UTC)
+	if err := persistTunnels(h.statePath, []tunnelState{
+		{Egress: "eg-restore", Listen: nonBindableListen, Restart: tunRestartAlways, Started: started},
+	}); err != nil {
+		t.Fatalf("persist state: %v", err)
+	}
+
+	h.restore()
+
+	h.mu.Lock()
+	entry, ok := h.byEgress["eg-restore"]
+	h.mu.Unlock()
+	if !ok {
+		t.Fatalf("failed restore dropped the entry from byEgress; logs:\n%s", logs.String())
+	}
+	if st := entry.toState(); st.State != "stopped" || st.Listen != nonBindableListen ||
+		st.Restart != tunRestartAlways || !st.Started.Equal(started) {
+		t.Fatalf("restored entry = %+v, want stopped with listen/restart/started preserved", st)
+	}
+}
+
+// TestRemovePersistedTunnel 验证 node 未运行时的意图清理:删掉指定 egress、保留其余,幂等且原子写。
+func TestRemovePersistedTunnel(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "tunnels.json")
+
+	// 文件不存在:没东西可删,不算错误。
+	if removed, err := removePersistedTunnel(statePath, "eg-a"); err != nil || removed {
+		t.Fatalf("removePersistedTunnel on missing file = (%v, %v), want (false, nil)", removed, err)
+	}
+
+	if err := persistTunnels(statePath, []tunnelState{
+		{Egress: "eg-a", Listen: "127.0.0.1:1080", Restart: tunRestartAlways, State: "running"},
+		{Egress: "eg-b", Listen: "127.0.0.1:1081", Restart: tunRestartNo, State: "stopped"},
+	}); err != nil {
+		t.Fatalf("persist state: %v", err)
+	}
+
+	removed, err := removePersistedTunnel(statePath, "eg-a")
+	if err != nil || !removed {
+		t.Fatalf("removePersistedTunnel = (%v, %v), want (true, nil)", removed, err)
+	}
+	states, err := loadTunnels(statePath)
+	if err != nil {
+		t.Fatalf("loadTunnels: %v", err)
+	}
+	if len(states) != 1 || states[0].Egress != "eg-b" {
+		t.Fatalf("state after removal = %+v, want only eg-b", states)
+	}
+
+	// 目标不存在:返回 false 且不动文件。
+	before, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	removed, err = removePersistedTunnel(statePath, "eg-nope")
+	if err != nil || removed {
+		t.Fatalf("removePersistedTunnel(eg-nope) = (%v, %v), want (false, nil)", removed, err)
+	}
+	after, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state again: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("state file rewritten for a no-op removal:\nbefore=%s\nafter=%s", before, after)
+	}
+}

@@ -35,6 +35,10 @@ const (
 
 	tunRestartAlways = "always"
 	tunRestartNo     = "no"
+
+	// 持久化失败时给 CLI 的告警尾句:说明「意图没落盘」对用户的实际后果(见 persistWarnLocked)。
+	tunPersistLostOnRestart = "the tunnel will not be restored on the next node start"
+	tunPersistLostOnClose   = "the persisted intent was not removed and the tunnel will reappear on the next node start"
 )
 
 // tunControlMsg 是一条来自 CLI 的控制消息(JSON 单行,如 docker CLI -> dockerd unix socket)。
@@ -47,9 +51,12 @@ type tunControlMsg struct {
 }
 
 // tunControlResp 是对控制消息的应答(JSON 单行)。Tunnels 供 list 返回全部隧道现状。
+// Warning 承载「操作已生效但持久化失败」这类非致命问题:OK 仍为 true(监听器确实已变更),
+// 但 CLI 必须把它打到 stderr,否则用户以为意图已落盘(durability 半途而废)。
 type tunControlResp struct {
 	OK      bool          `json:"ok"`
 	Error   string        `json:"error,omitempty"`
+	Warning string        `json:"warning,omitempty"`
 	Tunnels []tunnelState `json:"tunnels,omitempty"`
 }
 
@@ -81,6 +88,7 @@ func filterTunnels(states []tunnelState, target string, all bool) []tunnelState 
 // tunnelEntry 是常驻 node 进程内一条活跃隧道(内存态)。conns 记录在途的已被 Accept 的连接,
 // 供关闭时连同监听器一起回收。运行态由 listener 是否非 nil 表达(见 toState),不再另行冗余存储。
 // 设计上 holder 拥有唯一一把 mu,entry 自身不加锁。
+// closed 标记「条目已被主动关闭」,供 serveEntry 区分主动 Close 与真实 Accept 失败。
 type tunnelEntry struct {
 	egress   string
 	listen   string
@@ -88,6 +96,7 @@ type tunnelEntry struct {
 	listener net.Listener
 	conns    map[net.Conn]struct{}
 	started  time.Time
+	closed   bool
 
 	logf func(format string, args ...any) // 连接级错误经此路由到调用方的日志器,前缀 [tunnel <egress>]
 }
@@ -204,7 +213,9 @@ func (h *tunnelHolder) dispatch(msg tunControlMsg) tunControlResp {
 }
 
 // closeEntryLocked 关闭条目的监听器与全部在途连接并标记为 stopped。调用方须已持有 h.mu。
+// 先置 closed 再 Close:serveEntry 据此把随后的 Accept 失败识别为主动关闭,不当作真实故障。
 func (h *tunnelHolder) closeEntryLocked(entry *tunnelEntry) {
+	entry.closed = true
 	if entry.listener != nil {
 		_ = entry.listener.Close()
 		entry.listener = nil
@@ -215,34 +226,75 @@ func (h *tunnelHolder) closeEntryLocked(entry *tunnelEntry) {
 	entry.conns = make(map[net.Conn]struct{})
 }
 
-// openEntryLocked 绑定一条隧道:非 loopback 绑定发出与前台 tunnel 一致的告警,监听成功后
-// 成为 running 并启动 accept 循环。调用方须已持有 h.mu。
-func (h *tunnelHolder) openEntryLocked(egress, listen, restart string) error {
-	if !isLoopbackAddr(listen) {
-		fmt.Fprintf(h.logw, "WARNING: listening on %q (non-loopback). This tunnel has no auth; any host that can reach this port can use it to reach the executor's network.\n", listen)
-	}
+// normalizeTunnelRestart 归一化 restart 策略:空值按缺省 no 处理。
+func normalizeTunnelRestart(restart string) string {
 	if restart == "" {
-		restart = tunRestartNo
+		return tunRestartNo
+	}
+	return restart
+}
+
+// bindEntryLocked 绑定监听并构造条目,但尚未登记到 byEgress、也未启动 accept 循环。
+// 非 loopback 绑定先发出与前台 tunnel 一致的告警;绑定失败时调用方的既有条目毫发无损。
+// 拆出「绑定」这一步是为了让替换(open/restart)可以「先绑定成功、再拆除旧的」,避免绑定失败
+// 反而杀掉一条正在运行的隧道(见 opOpen)。调用方须已持有 h.mu。
+func (h *tunnelHolder) bindEntryLocked(egress, listen, restart string) (*tunnelEntry, error) {
+	if !isLoopbackAddr(listen) {
+		fmt.Fprint(h.logw, tunnelNonLoopbackWarning(listen))
 	}
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
-		return fmt.Errorf("listen %s failed: %w", listen, err)
+		return nil, fmt.Errorf("listen %s failed: %w", listen, err)
 	}
-	entry := &tunnelEntry{
+	return &tunnelEntry{
 		egress:   egress,
 		listen:   listen,
-		restart:  restart,
+		restart:  normalizeTunnelRestart(restart),
 		listener: ln,
 		conns:    make(map[net.Conn]struct{}),
 		started:  time.Now(),
 		logf:     h.entryLogf(egress),
+	}, nil
+}
+
+// installEntryLocked 把已绑定的条目登记为当前条目并启动 accept 循环。调用方须已持有 h.mu。
+// accept 循环不触碰 h.mu,可在锁内安全启动。
+func (h *tunnelHolder) installEntryLocked(entry *tunnelEntry) {
+	h.byEgress[entry.egress] = entry
+	go h.serveEntry(entry)
+}
+
+// openEntryLocked 绑定并登记一条隧道:先绑定新监听,成功后才替换旧条目并关闭它。
+// 绑定失败时既有的同 egress 条目(及其运行中的监听)保持原样,直接返回错误。
+// 调用方须已持有 h.mu。
+func (h *tunnelHolder) openEntryLocked(egress, listen, restart string) error {
+	prev := h.byEgress[egress]
+	entry, err := h.bindEntryLocked(egress, listen, restart)
+	if err != nil {
+		return err
 	}
-	h.byEgress[egress] = entry
-	go h.serveEntry(entry) // accept 循环不触碰 h.mu,可在锁内安全启动
+	h.installEntryLocked(entry)
+	if prev != nil && prev != entry {
+		h.closeEntryLocked(prev) // 新监听已就位,此时才拆除被替换的旧条目
+	}
 	return nil
 }
 
-// opOpen 打开(或幂等重开)一条隧道。若该 egress 已存在条目,则关闭并重开,保持持久化意图。
+// registerStoppedLocked 就地登记一条 stopped 条目(不绑定监听),保留 listen/restart/started,
+// 使其在 list/ps 可见,并可被 `relay tunnel restart` 依原参数重开。调用方须已持有 h.mu。
+func (h *tunnelHolder) registerStoppedLocked(st tunnelState) {
+	h.byEgress[st.Egress] = &tunnelEntry{
+		egress:  st.Egress,
+		listen:  st.Listen,
+		restart: st.Restart,
+		conns:   make(map[net.Conn]struct{}),
+		started: st.Started,
+		logf:    h.entryLogf(st.Egress),
+	}
+}
+
+// opOpen 打开(或幂等重开)一条隧道。同一地址重复 open 直接复用现有监听(只更新 restart 策略),
+// 地址变化时才走「先绑定新监听、成功后再拆除旧条目」的原子替换;绑定失败则旧隧道原样保留。
 func (h *tunnelHolder) opOpen(msg tunControlMsg) tunControlResp {
 	if msg.Egress == "" {
 		return tunControlResp{OK: false, Error: "egress must not be empty"}
@@ -254,19 +306,29 @@ func (h *tunnelHolder) opOpen(msg tunControlMsg) tunControlResp {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	// 幂等:重复 open 同一 egress 先关闭旧监听,再按新参数重开,保持持久化意图。
-	if entry, ok := h.byEgress[msg.Egress]; ok {
-		h.closeEntryLocked(entry)
-		delete(h.byEgress, msg.Egress)
+	// 幂等:同一 egress + 同一监听地址时复用现有监听——既避免打断在途连接,也避免
+	// 「先拆旧监听、再绑同一地址」的自我占用失败(旧实现在这里会 bind: address already in use)。
+	if prev, ok := h.byEgress[msg.Egress]; ok && prev.listener != nil && prev.listen == msg.Listen {
+		prev.restart = normalizeTunnelRestart(msg.Restart)
+		return tunControlResp{OK: true, Warning: h.persistWarnLocked(msg.Egress, tunPersistLostOnRestart)}
 	}
 
 	if err := h.openEntryLocked(msg.Egress, msg.Listen, msg.Restart); err != nil {
 		return tunControlResp{OK: false, Error: err.Error()}
 	}
+	return tunControlResp{OK: true, Warning: h.persistWarnLocked(msg.Egress, tunPersistLostOnRestart)}
+}
+
+// persistWarnLocked 落盘当前意图;失败时记日志并返回给 CLI 的 Warning 文案(空串表示成功)。
+// 持久化失败不算操作失败——监听器已经变更,故 OK 仍为 true,但必须让 CLI 能把它打到 stderr,
+// 否则 start/stop 会静默地丢掉「durability」那一半语义。
+// 调用方须已持有 h.mu。
+func (h *tunnelHolder) persistWarnLocked(egress, consequence string) string {
 	if err := h.persistLocked(); err != nil {
-		fmt.Fprintf(h.logw, "[tunnel %s] persist state: %v\n", msg.Egress, err)
+		fmt.Fprintf(h.logw, "[tunnel %s] persist state: %v\n", egress, err)
+		return fmt.Sprintf("state not persisted: %v; %s", err, consequence)
 	}
-	return tunControlResp{OK: true}
+	return ""
 }
 
 // opClose 关闭并移除指定 egress 的隧道(docker rm 语义):关闭监听与在途连接、从 byEgress 删除、
@@ -285,14 +347,11 @@ func (h *tunnelHolder) opClose(msg tunControlMsg) tunControlResp {
 	}
 	h.closeEntryLocked(entry)
 	delete(h.byEgress, msg.Egress)
-	if err := h.persistLocked(); err != nil {
-		fmt.Fprintf(h.logw, "[tunnel %s] persist state: %v\n", msg.Egress, err)
-	}
-	return tunControlResp{OK: true}
+	return tunControlResp{OK: true, Warning: h.persistWarnLocked(msg.Egress, tunPersistLostOnClose)}
 }
 
 // opRestart 关闭现有监听与在途连接,再按同一 egress/listen/restart 重开,保留持久化意图。
-// 条目不存在时报错。
+// 条目不存在时报错;重开绑定失败时条目留为 stopped(不落盘,意图文件保持原样)。
 func (h *tunnelHolder) opRestart(msg tunControlMsg) tunControlResp {
 	if msg.Egress == "" {
 		return tunControlResp{OK: false, Error: "egress must not be empty"}
@@ -309,10 +368,7 @@ func (h *tunnelHolder) opRestart(msg tunControlMsg) tunControlResp {
 	if err := h.openEntryLocked(entry.egress, entry.listen, entry.restart); err != nil {
 		return tunControlResp{OK: false, Error: err.Error()}
 	}
-	if err := h.persistLocked(); err != nil {
-		fmt.Fprintf(h.logw, "[tunnel %s] persist state: %v\n", entry.egress, err)
-	}
-	return tunControlResp{OK: true}
+	return tunControlResp{OK: true, Warning: h.persistWarnLocked(entry.egress, tunPersistLostOnRestart)}
 }
 
 // opList 返回全部隧道条目(依据监听器是否存活区分 running/stopped)。
@@ -323,13 +379,29 @@ func (h *tunnelHolder) opList(msg tunControlMsg) tunControlResp {
 }
 
 // serveEntry 接收来自本地监听端口的连接,并将其登记到 entry.conns 后启动双向泵。
-// 监听器关闭或条目已被替换时退出。监听器在进入循环前捕获一次,避免 close 置空 listener 后
-// 下一轮循环对 nil 调用 Accept 而 panic(重开时新 serveEntry 会捕获新监听器)。
+// 监听器在进入循环前捕获一次,避免 close 置空 listener 后下一轮循环对 nil 调用 Accept 而 panic
+// (重开时新 serveEntry 会捕获新监听器)。
+// Accept 失败分两类:主动 close(entry.closed)正常退出;其他失败(EMFILE/ENOBUFS/ECONNABORTED 等)
+// 必须留痕并把条目降为 stopped——否则 accept 循环已死、listener 仍在,list/ps 会一直谎报 running,
+// 新连接只会挂在 backlog 里无人应答。此处不重试,只求「死得可见、可 restart」。
 func (h *tunnelHolder) serveEntry(entry *tunnelEntry) {
 	ln := entry.listener
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			h.mu.Lock()
+			// 一次判定取齐三个条件:主动关闭、条目已被 reopen/restart 替换(新 serveEntry 接管)、
+			// 监听器已被换掉——这三种都是正常退出,不能把新条目误降为 stopped。
+			unexpected := !entry.closed && h.byEgress[entry.egress] == entry && entry.listener == ln
+			if unexpected {
+				entry.closed = true
+				_ = entry.listener.Close()
+				entry.listener = nil // toState 由此降为 stopped
+			}
+			h.mu.Unlock()
+			if unexpected {
+				entry.logf("accept failed: %v; tunnel stopped (restart it with `relay tunnel restart`)", err)
+			}
 			return
 		}
 		h.mu.Lock()
@@ -408,7 +480,9 @@ func persistTunnels(statePath string, states []tunnelState) error {
 }
 
 // restore 在启动时重放持久化的隧道意图:restart=always 的重新绑定(非 loopback 触发告警),
-// restart=no 的就地标记为 stopped(不绑定)。单条失败仅记录并继续。
+// restart=no 的就地标记为 stopped(不绑定)。单条失败仅记录并继续,但失败条目仍以 stopped 形态
+// 登记,避免「意图还在盘上、内存里却查无此隧道」——那样 ps/status/stop/restart 全线失灵,
+// 且下一次 persist 会把这条意图彻底抹掉。
 func (h *tunnelHolder) restore() {
 	states, err := loadTunnels(h.statePath)
 	if err != nil {
@@ -425,20 +499,15 @@ func (h *tunnelHolder) restore() {
 		}
 		if st.Restart == tunRestartAlways {
 			if err := h.openEntryLocked(st.Egress, st.Listen, st.Restart); err != nil {
-				fmt.Fprintf(h.logw, "[tunnel %s] open failed: %v\n", st.Egress, err)
+				// 绑定失败(端口被占等):与 restart=no 分支同样登记为 stopped,保持可见且可 restart。
+				fmt.Fprintf(h.logw, "[tunnel %s] open failed: %v; kept as stopped\n", st.Egress, err)
+				h.registerStoppedLocked(st)
 				continue
 			}
 			fmt.Fprintf(h.logw, "[tunnel %s] restored (running)\n", st.Egress)
 		} else {
 			// restart=no:不绑定,但保留意图供 list 展示为 stopped(docker 语义:容器仍存在)。
-			h.byEgress[st.Egress] = &tunnelEntry{
-				egress:  st.Egress,
-				listen:  st.Listen,
-				restart: st.Restart,
-				conns:   make(map[net.Conn]struct{}),
-				started: st.Started,
-				logf:    h.entryLogf(st.Egress),
-			}
+			h.registerStoppedLocked(st)
 			fmt.Fprintf(h.logw, "[tunnel %s] restored (stopped)\n", st.Egress)
 		}
 	}

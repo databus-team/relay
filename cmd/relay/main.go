@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -289,7 +287,7 @@ func main() {
 		case "stop":
 			runTunnelStop()
 		case "status":
-			if err := daemonStatusTunnel(); err != nil {
+			if err := runTunnelStatus(); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
@@ -1490,7 +1488,11 @@ func runLogs() {
 		}
 	}
 	if !knownTask {
-		if showTunnelLogs(*logsTaskID, *logsFollow, *logsTail) {
+		// 先问本地 node 的隧道持有者:隧道是否存在以 holder 为准,而不是日志里有没有匹配行。
+		// 新开且健康的隧道不会写任何 `[tunnel <egress>]` 前缀行,用「零命中」反推「不是隧道」
+		// 会把 `relay logs <egress> -f` 这个最常用的场景判死。
+		if tunnelEgressKnown(*logsTaskID) {
+			showTunnelLogs(*logsTaskID, *logsFollow, *logsTail)
 			return
 		}
 		fmt.Fprintf(os.Stderr, "logs failed: no task or tunnel named %s\n", *logsTaskID)
@@ -1509,169 +1511,6 @@ func runLogs() {
 	}
 }
 
-// tunnelLogLineMatches 判断一行 node 日志是否属于指定 egress 的隧道。隧道日志统一带字面前缀
-// `[tunnel <egress>]`;此处要求连右括号一起匹配,避免 egress 前缀相同的隧道互相误吞
-// (如 `eg-node` 不应匹配 `[tunnel eg-node-2]`)。纯函数,便于单测。
-func tunnelLogLineMatches(line, egress string) bool {
-	return strings.Contains(line, "[tunnel "+egress+"]")
-}
-
-// readTunnelLogTail 有界读取 node 日志中属于 egress 的最后至多 tailLines 行:从文件末尾按窗口
-// 回退读取,命中不足时窗口翻倍(上限为文件大小)。node.log 无轮转、无上限增长,故避免整文件扫描。
-func readTunnelLogTail(logPath, egress string, tailLines int) ([]string, error) {
-	f, err := os.Open(logPath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	size := fi.Size()
-	if size == 0 {
-		return nil, nil
-	}
-
-	window := int64(64 * 1024)
-	if w := int64(tailLines) * 512; w > window {
-		window = w
-	}
-	for {
-		if window > size {
-			window = size
-		}
-		start := size - window
-		buf := make([]byte, window)
-		if _, err := f.ReadAt(buf, start); err != nil && err != io.EOF {
-			return nil, err
-		}
-		text := string(buf)
-		if start > 0 {
-			// 窗口首行可能是被截断的半行,丢弃到第一个换行之后。
-			if i := strings.IndexByte(text, '\n'); i >= 0 {
-				text = text[i+1:]
-			} else {
-				text = ""
-			}
-		}
-		var matched []string
-		for _, line := range strings.Split(text, "\n") {
-			if line != "" && tunnelLogLineMatches(line, egress) {
-				matched = append(matched, line)
-			}
-		}
-		if len(matched) >= tailLines || start == 0 {
-			if len(matched) > tailLines {
-				matched = matched[len(matched)-tailLines:]
-			}
-			return matched, nil
-		}
-		window *= 2
-	}
-}
-
-// showTunnelLogs 把 `relay logs <egress>` 落到 node 日志上,只呈现该隧道的行。返回 false 表示
-// 没有可展示的内容,由调用方决定报错文案。node 前台运行时隧道日志走 stderr、不落 node.log,
-// 故仅当日志文件缺失才补一条提示,避免把普通任务名的未命中误读成隧道。
-func showTunnelLogs(egress string, follow bool, tailLines int) bool {
-	if tailLines <= 0 {
-		tailLines = 100
-	}
-	logPath := daemon.LogFile("node")
-	lines, err := readTunnelLogTail(logPath, egress, tailLines)
-	if err != nil {
-		if os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "node log %s not found (the node may be running in the foreground; its tunnel logs go to stderr).\n", shortenPath(logPath))
-		}
-		return false
-	}
-	if len(lines) == 0 {
-		return false
-	}
-	w := bufio.NewWriter(os.Stdout)
-	for _, l := range lines {
-		fmt.Fprintln(w, l)
-	}
-	_ = w.Flush()
-
-	if follow {
-		followTunnelLog(logPath, egress)
-	}
-	return true
-}
-
-// followTunnelLog 轮询 node 日志新增内容,只打印属于 egress 的行,直到收到 SIGINT/SIGTERM。
-// 打开一次并持有 fd,每 tick 仅 Stat + 续读;仅在出错或日志被截断时重新定位。
-func followTunnelLog(logPath, egress string) {
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	f, err := os.Open(logPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "follow tunnel log: %v\n", err)
-		return
-	}
-	defer f.Close()
-
-	// 从当前文件末尾起追,避免重复打印刚刚 tail 过的内容。
-	var offset int64
-	if fi, err := f.Stat(); err == nil {
-		offset = fi.Size()
-	}
-	pending := "" // 跨轮次的半行缓冲
-
-	ticker := time.NewTicker(300 * time.Millisecond)
-	defer ticker.Stop()
-	buf := make([]byte, 32*1024)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			fi, err := f.Stat()
-			if err != nil {
-				return
-			}
-			if fi.Size() < offset { // rotate/truncate:从头再读
-				if _, err := f.Seek(0, io.SeekStart); err != nil {
-					return
-				}
-				offset, pending = 0, ""
-			}
-			if fi.Size() == offset {
-				continue
-			}
-			if _, err := f.Seek(offset, io.SeekStart); err != nil {
-				return
-			}
-			var chunk []byte
-			for {
-				n, rerr := f.Read(buf)
-				if n > 0 {
-					chunk = append(chunk, buf[:n]...)
-					offset += int64(n)
-				}
-				if rerr != nil {
-					break
-				}
-			}
-			pending += string(chunk)
-			for {
-				idx := strings.IndexByte(pending, '\n')
-				if idx < 0 {
-					break
-				}
-				line := pending[:idx]
-				pending = pending[idx+1:]
-				if tunnelLogLineMatches(line, egress) {
-					fmt.Println(line)
-				}
-			}
-		}
-	}
-}
-
 func runStop() {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -1679,23 +1518,22 @@ func runStop() {
 		os.Exit(1)
 	}
 
-	b, err := getBackendWithAdaptiveLoopback(cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
-		os.Exit(1)
-	}
-
-	tb, ok := b.(backend.TaskSupervisorBackend)
-	if !ok {
-		fmt.Fprintf(os.Stderr, "Backend does not support task supervisor\n")
-		os.Exit(1)
+	// 后端建不出来(中转不可达)时降级:本地隧道不经中转,必须仍能停掉并释放监听端口,
+	// 故这里只告警不退出,与 runPs/runLogs 同一姿态。远端任务停不掉只能如实报错。
+	var tb backend.TaskSupervisorBackend
+	if b, berr := getBackendWithAdaptiveLoopback(cfg); berr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: create backend: %v\n", berr)
+	} else if x, ok := b.(backend.TaskSupervisorBackend); ok {
+		tb = x
+	} else {
+		fmt.Fprintf(os.Stderr, "Warning: backend does not support task supervisor\n")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	targetNode := resolveNodeTarget(*stopNode, *stopExec)
-	if targetNode == "" {
+	if targetNode == "" && tb != nil {
 		if tasks, err := tb.TaskList(ctx, "", true); err == nil {
 			for _, t := range tasks {
 				if t.ID == *stopTaskID {
@@ -1705,10 +1543,14 @@ func runStop() {
 			}
 		}
 	}
-	// ID 不是已知任务:退回本地 node 持有的隧道(egress 身份,如 `relay stop eg-node`)。
-	if targetNode == "" {
+	// ID 不是已知任务(或后端不可用):退回本地 node 持有的隧道(egress 身份,如 `relay stop eg-node`)。
+	if targetNode == "" || tb == nil {
 		if stopLocalTunnel(*stopTaskID) {
 			return
+		}
+		if tb == nil {
+			fmt.Fprintf(os.Stderr, "stop failed: backend unavailable and no local tunnel named %s\n", *stopTaskID)
+			os.Exit(1)
 		}
 		fmt.Fprintf(os.Stderr, "stop failed: no task or tunnel named %s\n", *stopTaskID)
 		os.Exit(1)

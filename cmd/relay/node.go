@@ -131,8 +131,9 @@ func runNode() error {
 
 			// 端口转发 + SOCKS5 隧道两个常驻持有者(本机 node 作为 dockerd,接收 CLI 控制以维持
 			// 本地监听,即使发起 CLI 已退出)。二者共用同一个 relay backend:客户端池按
-			// url|token|executor_id 复用,本就是同一底层连接;由本 goroutine 独占其生命周期,
-			// 避免任一 holder 早退(如控制 socket 绑定失败)连带拆掉另一个的传输与 executor 注册。
+			// url|token|executor_id 复用,本就是同一底层连接;该 backend 由本 goroutine 独占,
+			// 且只在 node 关闭(ctx 取消)时释放。两个 holder 各自起独立 goroutine,互为对称隔离:
+			// 任一早退(如控制 socket 绑定失败)只记录日志,不会连带拆掉另一个的传输与 executor 注册。
 			go func() {
 				rb, err := getRelayBackend(cfg)
 				if err != nil {
@@ -151,10 +152,15 @@ func runNode() error {
 
 				// 隧道持有者:各条 SOCKS5 出网隧道;意图持久化到 ~/.relay/tunnels.json,node 重启时
 				// 按 restart 策略回放。
-				holder := newTunnelHolder(ctx, rb, tunnelSockPath())
-				if err := holder.Run(); err != nil && err != context.Canceled {
-					fmt.Fprintf(os.Stderr, "[Node] Tunnel holder error: %v\n", err)
-				}
+				go func() {
+					holder := newTunnelHolder(ctx, rb, tunnelSockPath())
+					if err := holder.Run(); err != nil && err != context.Canceled {
+						fmt.Fprintf(os.Stderr, "[Node] Tunnel holder error: %v\n", err)
+					}
+				}()
+
+				// 阻塞至 node 关闭,再释放共享 backend;与任一 holder 是否仍在运行无关。
+				<-ctx.Done()
 			}()
 
 			if err := w.Run(ctx); err != nil && err != context.Canceled {

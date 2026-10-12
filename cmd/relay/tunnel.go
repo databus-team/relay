@@ -87,8 +87,22 @@ func runTunnelStart() error {
 		// 还占着同一端口,附上可操作的清理提示。
 		return fmt.Errorf("start tunnel %s: %s%s", target, resp.Error, tunnelLegacyDaemonHint(target))
 	}
+	// 非 loopback 绑定 = 一个无认证、网络上任意主机可用的 SOCKS5 入口。holder 侧也会记一条到
+	// node.log,但那是 node 的 stderr(daemon 已重定向),发起者本人看不到,故 CLI 同样打到 stderr。
+	if !isLoopbackAddr(*tunnelListen) {
+		fmt.Fprint(os.Stderr, tunnelNonLoopbackWarning(*tunnelListen))
+	}
+	if resp.Warning != "" {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", resp.Warning)
+	}
 	fmt.Printf("tunnel %s started: SOCKS5 on %s -> egress %s (restart=%s)\n", target, *tunnelListen, target, policy)
 	return nil
+}
+
+// tunnelNonLoopbackWarning 返回非 loopback 监听的告警文本。holder(node.log)与 CLI(stderr)
+// 共用同一措辞,避免两处措辞漂移。
+func tunnelNonLoopbackWarning(listen string) string {
+	return fmt.Sprintf("WARNING: listening on %q (non-loopback). This tunnel has no auth; any host that can reach this port can use it to reach the executor's network.\n", listen)
 }
 
 // tunnelLegacyDaemonHint 探测是否仍有旧的每出口独立 `tunnel-<egress>` daemon 在跑(已废弃的部署
@@ -112,7 +126,17 @@ func runTunnelStop() {
 	}
 
 	if !daemon.Get(daemon.PidFile("node")).Running {
-		fmt.Printf("node not running; no tunnel for %s to stop\n", target)
+		// node 未运行:没有 holder 可下发 close,但持久化意图仍须移除。否则 `--restart=always`
+		// 的条目会在下次 node 启动时被 restore 重放,与「关闭并遗忘」(docker rm)语义相悖。
+		removed, rerr := removePersistedTunnel(tunnelStatePath(), target)
+		switch {
+		case rerr != nil:
+			fmt.Fprintf(os.Stderr, "Warning: remove persisted tunnel %s: %v\n", target, rerr)
+		case removed:
+			fmt.Printf("node not running; removed persisted tunnel %s\n", target)
+		default:
+			fmt.Printf("node not running; no tunnel for %s to stop\n", target)
+		}
 	} else {
 		resp, err := sendTunnelControl(tunnelSockPath(), tunControlMsg{Op: tunOpClose, Egress: target})
 		switch {
@@ -121,6 +145,9 @@ func runTunnelStop() {
 		case !resp.OK:
 			fmt.Fprintf(os.Stderr, "Warning: stop tunnel %s: %s\n", target, resp.Error)
 		default:
+			if resp.Warning != "" {
+				fmt.Fprintf(os.Stderr, "Warning: %s\n", resp.Warning)
+			}
 			fmt.Printf("tunnel %s stopped\n", target)
 		}
 	}
@@ -129,6 +156,32 @@ func runTunnelStop() {
 	if legacy := daemon.Get(daemon.PidFile(tunnelInstanceName(target))); legacy.Running {
 		daemonStop(tunnelInstanceName(target))
 	}
+}
+
+// removePersistedTunnel 从隧道意图文件里移除指定 egress 的条目(holder 不可达时的清理路径,
+// 如 node 未运行)。返回是否确有条目被移除;文件不存在或本就没有该条目时返回 (false, nil)。
+// 读写复用 holder 的 loadTunnels/persistTunnels,保持 tmp+rename 的原子写。
+func removePersistedTunnel(statePath, egress string) (bool, error) {
+	states, err := loadTunnels(statePath)
+	if err != nil {
+		return false, err
+	}
+	kept := make([]tunnelState, 0, len(states))
+	removed := false
+	for _, st := range states {
+		if st.Egress == egress {
+			removed = true
+			continue
+		}
+		kept = append(kept, st)
+	}
+	if !removed {
+		return false, nil
+	}
+	if err := persistTunnels(statePath, kept); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // runTunnelRestart 重启一条 node 持有的隧道(按原 egress/listen/restart 策略重开,无需重敲旗标)。
@@ -148,6 +201,9 @@ func runTunnelRestart() error {
 	}
 	if !resp.OK {
 		return fmt.Errorf("restart tunnel %s: %s", target, resp.Error)
+	}
+	if resp.Warning != "" {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", resp.Warning)
 	}
 	fmt.Printf("tunnel %s restarted\n", target)
 	return nil
