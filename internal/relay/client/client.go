@@ -63,10 +63,11 @@ type Client struct {
 	tunnelStreams  map[string]*TunnelStream // 出站隧道(requester):streamID -> 本地 SOCKS/SOCKS 通
 	tunnelMu       sync.RWMutex
 
-	taskListHandler func(*TaskListSession)
-	taskStopHandler func(*TaskStopSession)
-	taskLogsHandler func(*TaskLogsSession)
-	taskHandlerM    sync.RWMutex
+	taskListHandler    func(*TaskListSession)
+	taskStopHandler    func(*TaskStopSession)
+	taskRestartHandler func(*TaskRestartSession)
+	taskLogsHandler    func(*TaskLogsSession)
+	taskHandlerM       sync.RWMutex
 
 	gitStatusHandler func(*GitStatusSession)
 	gitUndoHandler   func(*GitUndoSession)
@@ -356,6 +357,8 @@ func (c *Client) handleMessage(msg protocol.Message) {
 		c.handleInboundTaskList(msg)
 	case protocol.MsgTaskStop:
 		c.handleInboundTaskStop(msg)
+	case protocol.MsgTaskRestart:
+		c.handleInboundTaskRestart(msg)
 	case protocol.MsgTaskLogs:
 		c.handleInboundTaskLogs(msg)
 	case protocol.MsgGitStatus:

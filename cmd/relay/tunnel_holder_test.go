@@ -312,7 +312,7 @@ func waitDialable(t *testing.T, listen string) {
 	t.Fatalf("address %s never became dialable", listen)
 }
 
-// TestTunnelHolder_Restart 验证 `relay tunnel restart`(tunOpRestart)在原地址上关闭后重开:
+// TestTunnelHolder_Restart 验证根级 `relay restart <egress>` 的下发动作(tunOpRestart)在原地址上关闭后重开:
 // 应答 OK、list 中仍是同一条 running 条目(不重复累加)、地址重新可连、持久化意图保持。
 func TestTunnelHolder_Restart(t *testing.T) {
 	holder, cancel, sock := startTestHolder(t, "", nil)
@@ -520,7 +520,7 @@ func TestTunnelHolder_AcceptErrorMarksStopped(t *testing.T) {
 }
 
 // TestTunnelHolder_RestoreBindFailureKeepsStoppedEntry 验证 restore 时 restart=always 重绑失败
-// 不再直接丢弃条目:仍以 stopped 登记(ps/status 可见,relay tunnel restart 可重开)。
+// 不再直接丢弃条目:仍以 stopped 登记(ps 可见,relay start/restart 可重开)。
 func TestTunnelHolder_RestoreBindFailureKeepsStoppedEntry(t *testing.T) {
 	logs := &syncBuffer{}
 	h := newTunnelHolder(context.Background(), nil, filepath.Join(t.TempDir(), "tunnel.sock"))

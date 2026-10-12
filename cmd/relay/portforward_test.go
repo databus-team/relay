@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -10,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/user/relay/internal/relay/client"
 	relaybackend "github.com/user/relay/internal/relay/backend"
+	"github.com/user/relay/internal/relay/client"
 	"github.com/user/relay/internal/relay/server"
 )
 
@@ -61,6 +62,35 @@ func TestParsePortForwardSpec(t *testing.T) {
 			wantRemoteP: 5432,
 			wantErr:     false,
 		},
+		// host:port 形态(R15): 绑定主机 + 本地端口，远端默认同本地端口
+		{
+			raw:         "127.0.0.1:8080",
+			defaultBind: "127.0.0.1",
+			wantBind:    "127.0.0.1",
+			wantLocal:   8080,
+			wantRemoteH: "127.0.0.1",
+			wantRemoteP: 8080,
+			wantErr:     false,
+		},
+		{
+			raw:         "0.0.0.0:8080",
+			defaultBind: "127.0.0.1",
+			wantBind:    "0.0.0.0",
+			wantLocal:   8080,
+			wantRemoteH: "127.0.0.1",
+			wantRemoteP: 8080,
+			wantErr:     false,
+		},
+		// 显式 host 覆盖 --bind-host 默认值
+		{
+			raw:         "127.0.0.1:8080",
+			defaultBind: "0.0.0.0",
+			wantBind:    "127.0.0.1",
+			wantLocal:   8080,
+			wantRemoteH: "127.0.0.1",
+			wantRemoteP: 8080,
+			wantErr:     false,
+		},
 		{
 			raw:     "invalid",
 			wantErr: true,
@@ -71,6 +101,10 @@ func TestParsePortForwardSpec(t *testing.T) {
 		},
 		{
 			raw:     "8080:70000",
+			wantErr: true,
+		},
+		{
+			raw:     ":8080",
 			wantErr: true,
 		},
 	}
@@ -98,6 +132,158 @@ func TestParsePortForwardSpec(t *testing.T) {
 		if spec.RemotePort != tt.wantRemoteP {
 			t.Errorf("RemotePort = %d, want %d", spec.RemotePort, tt.wantRemoteP)
 		}
+	}
+}
+
+// `-p host:port` 与 `-p port --bind-host host` 等价，且解析结果必须无损带走绑定面(R21/KTD9):
+// String() 只用于展示，记录必须走结构化字段。
+func TestParsePortForwardSpec_HostPortEquivalentAndLossless(t *testing.T) {
+	explicit, err := parsePortForwardSpec("127.0.0.1:8080", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("parse 127.0.0.1:8080: %v", err)
+	}
+	viaFlag, err := parsePortForwardSpec("8080", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("parse 8080: %v", err)
+	}
+	if *explicit != *viaFlag {
+		t.Errorf("-p 127.0.0.1:8080 = %+v, want equivalent to -p 8080 --bind-host 127.0.0.1 = %+v", *explicit, *viaFlag)
+	}
+
+	// 绑定面不比默认窄：展示字符串丢掉 0.0.0.0，但结构化记录必须原样保留
+	wild, err := parsePortForwardSpec("0.0.0.0:8080", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("parse 0.0.0.0:8080: %v", err)
+	}
+	if wild.BindHost != "0.0.0.0" {
+		t.Fatalf("BindHost = %q, want 0.0.0.0", wild.BindHost)
+	}
+	if wild.String() != "8080" {
+		t.Errorf("String() = %q, want %q (display-only, does not carry the bind face)", wild.String(), "8080")
+	}
+
+	// 记录往返(生产侧以解析后的结构上行，不依赖 String())
+	raw, err := json.Marshal(wild)
+	if err != nil {
+		t.Fatalf("marshal spec: %v", err)
+	}
+	var restored PortForwardSpec
+	if err := json.Unmarshal(raw, &restored); err != nil {
+		t.Fatalf("unmarshal spec: %v", err)
+	}
+	if restored != *wild {
+		t.Errorf("round-tripped spec = %+v, want %+v", restored, *wild)
+	}
+}
+
+func TestParseTunnelListenSpec(t *testing.T) {
+	tests := []struct {
+		raw         string
+		defaultBind string
+		wantBind    string
+		wantPort    int
+		wantErr     bool
+		errContains string
+	}{
+		{
+			raw:         "1080",
+			defaultBind: "127.0.0.1",
+			wantBind:    "127.0.0.1",
+			wantPort:    1080,
+		},
+		{
+			raw:         "127.0.0.1:1080",
+			defaultBind: "127.0.0.1",
+			wantBind:    "127.0.0.1",
+			wantPort:    1080,
+		},
+		{
+			raw:         "0.0.0.0:1080",
+			defaultBind: "127.0.0.1",
+			wantBind:    "0.0.0.0",
+			wantPort:    1080,
+		},
+		{
+			raw:         "8080",
+			defaultBind: "0.0.0.0",
+			wantBind:    "0.0.0.0",
+			wantPort:    8080,
+		},
+		{
+			raw:         "8080:9000",
+			defaultBind: "127.0.0.1",
+			wantErr:     true,
+			errContains: "[host:]port",
+		},
+		{
+			raw:         "8080:9000:1080",
+			defaultBind: "127.0.0.1",
+			wantErr:     true,
+			errContains: "[host:]port",
+		},
+		{
+			raw:     "invalid",
+			wantErr: true,
+		},
+		{
+			raw:     "0",
+			wantErr: true,
+		},
+		{
+			raw:     "70000",
+			wantErr: true,
+		},
+		{
+			raw:         "127.0.0.1:70000",
+			wantErr:     true,
+			errContains: "[host:]port",
+		},
+		{
+			raw:         ":8080",
+			wantErr:     true,
+			errContains: "[host:]port",
+		},
+	}
+
+	for _, tt := range tests {
+		spec, err := parseTunnelListenSpec(tt.raw, tt.defaultBind)
+		if tt.wantErr {
+			if err == nil {
+				t.Errorf("parseTunnelListenSpec(%q) expected error, got nil", tt.raw)
+				continue
+			}
+			if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
+				t.Errorf("parseTunnelListenSpec(%q) error = %q, want it to contain %q", tt.raw, err.Error(), tt.errContains)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("parseTunnelListenSpec(%q) unexpected error: %v", tt.raw, err)
+		}
+		if spec.BindHost != tt.wantBind {
+			t.Errorf("BindHost = %q, want %q", spec.BindHost, tt.wantBind)
+		}
+		if spec.Port != tt.wantPort {
+			t.Errorf("Port = %d, want %d", spec.Port, tt.wantPort)
+		}
+	}
+}
+
+// `-p 1080` 与 `-p 127.0.0.1:1080` 必须得到同一个监听地址(绑定取 --bind-host)
+func TestParseTunnelListenSpec_BarePortMatchesLoopback(t *testing.T) {
+	bare, err := parseTunnelListenSpec("1080", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("parse 1080: %v", err)
+	}
+	explicit, err := parseTunnelListenSpec("127.0.0.1:1080", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("parse 127.0.0.1:1080: %v", err)
+	}
+	if *bare != *explicit {
+		t.Errorf("-p 1080 -> %+v, want same listen address as -p 127.0.0.1:1080 -> %+v", *bare, *explicit)
+	}
+	if bare.Addr() != "127.0.0.1:1080" {
+		t.Errorf("Addr() = %q, want %q", bare.Addr(), "127.0.0.1:1080")
 	}
 }
 

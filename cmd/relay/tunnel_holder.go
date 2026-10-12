@@ -70,7 +70,7 @@ type tunnelState struct {
 }
 
 // filterTunnels 按 target 精确过滤 egress(空 target = 不过滤);all=false 时仅保留 running。
-// relay ps 与 relay tunnel status 共用同一语义。
+// 只有 relay ps 使用它:relay logs <egress> 走 resolveLifecycle/tunnelStatesForRead,不经这里。
 func filterTunnels(states []tunnelState, target string, all bool) []tunnelState {
 	out := make([]tunnelState, 0, len(states))
 	for _, st := range states {
@@ -125,7 +125,7 @@ func (e *tunnelEntry) toState() tunnelState {
 
 // tunnelHolder 是常驻于本地 node(agent 角色)进程内的 SOCKS5 隧道持有者,类比 dockerd。
 // 它通过 unix socket 接受 CLI 的 open/close/restart/list 控制,并负责维持各隧道的本地监听;
-// 即使发起 `relay tunnel` 的 CLI 已退出,隧道依然存活。意图持久化到 tunnels.json,重启后按 restart 策略恢复。
+// 即使发起 `relay run -t tunnel` 的 CLI 已退出,隧道依然存活。意图持久化到 tunnels.json,重启后按 restart 策略恢复。
 type tunnelHolder struct {
 	rb        *relaybackend.RelayBackend
 	ctx       context.Context
@@ -281,7 +281,7 @@ func (h *tunnelHolder) openEntryLocked(egress, listen, restart string) error {
 }
 
 // registerStoppedLocked 就地登记一条 stopped 条目(不绑定监听),保留 listen/restart/started,
-// 使其在 list/ps 可见,并可被 `relay tunnel restart` 依原参数重开。调用方须已持有 h.mu。
+// 使其在 list/ps 可见,并可被 `relay start <egress>` / `relay restart <egress>` 依原参数重开。调用方须已持有 h.mu。
 func (h *tunnelHolder) registerStoppedLocked(st tunnelState) {
 	h.byEgress[st.Egress] = &tunnelEntry{
 		egress:  st.Egress,
@@ -400,7 +400,7 @@ func (h *tunnelHolder) serveEntry(entry *tunnelEntry) {
 			}
 			h.mu.Unlock()
 			if unexpected {
-				entry.logf("accept failed: %v; tunnel stopped (restart it with `relay tunnel restart`)", err)
+				entry.logf("accept failed: %v; tunnel stopped (restart it with `relay restart %s`)", err, entry.egress)
 			}
 			return
 		}

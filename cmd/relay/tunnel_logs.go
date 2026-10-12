@@ -85,29 +85,10 @@ func readTunnelLogTail(logPath, egress string, tailLines int) ([]string, error) 
 	}
 }
 
-// tunnelEgressKnown 询问本地 node 的隧道持有者是否认识该 egress。隧道是否存在以 holder 为准,
-// 而不是日志内容:新开且健康的隧道不会写任何 `[tunnel <egress>]` 前缀行,「零匹配行」推不出
-// 「不是隧道」。node 未运行(无持有者)时一律返回 false。
-func tunnelEgressKnown(egress string) bool {
-	if egress == "" || !daemon.Get(daemon.PidFile("node")).Running {
-		return false
-	}
-	resp, err := sendTunnelControl(tunnelSockPath(), tunControlMsg{Op: tunOpList})
-	if err != nil || !resp.OK {
-		return false
-	}
-	for _, st := range resp.Tunnels {
-		if st.Egress == egress {
-			return true
-		}
-	}
-	return false
-}
-
 // showTunnelLogs 把 `relay logs <egress>` 落到 node 日志上,只呈现该隧道的行。调用方须先经
-// tunnelEgressKnown 确认 holder 认识该 egress:此时零匹配行是「尚无输出」而非「不是隧道」,
-// 照常打印已有行(可能一行都没有)并在 follow 时进入跟读。node 前台运行时隧道日志走 stderr、
-// 不落 node.log,故仅当日志文件缺失才补一条提示。
+// resolveLifecycle 确认身份(holder 或意图文件认识该 egress)且本机 node 在运行:
+// 此时零匹配行是「尚无输出」而非「不是隧道」,照常打印已有行(可能一行都没有)并在 follow 时进入跟读。
+// node 前台运行时隧道日志走 stderr、不落 node.log,故仅当日志文件缺失才补一条提示。
 func showTunnelLogs(egress string, follow bool, tailLines int) {
 	if tailLines <= 0 {
 		tailLines = 100

@@ -3,6 +3,8 @@ package backend
 import (
 	"context"
 	"errors"
+
+	"github.com/user/relay/internal/portfwd"
 )
 
 var (
@@ -58,7 +60,7 @@ type GitSyncPayload struct {
 type GitSyncExecBackend interface {
 	ExecStreamWithGitSync(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, onChunk func(ExecChunk)) (int, error)
 	ExecStreamWithOptions(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, detach bool, onChunk func(ExecChunk)) (int, error)
-	ExecStreamWithPorts(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, detach bool, ports []string, onChunk func(ExecChunk)) (int, error)
+	ExecStreamWithPorts(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, detach bool, ports []portfwd.Spec, restart string, onChunk func(ExecChunk)) (int, error)
 }
 
 // TaskInfo 跨机任务简报
@@ -68,17 +70,20 @@ type TaskInfo struct {
 	Cmd       string
 	Cwd       string
 	PID       int
-	Ports     []string
+	Ports     []portfwd.Spec
 	Status    string
 	ExitCode  int
 	StartTime int64
 	EndTime   int64
+	Restart   string // restart 策略(always|no)
+	CreatedAt int64  // 首次创建时间(unix 秒),重启不重置
 }
 
 // TaskSupervisorBackend 可选接口:支持类似 Docker 的后台服务生命周期管理
 type TaskSupervisorBackend interface {
 	TaskList(ctx context.Context, targetExecutor string, all bool) ([]TaskInfo, error)
 	TaskStop(ctx context.Context, targetExecutor, taskID string) error
+	TaskRestart(ctx context.Context, targetExecutor, taskID string) error
 	TaskLogs(ctx context.Context, targetExecutor, taskID string, follow bool, tailLines int, onChunk func(ExecChunk)) error
 }
 

@@ -1,5 +1,7 @@
 package protocol
 
+import "github.com/user/relay/internal/portfwd"
+
 // ForwardTaskIDMarker 是 detach 执行时 executor 回写任务 ID 的 stdout 行前缀标记。
 // 使 CLI 端能精确识别任务 ID,而不与任务自身的 stdout 混淆(任务可能先于 ID 回写打印任意输出)。
 const ForwardTaskIDMarker = "__relay_task_id__"
@@ -36,6 +38,7 @@ const (
 	MsgTunnelEnd        MessageType = "tunnel_end"
 	MsgTaskList         MessageType = "task_list"
 	MsgTaskStop         MessageType = "task_stop"
+	MsgTaskRestart      MessageType = "task_restart"
 	MsgTaskLogs         MessageType = "task_logs"
 	MsgGitStatus        MessageType = "git_status"
 	MsgGitUndo          MessageType = "git_undo"
@@ -351,22 +354,25 @@ type ExecRequest struct {
 	Cwd        string          `json:"cwd,omitempty"`
 	Timeout    int             `json:"timeout"`
 	GitSync    *GitSyncPayload `json:"git_sync,omitempty"`
-	Detach     bool            `json:"detach,omitempty"` // true = 后台托管运行并立即返回 TaskID
-	Ports      []string        `json:"ports,omitempty"`  // 关联的端口映射信息, 如 ["8080:8080"]
+	Detach     bool            `json:"detach,omitempty"`  // true = 后台托管运行并立即返回 TaskID
+	Ports      []portfwd.Spec  `json:"ports,omitempty"`   // 关联的端口转发规格(含绑定主机), 如 [{"bind":"0.0.0.0","local_port":8080,...}]
+	Restart    string          `json:"restart,omitempty"` // 后台任务的 restart 策略(always|no), 仅 detach 时有意义
 }
 
 // TaskInfo 描述跨机传输的任务简报
 type TaskInfo struct {
-	ID        string   `json:"id"`
-	Node      string   `json:"node,omitempty"` // 所属执行方 executor_id
-	Cmd       string   `json:"cmd"`
-	Cwd       string   `json:"cwd"`
-	PID       int      `json:"pid"`
-	Ports     []string `json:"ports,omitempty"` // 端口映射信息
-	Status    string   `json:"status"`
-	ExitCode  int      `json:"exit_code"`
-	StartTime int64    `json:"start_time"`
-	EndTime   int64    `json:"end_time,omitempty"`
+	ID        string         `json:"id"`
+	Node      string         `json:"node,omitempty"` // 所属执行方 executor_id
+	Cmd       string         `json:"cmd"`
+	Cwd       string         `json:"cwd"`
+	PID       int            `json:"pid"`
+	Ports     []portfwd.Spec `json:"ports,omitempty"` // 端口转发规格(含绑定主机)
+	Status    string         `json:"status"`
+	ExitCode  int            `json:"exit_code"`
+	StartTime int64          `json:"start_time"`
+	EndTime   int64          `json:"end_time,omitempty"`
+	Restart   string         `json:"restart,omitempty"`    // restart 策略(always|no)
+	CreatedAt int64          `json:"created_at,omitempty"` // 首次创建时间(unix 秒),重启不重置
 }
 
 // TaskListRequest 查询任务列表
@@ -384,6 +390,12 @@ type TaskListResponse struct {
 
 // TaskStopRequest 停止任务请求
 type TaskStopRequest struct {
+	ExecutorID string `json:"executor_id,omitempty"`
+	TaskID     string `json:"task_id"`
+}
+
+// TaskRestartRequest 重启任务请求:由执行方在原 task id 上按记录的命令/工作目录/端口重跑。
+type TaskRestartRequest struct {
 	ExecutorID string `json:"executor_id,omitempty"`
 	TaskID     string `json:"task_id"`
 }

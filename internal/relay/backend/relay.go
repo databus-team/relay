@@ -21,6 +21,7 @@ import (
 	"github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/config"
 	"github.com/user/relay/internal/logx"
+	"github.com/user/relay/internal/portfwd"
 	"github.com/user/relay/internal/relay/client"
 	"github.com/user/relay/internal/relay/protocol"
 	"github.com/user/relay/internal/supervisor"
@@ -37,10 +38,6 @@ type RelayBackend struct {
 	configPath string // config-sync 落盘目标(执行方)
 	eventCh    chan backend.FileInfo
 	mu         sync.RWMutex
-
-	// supervisor 负责进程树生命周期与后台任务托管
-	sup   *supervisor.Supervisor
-	supMu sync.Mutex
 
 	// tunnelAllow 是执行方 network_allow 出网白名单(已解析)。空 = 默认拒绝一切隧道建连(fail-closed)。
 	tunnelAllow []config.TunnelRule
@@ -257,39 +254,93 @@ func (b *RelayBackend) Exec(ctx context.Context, cmd string, cwd string, timeout
 }
 
 var (
-	activeSupervisorsMu sync.Mutex
-	activeSupervisors   = make(map[*supervisor.Supervisor]struct{})
+	// supervisorsMu 同时守护 supervisors 的写入(newSupervisor 的查/插)与读取(Cleanup 的快照)。
+	supervisorsMu sync.Mutex
+	// supervisors 按任务目录记住本进程唯一的 supervisor,它的值集合同样就是 Cleanup 在进程
+	// 退出时要停的全集(见 Cleanup),不再另存一份指针集合——同一事实存两处迟早会漂移,只往
+	// 一处登记会让 Cleanup 漏停某个 supervisor,重新制造它本要避免的孤儿任务。执行方在运行中
+	// 会反复构造 backend(命令轮询每轮一次、文件事件各一次),每个 backend 各建一份会让同一批
+	// meta.json 被反复加载与回写,Cleanup 也会拿着两份互不知情的内存视图对同一批任务各杀一次。
+	// 以目录为键恰好与 supervisorBaseDir 测试接缝对齐:各用例各自给一个 t.TempDir(),互不串台。
+	supervisors = make(map[string]*supervisor.Supervisor)
 )
 
-// Cleanup 停止当前进程管理的所有后台任务（在 agent 退出或重启时调用，避免孤儿进程残留）
+// supervisorBaseDir 是执行方任务目录,空值回退到 supervisor.DefaultBaseDir()(~/.relay/tasks)。
+// 测试据此外接到临时目录,避免碰到真实节点状态。
+var supervisorBaseDir string
+
+// newSupervisor 返回 supervisorBaseDir 对应的 supervisor(每目录每进程唯一),首次构造时登记进
+// supervisors,让 Cleanup 能在进程退出时停掉它托管的任务。
+func newSupervisor() (*supervisor.Supervisor, error) {
+	dir := supervisorBaseDir
+	if dir == "" {
+		dir = supervisor.DefaultBaseDir()
+	}
+	supervisorsMu.Lock()
+	defer supervisorsMu.Unlock()
+	if s, ok := supervisors[dir]; ok {
+		return s, nil
+	}
+	s, err := supervisor.New(dir)
+	if err != nil {
+		return nil, err
+	}
+	supervisors[dir] = s
+	return s, nil
+}
+
+// Cleanup 停止当前进程管理的所有后台任务（在 agent 退出或重启时调用，避免孤儿进程残留）。
+// 直接取 supervisors 的值,不另设登记表:登记与 Cleanup 的取材同源,就不存在只登记一处导致漏停。
 func Cleanup() {
-	activeSupervisorsMu.Lock()
-	sups := make([]*supervisor.Supervisor, 0, len(activeSupervisors))
-	for s := range activeSupervisors {
+	supervisorsMu.Lock()
+	sups := make([]*supervisor.Supervisor, 0, len(supervisors))
+	for _, s := range supervisors {
 		sups = append(sups, s)
 	}
-	activeSupervisorsMu.Unlock()
+	supervisorsMu.Unlock()
 
 	for _, s := range sups {
 		s.StopAll()
 	}
 }
 
-func (b *RelayBackend) getSupervisor() *supervisor.Supervisor {
-	b.supMu.Lock()
-	defer b.supMu.Unlock()
-	if b.sup == nil {
-		s, err := supervisor.New("")
-		if err != nil {
-			log.Printf("[supervisor] init failed: %v", err)
-			return nil
-		}
-		b.sup = s
-		activeSupervisorsMu.Lock()
-		activeSupervisors[s] = struct{}{}
-		activeSupervisorsMu.Unlock()
+// 重放每进程只触发一次(KTD4):以 supervisor 目录为键的进程级 once 守卫。执行方在运行中会
+// 反复构造 backend(命令轮询每轮一次、文件事件各一次),把重放挂到构造上会让每个 always
+// 任务每 2–30 秒被杀一次,直接违背 R6。故守卫放在进程级,只有执行方启动路径显式调用。
+var (
+	replayMu    sync.Mutex
+	replayedDir = make(map[string]struct{})
+)
+
+// ReplayAlwaysTasks 在执行方进程启动路径上重放策略为 always 的任务(R6、KTD4、KTD10):
+// 只看策略、不看进入时的状态,优雅停机留下的 stopped 也会被重新拉起。同一 supervisor 目录
+// 每进程只触发一次;单条失败只写进该任务日志并保持停止,不阻塞启动(R8)。
+func ReplayAlwaysTasks() {
+	replayMu.Lock()
+	if _, done := replayedDir[supervisorBaseDir]; done {
+		replayMu.Unlock()
+		return
 	}
-	return b.sup
+	replayedDir[supervisorBaseDir] = struct{}{}
+	replayMu.Unlock()
+
+	sup, err := newSupervisor()
+	if err != nil {
+		log.Printf("[replay] supervisor init failed: %v", err)
+		return
+	}
+	for _, res := range sup.ReplayAlways() {
+		log.Printf("[replay] task %s restore failed: %v", res.ID, res.Err)
+	}
+}
+
+func (b *RelayBackend) getSupervisor() *supervisor.Supervisor {
+	s, err := newSupervisor()
+	if err != nil {
+		log.Printf("[supervisor] init failed: %v", err)
+		return nil
+	}
+	return s
 }
 
 // ExecStream 流式执行:本地 CLI 作为请求方时,经中转把命令转发给远端 executor 并实时回调输出。
@@ -305,11 +356,11 @@ func (b *RelayBackend) ExecStreamWithGitSync(ctx context.Context, targetExecutor
 
 // ExecStreamWithOptions 携带完整选项(包括 detach)的流式执行。
 func (b *RelayBackend) ExecStreamWithOptions(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, syncPayload *backend.GitSyncPayload, detach bool, onChunk func(backend.ExecChunk)) (int, error) {
-	return b.ExecStreamWithPorts(ctx, targetExecutor, cmd, cwd, timeout, syncPayload, detach, nil, onChunk)
+	return b.ExecStreamWithPorts(ctx, targetExecutor, cmd, cwd, timeout, syncPayload, detach, nil, "", onChunk)
 }
 
-// ExecStreamWithPorts 携带完整选项(包括 detach 和 ports 端口列表)的流式执行。
-func (b *RelayBackend) ExecStreamWithPorts(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, syncPayload *backend.GitSyncPayload, detach bool, ports []string, onChunk func(backend.ExecChunk)) (int, error) {
+// ExecStreamWithPorts 携带完整选项(包括 detach、ports 端口转发规格与后台任务的 restart 策略)的流式执行。
+func (b *RelayBackend) ExecStreamWithPorts(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, syncPayload *backend.GitSyncPayload, detach bool, ports []portfwd.Spec, restart string, onChunk func(backend.ExecChunk)) (int, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return 0, err
 	}
@@ -335,6 +386,7 @@ func (b *RelayBackend) ExecStreamWithPorts(ctx context.Context, targetExecutor, 
 		GitSync:        protoSync,
 		Detach:         detach,
 		Ports:          ports,
+		Restart:        restart,
 	}
 
 	resp, err := b.client.ExecStreamWithOptions(ctx, opts, func(chunk protocol.ExecChunk) {
@@ -448,6 +500,7 @@ func (b *RelayBackend) enableExecutor() {
 	b.client.SetTunnelHandler(func(sess *client.TunnelSession) { b.handleInboundTunnelConnect(sess) })
 	b.client.SetTaskListHandler(func(sess *client.TaskListSession) { b.handleInboundTaskList(sess) })
 	b.client.SetTaskStopHandler(func(sess *client.TaskStopSession) { b.handleInboundTaskStop(sess) })
+	b.client.SetTaskRestartHandler(func(sess *client.TaskRestartSession) { b.handleInboundTaskRestart(sess) })
 	b.client.SetTaskLogsHandler(func(sess *client.TaskLogsSession) { b.handleInboundTaskLogs(sess) })
 	b.client.SetGitStatusHandler(func(sess *client.GitStatusSession) { b.handleInboundGitStatus(sess) })
 	b.client.SetGitUndoHandler(func(sess *client.GitUndoSession) { b.handleInboundGitUndo(sess) })
@@ -728,14 +781,14 @@ func (b *RelayBackend) handleInboundExec(sess *client.ExecSession) {
 			_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: "supervisor not available"})
 			return
 		}
-		task, err := sup.StartTaskWithPorts(sess.Cmd(), targetDir, sess.Ports(), nil)
+		task, err := sup.StartTaskWithPolicy(sess.Cmd(), targetDir, sess.Ports(), sess.Restart(), nil)
 		if err != nil {
 			log.Printf("[exec -d] start task failed: %v", err)
 			_ = sess.Write(false, fmt.Sprintf("start background task failed: %v\n", err))
 			_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: err.Error()})
 			return
 		}
-		log.Printf("[exec -d] task started: id=%s pid=%d (watch=%s, ports=%v)", task.Meta().ID, task.Meta().PID, sess.ExecutorID(), task.Meta().Ports)
+		log.Printf("[exec -d] task started: id=%s pid=%d (watch=%s, ports=%v, restart=%s)", task.Meta().ID, task.Meta().PID, sess.ExecutorID(), task.Meta().Ports, task.Meta().Restart)
 		// 任务 ID 以带标记的单行回写,CLI 端据此前缀精确捕获,避免与任务自身的 stdout 混淆。
 		_ = sess.Write(true, fmt.Sprintf("%s%s\n", protocol.ForwardTaskIDMarker, task.Meta().ID))
 		_ = sess.Done(protocol.ExecResponse{
@@ -776,6 +829,8 @@ func (b *RelayBackend) handleInboundTaskList(sess *client.TaskListSession) {
 			Status:    string(t.Status),
 			ExitCode:  t.ExitCode,
 			StartTime: t.StartTime.Unix(),
+			Restart:   supervisor.NormalizeRestart(t.Restart),
+			CreatedAt: t.CreatedAt.Unix(),
 		}
 		if t.EndTime != nil {
 			info.EndTime = t.EndTime.Unix()
@@ -791,7 +846,18 @@ func (b *RelayBackend) handleInboundTaskStop(sess *client.TaskStopSession) {
 		_ = sess.Done(fmt.Errorf("supervisor not enabled"))
 		return
 	}
-	err := sup.StopTask(sess.TaskID())
+	// 显式 stop 同时清除 restart 策略(R7/KD5):停掉的任务不会在执行方启动时自行复活。
+	err := sup.StopTaskAndClearPolicy(sess.TaskID())
+	_ = sess.Done(err)
+}
+
+func (b *RelayBackend) handleInboundTaskRestart(sess *client.TaskRestartSession) {
+	sup := b.getSupervisor()
+	if sup == nil {
+		_ = sess.Done(fmt.Errorf("supervisor not enabled"))
+		return
+	}
+	_, err := sup.RestartTask(sess.TaskID())
 	_ = sess.Done(err)
 }
 
@@ -880,6 +946,8 @@ func (b *RelayBackend) TaskList(ctx context.Context, targetExecutor string, all 
 			ExitCode:  t.ExitCode,
 			StartTime: t.StartTime,
 			EndTime:   t.EndTime,
+			Restart:   supervisor.NormalizeRestart(t.Restart),
+			CreatedAt: t.CreatedAt,
 		})
 	}
 	return out, nil
@@ -891,6 +959,14 @@ func (b *RelayBackend) TaskStop(ctx context.Context, targetExecutor, taskID stri
 		return err
 	}
 	return b.client.TaskStop(ctx, targetExecutor, taskID)
+}
+
+// TaskRestart 向目标执行方请求在原 task id 上重启任务
+func (b *RelayBackend) TaskRestart(ctx context.Context, targetExecutor, taskID string) error {
+	if err := b.ensureConnected(ctx); err != nil {
+		return err
+	}
+	return b.client.TaskRestart(ctx, targetExecutor, taskID)
 }
 
 // PruneOfflineExecutors 向中转请求清理「已知但离线」的 executor 台账条目,返回清理数。
@@ -1121,14 +1197,6 @@ func (b *RelayBackend) forwardEvents() {
 }
 
 func (b *RelayBackend) Close() error {
-	b.supMu.Lock()
-	if b.sup != nil {
-		activeSupervisorsMu.Lock()
-		delete(activeSupervisors, b.sup)
-		activeSupervisorsMu.Unlock()
-		b.sup = nil
-	}
-	b.supMu.Unlock()
 	if b.client != nil {
 		return b.client.Disconnect()
 	}

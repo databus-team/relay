@@ -186,6 +186,9 @@ func (c *Client) handleMessage(msg protocol.Message) {
 	case protocol.MsgTaskStop:
 		c.handleTaskStop(msg)
 
+	case protocol.MsgTaskRestart:
+		c.handleTaskRestart(msg)
+
 	case protocol.MsgTaskLogs:
 		c.handleTaskLogs(msg)
 
@@ -348,6 +351,11 @@ func (c *Client) handleTaskList(msg protocol.Message) {
 
 // handleTaskStop 处理停止任务请求
 func (c *Client) handleTaskStop(msg protocol.Message) {
+	c.forwardToExecutor(msg)
+}
+
+// handleTaskRestart 处理重启任务请求
+func (c *Client) handleTaskRestart(msg protocol.Message) {
 	c.forwardToExecutor(msg)
 }
 

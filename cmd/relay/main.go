@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -20,6 +22,7 @@ import (
 	"github.com/user/relay/internal/exchange"
 	"github.com/user/relay/internal/jobrunner"
 	"github.com/user/relay/internal/logx"
+	"github.com/user/relay/internal/portfwd"
 	relaybackend "github.com/user/relay/internal/relay/backend"
 	"github.com/user/relay/internal/relay/protocol"
 	_ "github.com/user/relay/internal/relay/server"
@@ -85,9 +88,17 @@ var (
 	execDetach      = execCmd.Flag("detach", "Run command in background as daemon task (returns TaskID)").Short('d').Bool()
 	execPublish     = execCmd.Flag("publish", "Publish remote port to local (e.g. -p 8080 or -p 8080:8080, similar to docker run -p)").Short('p').Strings()
 	execBindHost    = execCmd.Flag("bind-host", "Local bind host for published ports (default: 127.0.0.1)").Default("127.0.0.1").String()
+	// -t/--type 选择创建的对象:缺省 task(在远端跑命令);tunnel 则在本机 node 上开一条 SOCKS5 隧道。
+	execType = execCmd.Flag("type", "Object type to create: task (default) or tunnel").Short('t').String()
+	// --restart/--no-restart 是任务与隧道共用的重启策略旗标对(隧道模式写入隧道意图 R14;
+	// 任务的写入/校验由任务模式实现负责)。缺省留空以便区分「未给出」与「显式 --restart=no」,
+	// 任务模式据此要求 -d(R5);取值校验抽成 restartPolicyValue 纯函数共用。
+	execRestartPolicy = execCmd.Flag("restart", "Restart policy at the owning daemon's next start: always|no (task: executor start; tunnel: local node start)").String()
+	execNoRestart     = execCmd.Flag("no-restart", "Shortcut for --restart=no").Bool()
 	// 支持多词命令:relay run git status 会收成 ["git","status"] 再空格 join。
 	// 含以 - 开头参数的命令(如 git log --oneline)仍须整体加引号,避免被当 flag。
-	execCmdStr = execCmd.Arg("command", "Command to execute (multiple words are joined)").Required().Strings()
+	// 不设 Required:模式按 KTD7 由代码校验(任务模式必需,隧道模式必须为空)。
+	execCmdStr = execCmd.Arg("command", "Command to execute (multiple words are joined; required in task mode)").Strings()
 
 	// ps command - 查询后台任务
 	psCmd  = kingpin.Command("ps", "List managed background tasks and node-held tunnels (similar to docker ps)")
@@ -109,6 +120,18 @@ var (
 	stopTaskID = stopCmd.Arg("task-id", "Task ID or tunnel egress to stop").Required().String()
 	stopExec   = stopCmd.Flag("executor", "Target executor node").Short('e').HintAction(getNodeHints).String()
 	stopNode   = stopCmd.Flag("node", "Target node ID (alias for --executor)").HintAction(getNodeHints).String()
+
+	// start/restart commands - 根级生命周期动词(R1):按名字操作已存在的任务或隧道,从不创建对象。
+	// 任务寻址沿用 stop/logs 的 -e/--node;隧道寻址就用名字本身(egress),不需要 -e。
+	startCmd    = kingpin.Command("start", "Start an existing task or node-held tunnel by name (never creates one)")
+	startTarget = startCmd.Arg("name", "Task ID or tunnel egress to start").Required().String()
+	startExec   = startCmd.Flag("executor", "Target executor node").Short('e').HintAction(getNodeHints).String()
+	startNode   = startCmd.Flag("node", "Target node ID (alias for --executor)").HintAction(getNodeHints).String()
+
+	restartCmd    = kingpin.Command("restart", "Restart an existing task or node-held tunnel by name")
+	restartTarget = restartCmd.Arg("name", "Task ID or tunnel egress to restart").Required().String()
+	restartExec   = restartCmd.Flag("executor", "Target executor node").Short('e').HintAction(getNodeHints).String()
+	restartNode   = restartCmd.Flag("node", "Target node ID (alias for --executor)").HintAction(getNodeHints).String()
 
 	// Nodes command - 查看全网节点拓扑状态与角色 (类似 kubectl get nodes / docker node ls; alias: status)
 	nodesCmd      = kingpin.Command("nodes", "List cluster peer nodes and topology (alias: status)").Alias("status")
@@ -141,19 +164,8 @@ var (
 	serverRemoteBin    = serverRemoteCmd.Flag("binary", "Path to the new relay binary to send (default: current executable)").String()
 	serverRemoteExpect = serverRemoteCmd.Flag("expect", "Expected transit version after swap (default: this relay's version.String())").String()
 
-	tunnelCmd      = kingpin.Command("tunnel", "Open SOCKS5 egress tunnel through remote node")
-	tunnelListen   = tunnelCmd.Flag("listen", "Local SOCKS5 listen address").Default("127.0.0.1:1080").String()
-	tunnelExecName = tunnelCmd.Flag("executor", "Egress executor's executor_id (see `relay status` -> executors[].executor_id)").Short('w').HintAction(getNodeHints).String()
-	tunnelNodeName = tunnelCmd.Flag("node", "Egress node ID (alias for --executor)").HintAction(getNodeHints).String()
-
-	// tunnel 子命令:隧道由本地 node 持有(类比 dockerd),CLI 仅作控制面经 unix socket 下发
-	// open/close/restart/list。故没有 run(常驻进程已并入 node),也没有独立的 logs/upgrade/status
-	// —— 读取统一走 `relay ps`(TYPE tunnel 行)与 `relay logs <egress>`,tunnel 侧只留写动词。
-	tunnelStartCmd      = tunnelCmd.Command("start", "Start a SOCKS5 tunnel held by the local node")
-	tunnelRestartPolicy = tunnelStartCmd.Flag("restart", "Restart policy on node restart: always|no").Default("no").String()
-	tunnelNoRestart     = tunnelStartCmd.Flag("no-restart", "Shortcut for --restart=no").Bool()
-	_                   = tunnelCmd.Command("stop", "Stop a node-held tunnel")
-	_                   = tunnelCmd.Command("restart", "Restart a node-held tunnel (reopen without retyping flags)")
+	// 隧道没有独立命名空间:创建走 `relay run -t|--type=tunnel`(R14/KD6),生命周期走根级
+	// `start`/`restart`/`stop`/`logs`(R1),读取统一走 `relay ps`(TYPE tunnel 行)。
 
 	// Undo command - 一键恢复远端工作区影子快照 (防误操作与冲突覆盖)
 	undoCmd      = kingpin.Command("undo", "Restore remote workspace shadow snapshot")
@@ -275,24 +287,6 @@ func main() {
 		default:
 			app.Usage(os.Args[1:])
 		}
-	case selectedCmd == "tunnel" || strings.HasPrefix(selectedCmd, "tunnel "):
-		sub := strings.TrimSpace(strings.TrimPrefix(selectedCmd, "tunnel"))
-		switch sub {
-		case "start":
-			if err := runTunnelStart(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		case "stop":
-			runTunnelStop()
-		case "restart":
-			if err := runTunnelRestart(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		default:
-			app.Usage(os.Args[1:])
-		}
 	case selectedCmd == pullCmd.FullCommand():
 		runPull()
 	case selectedCmd == pushCmd.FullCommand():
@@ -319,6 +313,10 @@ func main() {
 		runLogs()
 	case selectedCmd == stopCmd.FullCommand():
 		runStop()
+	case selectedCmd == startCmd.FullCommand():
+		runStart()
+	case selectedCmd == restartCmd.FullCommand():
+		runRestart()
 	case selectedCmd == serverRemoteCmd.FullCommand():
 		runServerRemote()
 	case selectedCmd == completionCmd.FullCommand():
@@ -452,15 +450,6 @@ func tunnelInstanceName(executor string) string {
 	return b.String()
 }
 
-// tunnelRequireExecutor 校验隧道控制类操作(启动/停止/重启/升级)必须携带 node/executor 并返回目标节点 ID。
-func tunnelRequireExecutor() (string, error) {
-	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
-	if target == "" {
-		return "", fmt.Errorf("Specify --node or --executor with the egress node ID (see `relay status` -> `executors[].executor_id`)")
-	}
-	return target, nil
-}
-
 func runWatch() {
 	// Resolve a leading ~ so the path stored on the watcher (used later for
 	// config backup during sync) is an absolute filesystem path, not a literal
@@ -494,6 +483,10 @@ func runWatch() {
 	// 这样配置里的 executor: true 只在 relay watch 生效;本地 CLI(exec/push/sync)
 	// 即便共用同一份包含 executor 的配置,也不会自注册为执行方、把命令转发回本机。
 	relaybackend.SetExecutorRole(true)
+
+	// 执行方进程启动路径:显式构造 supervisor 并重放策略为 always 的任务一次(KTD4)。
+	// 每进程只触发一次;单条失败不阻塞启动,原因写入该任务自己的日志。
+	relaybackend.ReplayAlwaysTasks()
 
 	w, err := watcher.New(cfg, cfgPath)
 	if err != nil {
@@ -1056,10 +1049,142 @@ func disambiguateWorkspacesByPath(candidates []*config.WorkspaceConfig, absPath 
 	return nil
 }
 
+// tunnelModeInput 是 relay run 在隧道模式下用到的已解析旗标。显式传入(不读全局变量),
+// 使模式/旗标校验成为可逐条断言的纯决策(KTD7)。
+type tunnelModeInput struct {
+	Command   []string
+	Publish   []string
+	BindHost  string
+	Watch     string
+	Node      string
+	Executor  string
+	Detach    bool
+	NoSync    bool
+	Force     bool
+	NoRestart bool
+	Restart   string
+}
+
+// tunnelModeRequest 是隧道模式归一后的创建请求。
+type tunnelModeRequest struct {
+	Listen  *TunnelListenSpec
+	Egress  string
+	Restart string
+}
+
+// resolveTunnelMode 按模式矩阵校验并归一 relay run --type=tunnel 的旗标(R14/R16):
+// 恰好一个 -p([host:]port,无远端半段),没有位置命令,不接受任务语义旗标(-d/--no-sync/-f/-w),
+// 出口取 -e/--node,策略取 --restart/--no-restart。任一违规组合显式报错,不静默忽略。
+func resolveTunnelMode(in tunnelModeInput) (*tunnelModeRequest, error) {
+	if len(in.Command) > 0 {
+		return nil, fmt.Errorf("--type=tunnel takes no command (got %q); tunnels are created by the local node, not by running a command", strings.Join(in.Command, " "))
+	}
+	if in.Detach {
+		return nil, fmt.Errorf("-d/--detach is task-only and cannot be combined with --type=tunnel (tunnels are held by the local node)")
+	}
+	if in.NoSync {
+		return nil, fmt.Errorf("--no-sync is task-only and cannot be combined with --type=tunnel")
+	}
+	if in.Force {
+		return nil, fmt.Errorf("-f/--force-remote is task-only and cannot be combined with --type=tunnel")
+	}
+	if in.Watch != "" {
+		return nil, fmt.Errorf("-w/--watch is task-only and cannot be combined with --type=tunnel; pick the tunnel egress with -e/--executor")
+	}
+	switch len(in.Publish) {
+	case 0:
+		return nil, fmt.Errorf("--type=tunnel requires exactly one -p <[host:]port>")
+	case 1:
+	default:
+		return nil, fmt.Errorf("--type=tunnel accepts exactly one -p, got %d", len(in.Publish))
+	}
+	listen, err := parseTunnelListenSpec(in.Publish[0], in.BindHost)
+	if err != nil {
+		return nil, err
+	}
+	egress := resolveNodeTarget(in.Node, in.Executor)
+	if egress == "" {
+		return nil, fmt.Errorf("Specify --node or --executor with the egress node ID (see `relay status` -> `executors[].executor_id`)")
+	}
+	policy, err := restartPolicyValue(in.Restart, in.NoRestart)
+	if err != nil {
+		return nil, err
+	}
+	return &tunnelModeRequest{Listen: listen, Egress: egress, Restart: policy}, nil
+}
+
+// resolveTaskRestartPolicy 校验任务模式的 --restart/--no-restart(R5):取值复用与隧道共用的
+// restartPolicyValue 纯函数;任一旗标显式给出时都要求 -d/--detach —— 前台执行没有可承载策略
+// 的受管任务,带它时直接报错,不静默忽略。纯函数,不读全局旗标,便于单测与隧道命名空间退役后
+// 独立使用。
+func resolveTaskRestartPolicy(policy string, noRestart, detach bool) (string, error) {
+	resolved, err := restartPolicyValue(policy, noRestart)
+	if err != nil {
+		return "", err
+	}
+	explicit := strings.TrimSpace(policy) != "" || noRestart
+	if explicit && !detach {
+		return "", fmt.Errorf("--restart/--no-restart requires -d/--detach (a foreground run has no managed task to carry a restart policy)")
+	}
+	return resolved, nil
+}
+
+// requireTaskCommand 校验任务模式必须有位置命令。kingpin 层不再声明 Required,
+// 改为按模式校验(KTD7:隧道模式必须没有命令,任务模式必须有)。
+func requireTaskCommand(command []string) error {
+	if len(command) == 0 {
+		return fmt.Errorf("a command is required (e.g. `relay run echo hi`); use --type=tunnel to create a tunnel instead")
+	}
+	return nil
+}
+
 func runExec() {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 模式分支(KTD7):置于工作区/执行方解析之前,隧道模式直接走创建流程,不解析工作区,
+	// 也不需要命令;任务模式(默认)保持既有行为。两种路径的旗标规则互不干扰。
+	var taskRestart string
+	switch mode := strings.ToLower(strings.TrimSpace(*execType)); mode {
+	case "", "task":
+		if err := requireTaskCommand(*execCmdStr); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		policy, err := resolveTaskRestartPolicy(*execRestartPolicy, *execNoRestart, *execDetach)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		taskRestart = policy
+	case "tunnel":
+		req, err := resolveTunnelMode(tunnelModeInput{
+			Command:   *execCmdStr,
+			Publish:   *execPublish,
+			BindHost:  *execBindHost,
+			Watch:     *execWatch,
+			Node:      *execNode,
+			Executor:  *execExec,
+			Detach:    *execDetach,
+			NoSync:    *execNoSync,
+			Force:     *execForceRemote,
+			NoRestart: *execNoRestart,
+			Restart:   *execRestartPolicy,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := startTunnel(cfg, req.Egress, req.Listen.Addr(), req.Restart, os.Stderr); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	default:
+		fmt.Fprintf(os.Stderr, "Error: invalid --type %q (want task|tunnel)\n", *execType)
 		os.Exit(1)
 	}
 
@@ -1216,11 +1341,12 @@ func runExec() {
 
 	// 支持 Git 增量同步与后台托管的流式后端(relay)逐帧实时转发输出,并以 exit code 收尾
 	if eb, ok := b.(backend.GitSyncExecBackend); ok {
-		var portStrs []string
+		// 端口规格以解析后的结构上行(KTD9):记录必须无损带走绑定面,不能退化成 String() 的展示形态。
+		var execPorts []portfwd.Spec
 		for _, spec := range pfSpecs {
-			portStrs = append(portStrs, spec.String())
+			execPorts = append(execPorts, *spec)
 		}
-		exit, err := eb.ExecStreamWithPorts(ctx, targetExecutor, cmd, execCwd, 0, gitSyncPayload, *execDetach, portStrs, func(chunk backend.ExecChunk) {
+		exit, err := eb.ExecStreamWithPorts(ctx, targetExecutor, cmd, execCwd, 0, gitSyncPayload, *execDetach, execPorts, taskRestart, func(chunk backend.ExecChunk) {
 			if chunk.Stdout {
 				// detach 时从 stdout 捕获任务 ID(marker 前缀精确解析)。
 				if *execDetach && detachTaskID == "" {
@@ -1250,13 +1376,11 @@ func runExec() {
 				fmt.Fprintf(os.Stderr, "Port-forward register error: %v\n", regErr)
 				os.Exit(1)
 			}
-			for _, a := range registered {
-				fmt.Printf("➜ [port-forward] %s still listening (task %s)\n", a, detachTaskID)
-			}
-			for _, r := range rejected {
-				fmt.Fprintf(os.Stderr, "WARNING: %s (task %s)\n", r, detachTaskID)
-			}
-			// 已输出转发行,不再重复 echo task ID(转发行内已含 task id)。
+			// 非前台(经 holder)的注册路径由 CLI 自己复述非 loopback 告警:holder 那条只落到
+			// node.log,用户看不到(见 warnNonLoopbackForwards)。
+			warnNonLoopbackForwards(pfSpecs, registered)
+			// 转发行里已含 task id,故这条分支不再重复 echo(见下面的 else if)。
+			reportForwardRegistration(registered, rejected, detachTaskID)
 		} else if *execDetach && detachTaskID != "" {
 			// detach 无 -p 时,CLI 需把解析出的任务 ID 回显给用户(--detach 承诺返回 TaskID)。
 			fmt.Println(detachTaskID)
@@ -1306,7 +1430,7 @@ type psRow struct {
 	Created string `json:"created,omitempty"` // 相对时间("3m ago")
 	Command string `json:"command"`           // task: cmd; tunnel: "egress <egress>"
 	Egress  string `json:"egress,omitempty"`  // tunnel only
-	Restart string `json:"restart,omitempty"` // tunnel only
+	Restart string `json:"restart,omitempty"` // 任务与隧道共用(R20:任务行显示 restart 策略;隧道行早就用它)
 	// 隧道出口就绪(取自中转台账,与 `relay nodes` 同一事实来源)。出口是 SOCKS5 的三段链路末段,
 	// 本地 listener 活着不代表出口活着,故单独成列/字段。
 	EgressStatus string `json:"egress_status,omitempty"` // ready | offline | notready | unknown
@@ -1317,12 +1441,30 @@ type psRow struct {
 	statusDisplay string
 }
 
+// psRowFormat 是 relay ps 表格的行格式。独立成常量以便表头与行共用同一列宽(R20 的 RESTART 列
+// 必须与每一行对齐;表头由 psHeader 渲染,行由 runPs 逐行套用)。
+const psRowFormat = "%-8s %-12s %-16s %-30s %-16s %-8s %-6s %-16s %s\n"
+
+// psHeader 渲染 relay ps 的表头行。独立成函数以便单测钉住 R20 的 RESTART 列位置。
+func psHeader() string {
+	return fmt.Sprintf(psRowFormat, "TYPE", "TASK ID", "NODE", "STATUS", "PORTS", "RESTART", "EXIT", "CREATED", "COMMAND")
+}
+
 // displayStatus 返回表格用的 STATUS 单元格:叠加了出口就绪时用叠加文案,否则用纯 status。
 func (r psRow) displayStatus() string {
 	if r.statusDisplay != "" {
 		return r.statusDisplay
 	}
 	return r.Status
+}
+
+// portDisplay 渲染一条端口转发规格用于 ps 的 PORTS 列。历史形态(回环绑定)保持字节一致,
+// 非回环时前缀绑定主机(如 "0.0.0.0:8080"),让发布面在展示上也可见(R21/KTD9)。
+func portDisplay(s portfwd.Spec) string {
+	if isLoopbackAddr(s.BindHost) {
+		return s.String()
+	}
+	return s.BindHost + ":" + s.String()
 }
 
 // taskToPSRow 把一个远端 detach 任务投影为统一行。纯函数,便于单测。
@@ -1332,20 +1474,30 @@ func taskToPSRow(t backend.TaskInfo) psRow {
 	if nodeDisp == "" {
 		nodeDisp = "(unknown)"
 	}
-	portsDisp := "-"
-	if len(t.Ports) > 0 {
-		portsDisp = strings.Join(t.Ports, ",")
-		if len(portsDisp) > 16 {
-			portsDisp = portsDisp[:13] + "..."
-		}
+	// 从结构化记录渲染:回环绑定显示与历史一致的端口形态,非回环时补上绑定面,
+	// 使 0.0.0.0 这类发布面在 ps 里可见(R21/KTD9)。portDisplay 从不返回空串,故无端口时
+	// 由 orDash 落到占位符。
+	parts := make([]string, len(t.Ports))
+	for i, p := range t.Ports {
+		parts[i] = portDisplay(p)
+	}
+	portsDisp := orDash(strings.Join(parts, ","))
+	if len(portsDisp) > 16 {
+		portsDisp = portsDisp[:13] + "..."
 	}
 	exitDisp := "-"
-	if t.Status != "running" {
+	if t.Status != taskStatusRunning {
 		exitDisp = fmt.Sprintf("%d", t.ExitCode)
 	}
 	cmdDisp := t.Cmd
 	if len(cmdDisp) > 35 {
 		cmdDisp = cmdDisp[:32] + "..."
+	}
+	// CREATED 取首次创建时间而非最近一次启动(R12):重启不重置 CREATED。老执行方上行 CreatedAt=0
+	// 时回退到最近一次启动时间(与既有展示一致)。
+	createdAt := t.StartTime
+	if t.CreatedAt != 0 {
+		createdAt = t.CreatedAt
 	}
 	return psRow{
 		Type:    "task",
@@ -1354,8 +1506,9 @@ func taskToPSRow(t backend.TaskInfo) psRow {
 		Status:  t.Status,
 		Ports:   portsDisp,
 		Exit:    exitDisp,
-		Created: formatRelativeTime(time.Unix(t.StartTime, 0)),
+		Created: formatRelativeTime(time.Unix(createdAt, 0)),
 		Command: cmdDisp,
+		Restart: t.Restart,
 	}
 }
 
@@ -1481,18 +1634,19 @@ func runPs() {
 		}
 	}
 
-	// 本地隧道只在 node 在运行时才可能被持有;node 未运行即视为无隧道(不隐式拉起)。
+	// 本地隧道:node 在运行时问 holder(内存态是权威),node 未运行时降级读意图文件并把 state
+	// 一律标成 stopped(R19)—— 没有任何进程持有监听,文件里残留的 running 已不再成立。
+	// 无 -a 时 stopped 隧道照旧不出现在表里(filterTunnels 语义不变),所以 node 未运行且没给 -a
+	// 的时候连文件都不读:读出来的东西注定被丢弃。
 	var tunnels []tunnelState
-	if daemon.Get(daemon.PidFile("node")).Running {
-		resp, terr := sendTunnelControl(tunnelSockPath(), tunControlMsg{Op: tunOpList})
-		switch {
-		case terr != nil:
+	nodeRunning := nodeDaemonRunning()
+	if nodeRunning || *psAll {
+		var terr error
+		tunnels, terr = tunnelStatesForRead(tunnelStatePath(), tunnelSockPath(), nodeRunning)
+		if terr != nil {
 			fmt.Fprintf(os.Stderr, "Warning: list local tunnels: %v\n", terr)
-		case !resp.OK:
-			fmt.Fprintf(os.Stderr, "Warning: list local tunnels: %s\n", resp.Error)
-		default:
-			tunnels = filterTunnels(resp.Tunnels, targetNode, *psAll)
 		}
+		tunnels = filterTunnels(tunnels, targetNode, *psAll)
 	}
 
 	// 合并:任务行在前,隧道行在后。出口探测只在确有运行中的隧道时才发(一次中转查询,1.5s 上限),
@@ -1530,9 +1684,9 @@ func runPs() {
 		return
 	}
 
-	fmt.Printf("%-8s %-12s %-16s %-30s %-16s %-6s %-16s %s\n", "TYPE", "TASK ID", "NODE", "STATUS", "PORTS", "EXIT", "CREATED", "COMMAND")
+	fmt.Print(psHeader())
 	for _, r := range rows {
-		fmt.Printf("%-8s %-12s %-16s %-30s %-16s %-6s %-16s %s\n", r.Type, r.ID, r.Node, r.displayStatus(), r.Ports, r.Exit, r.Created, r.Command)
+		fmt.Printf(psRowFormat, r.Type, r.ID, r.Node, r.displayStatus(), r.Ports, r.Restart, r.Exit, r.Created, r.Command)
 	}
 }
 
@@ -1557,53 +1711,38 @@ func runLogs() {
 		os.Exit(1)
 	}
 
-	ctx := context.Background()
+	tb := taskSupervisorBackend(cfg)
 	targetNode := resolveNodeTarget(*logsNode, *logsExec)
+	nodeRunning := nodeDaemonRunning()
 
-	// 后端建不出来(中转不可达)时降级:隧道日志完全在本地、不经中转,应仍可查看。
-	var tb backend.TaskSupervisorBackend
-	if b, berr := getBackendWithAdaptiveLoopback(cfg); berr != nil {
-		fmt.Fprintf(os.Stderr, "Warning: create backend: %v\n", berr)
-	} else if x, ok := b.(backend.TaskSupervisorBackend); ok {
-		tb = x
-	} else {
-		fmt.Fprintf(os.Stderr, "Warning: backend does not support task supervisor\n")
-	}
-
-	// 显式给了 -e/-w 且后端可用时按任务直接寻址(与 runStop 同构),不做任务名解析;
-	// 只有在未指定目标时才在任务台账里反查节点,查不到即回退到本地隧道日志。
-	knownTask := targetNode != "" && tb != nil
-	if targetNode == "" && tb != nil {
-		if tasks, err := tb.TaskList(ctx, "", true); err == nil {
-			for _, t := range tasks {
-				if t.ID == *logsTaskID {
-					targetNode = t.Node
-					knownTask = true
-					break
-				}
+	// 名字解析(KTD8):任务清单(含已停止,all=true)优先,再本机 holder,最后意图文件。后端建不出来
+	// (中转不可达)时降级:隧道日志完全在本地、不经中转,应仍可查看。
+	listCtx, cancelList := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelList()
+	res := resolveLifecycle(*logsTaskID, lifecycleDepsFor(listCtx, tb, targetNode, nodeRunning))
+	switch res.Kind {
+	case lifecycleKindTask:
+		err := tb.TaskLogs(context.Background(), res.Node, res.Task.ID, *logsFollow, *logsTail, func(chunk backend.ExecChunk) {
+			if chunk.Stdout {
+				os.Stdout.WriteString(chunk.Data)
+			} else {
+				os.Stderr.WriteString(chunk.Data)
 			}
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "logs failed: %v\n", err)
+			os.Exit(1)
 		}
-	}
-	if !knownTask {
-		// 先问本地 node 的隧道持有者:隧道是否存在以 holder 为准,而不是日志里有没有匹配行。
-		// 新开且健康的隧道不会写任何 `[tunnel <egress>]` 前缀行,用「零命中」反推「不是隧道」
-		// 会把 `relay logs <egress> -f` 这个最常用的场景判死。
-		if tunnelEgressKnown(*logsTaskID) {
-			showTunnelLogs(*logsTaskID, *logsFollow, *logsTail)
-			return
+	case lifecycleKindTunnel:
+		// R19:意图文件确认它存在,但没有持有者在写日志 —— 如实说「node 未运行」,而不是「没有这个
+		// 任务或隧道」。node 在运行时走既有日志呈现(零匹配行 = 尚无输出,见 showTunnelLogs)。
+		if !res.NodeRunning {
+			fmt.Fprintf(os.Stderr, "logs failed: local node is not running; %s is a persisted tunnel intent (start the node with `relay node start` to see its log)\n", *logsTaskID)
+			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "logs failed: no task or tunnel named %s\n", *logsTaskID)
-		os.Exit(1)
-	}
-	err = tb.TaskLogs(ctx, targetNode, *logsTaskID, *logsFollow, *logsTail, func(chunk backend.ExecChunk) {
-		if chunk.Stdout {
-			os.Stdout.WriteString(chunk.Data)
-		} else {
-			os.Stderr.WriteString(chunk.Data)
-		}
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "logs failed: %v\n", err)
+		showTunnelLogs(*logsTaskID, *logsFollow, *logsTail)
+	default:
+		fmt.Fprintf(os.Stderr, "logs failed: %v\n", lifecycleUnresolvedError(*logsTaskID, res))
 		os.Exit(1)
 	}
 }
@@ -1615,8 +1754,85 @@ func runStop() {
 		os.Exit(1)
 	}
 
-	// 后端建不出来(中转不可达)时降级:本地隧道不经中转,必须仍能停掉并释放监听端口,
-	// 故这里只告警不退出,与 runPs/runLogs 同一姿态。远端任务停不掉只能如实报错。
+	tb := taskSupervisorBackend(cfg)
+	targetNode := resolveNodeTarget(*stopNode, *stopExec)
+	nodeRunning := nodeDaemonRunning()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 名字解析(KTD8):任务清单(含已停止)优先,再本机 holder,最后意图文件。后端建不出来
+	// (中转不可达)时降级:本地隧道不经中转,必须仍能停掉并释放监听端口。
+	res := resolveLifecycle(*stopTaskID, lifecycleDepsFor(ctx, tb, targetNode, nodeRunning))
+	switch res.Kind {
+	case lifecycleKindTask:
+		if err := tb.TaskStop(ctx, res.Node, res.Task.ID); err != nil {
+			// 兜底:ID 也可能恰是一条隧道 egress。任务停不掉时再试一次本地隧道,能关掉就不算失败。
+			if stopSucceeded(stopLocalTunnel(tunnelStatePath(), tunnelSockPath(), *stopTaskID, nodeRunning)) {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "stop failed: task %s on executor %s: %v\n", res.Task.ID, res.Node, err)
+			os.Exit(1)
+		}
+		fmt.Printf("Stopped task %s\n", res.Task.ID)
+
+		// 联动撤销本地 node 持有的对应端口转发(若存在):远端任务已停,释放本机监听。
+		// 仅当本机 node daemon 在运行(其 holder 才持有本地转发)时尝试 unregister;node 未运行
+		// (含 kill -9 残留的陈旧 socket)时该任务本就没有本地转发,静默跳过避免误导性告警。
+		if nodeRunning {
+			if err := sendForwardUnregister(forwardSockPath(), res.Task.ID); err != nil {
+				fmt.Fprintf(os.Stderr, "WARNING: failed to stop local port-forward for task %s: %v\n", res.Task.ID, err)
+			}
+		}
+	case lifecycleKindTunnel:
+		// R2:已停止的隧道再停一次不算失败,但名字得还在(holder 或意图文件里);意图移除照常生效(R18)。
+		// 「关不掉」(holder 不可达/拒绝)与「名字不在」必须分开答复:名字上一刻才刚解析出来,
+		// 把传输失败说成「没有这个对象」会把操作者推去重建,而旧监听还占着端口(R21 隧道侧)。
+		out, err := stopLocalTunnel(tunnelStatePath(), tunnelSockPath(), res.State.Egress, nodeRunning)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "stop failed: %v\n", err)
+			os.Exit(1)
+		}
+		if !stopSucceeded(out, nil) {
+			fmt.Fprintf(os.Stderr, "stop failed: no task or tunnel named %s\n", *stopTaskID)
+			os.Exit(1)
+		}
+	default:
+		// 名字解析不到对象时,仍可能有一个旧版 per-egress `tunnel-<egress>` daemon 占着监听地址
+		// (创建失败时打印的提示正是让人来跑这条命令,见 tunnelLegacyDaemonHint)。这里就地清掉它,
+		// 让那条提示成真;确有进程被停时就不再报「没有这个对象」—— 那会与刚完成的动作自相矛盾(#8)。
+		if stopLegacyTunnelDaemon(*stopTaskID) {
+			fmt.Printf("stopped legacy tunnel daemon %s (no task or node-held tunnel has that name)\n", *stopTaskID)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "stop failed: %v\n", lifecycleUnresolvedError(*stopTaskID, res))
+		os.Exit(1)
+	}
+}
+
+// nodeDaemonRunning 是「本机 node daemon 是否在运行」在 CLI 侧的判据:node.pid 说在跑,或
+// 隧道控制 socket 能拨通(同一个探针,ensureLocalRelayNode 也以它作为就绪信号)。只认 pid 文件会
+// 把前台 `relay node run` 判成「没在跑」—— 它不写 node.pid,但 holder 确实在监听,于是 ps/stop/
+// restart 全去读改过期的意图文件。抽成包级变量供单测注入:node 未运行的分支在真机上无法安全构造
+// (会去拨真实的 ~/.relay/tunnel.sock / 改真实的 ~/.relay/tunnels.json),测试须临时替换它并还原
+// —— 与 relaybackend.SetExecutorRole 同一姿态。socket 不存在时 unix 拨号立即失败,不开销。
+// ensureLocalRelayNode 另有自己的 daemon.Get 调用:它需要拿到具体的错误好把「起不来」的原因
+// 讲清楚,不只是一个是/否。
+var nodeDaemonRunning = func() bool {
+	if daemon.Get(daemon.PidFile("node")).Running {
+		return true
+	}
+	conn, err := net.DialTimeout("unix", tunnelSockPath(), time.Second)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// taskSupervisorBackend 尽力而为地构造任务后端(TaskSupervisorBackend):建不出来(中转不可达)
+// 或后端不支持时只告警不退出,调用方自行降级 —— 本地隧道不经中转,列出/停止/看日志必须照常可用。
+func taskSupervisorBackend(cfg *config.Config) backend.TaskSupervisorBackend {
 	var tb backend.TaskSupervisorBackend
 	if b, berr := getBackendWithAdaptiveLoopback(cfg); berr != nil {
 		fmt.Fprintf(os.Stderr, "Warning: create backend: %v\n", berr)
@@ -1625,68 +1841,355 @@ func runStop() {
 	} else {
 		fmt.Fprintf(os.Stderr, "Warning: backend does not support task supervisor\n")
 	}
+	return tb
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+// lifecycleKind 是名字解析出的对象种类。
+type lifecycleKind int
 
-	targetNode := resolveNodeTarget(*stopNode, *stopExec)
-	if targetNode == "" && tb != nil {
-		if tasks, err := tb.TaskList(ctx, "", true); err == nil {
-			for _, t := range tasks {
-				if t.ID == *stopTaskID {
-					targetNode = t.Node
-					break
-				}
+const (
+	lifecycleKindUnknown lifecycleKind = iota
+	lifecycleKindTask
+	lifecycleKindTunnel
+)
+
+// lifecycleTarget 是一次名字解析的结果。判别式的 struct 而非裸字符串:调用方需要据此给出三种
+// 不同的答复 —— 名字不存在(R1 的创建提示)、任务在不可达的执行方上(R4 的「可能离线、用 -e」)、
+// 隧道而本机 node 未运行(R4/R19 的降级说明,不静默)。
+type lifecycleTarget struct {
+	Kind lifecycleKind
+
+	// 任务侧(Kind == lifecycleKindTask):Node 是执行方 executor_id(隧道侧不设,身份取 State.Egress),
+	// Task 是任务记录(带 Ports/Status/Restart/CreatedAt,R13/R20 据此补登记与呈现)。
+	Node string
+	Task backend.TaskInfo
+
+	// 隧道侧(Kind == lifecycleKindTunnel):身份取自 State.Egress(Node 只承载任务侧的执行方),
+	// State 是 holder 或意图文件里的现状,NodeRunning 说明本机 node 当时是否在运行
+	// (未运行时 State 已被降级标成 stopped)。
+	State       tunnelState
+	NodeRunning bool
+
+	// Target 是用户用 -e/--node 显式指明的执行方(空 = 未指明,靠清单反查)。
+	Target string
+	// Unreachable 非空表示「查不到」不是「不存在」,而是清单/现状根本问不到(执行方离线或中转
+	// 不可达)。此时按 R4 报「该执行方可能离线、可用 -e 指定」,不提示重建。
+	Unreachable string
+}
+
+// lifecycleDeps 是名字解析的外部依赖(任务清单与本机隧道现状),抽成函数值以便单测注入,
+// 不必凭空构造一个在线 node 或真中转。
+type lifecycleDeps struct {
+	Target      string
+	NodeRunning bool
+	ListTasks   func() ([]backend.TaskInfo, error)
+	Tunnels     func() ([]tunnelState, error)
+}
+
+// taskBackendUnavailable 是「任务后端问不到」的唯一措辞:中转不可达,或后端不支持任务监管。
+// 名字解析与各调用点共用同一句,同一种情形不再有好几种拼法。
+const taskBackendUnavailable = "task backend unavailable (transit unreachable?)"
+
+// lifecycleDepsFor 构造生命周期动词共用的名字解析依赖(KTD8):任务清单(含已停止,all=true)优先,
+// 本机 holder 与意图文件兜底。ctx 由调用方给,各条命令各自持有自己的时限,不互相延长。
+func lifecycleDepsFor(ctx context.Context, tb backend.TaskSupervisorBackend, target string, nodeRunning bool) lifecycleDeps {
+	return lifecycleDeps{
+		Target:      target,
+		NodeRunning: nodeRunning,
+		ListTasks: func() ([]backend.TaskInfo, error) {
+			if tb == nil {
+				return nil, errors.New(taskBackendUnavailable)
 			}
-		}
-	}
-	// ID 不是已知任务(或后端不可用):退回本地 node 持有的隧道(egress 身份,如 `relay stop eg-node`)。
-	if targetNode == "" || tb == nil {
-		if stopLocalTunnel(*stopTaskID) {
-			return
-		}
-		if tb == nil {
-			fmt.Fprintf(os.Stderr, "stop failed: backend unavailable and no local tunnel named %s\n", *stopTaskID)
-			os.Exit(1)
-		}
-		fmt.Fprintf(os.Stderr, "stop failed: no task or tunnel named %s\n", *stopTaskID)
-		os.Exit(1)
-	}
-	if err := tb.TaskStop(ctx, targetNode, *stopTaskID); err != nil {
-		// 兜底:ID 也可能恰是一条隧道 egress。任务停不掉时再试一次本地隧道,能关掉就不算失败。
-		if stopLocalTunnel(*stopTaskID) {
-			return
-		}
-		fmt.Fprintf(os.Stderr, "stop failed: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("Stopped task %s\n", *stopTaskID)
-
-	// 联动撤销本地 node 持有的对应端口转发(若存在):远端任务已停,释放本机监听。
-	// 仅当本机 node daemon 在运行(其 holder 才持有本地转发)时尝试 unregister;node 未运行
-	// (含 kill -9 残留的陈旧 socket)时该任务本就没有本地转发,静默跳过避免误导性告警。
-	if d := daemon.Get(daemon.PidFile("node")); d.Running {
-		if err := sendForwardUnregister(forwardSockPath(), *stopTaskID); err != nil {
-			fmt.Fprintf(os.Stderr, "WARNING: failed to stop local port-forward for task %s: %v\n", *stopTaskID, err)
-		}
+			return tb.TaskList(ctx, target, true)
+		},
+		Tunnels: func() ([]tunnelState, error) {
+			return tunnelStatesForRead(tunnelStatePath(), tunnelSockPath(), nodeRunning)
+		},
 	}
 }
 
-// stopLocalTunnel 关闭本地 node 持有的一条隧道(供 relay stop 复用)。node 未运行、socket
-// 不可达或 holder 未命中该 egress 时均返回 false(调用方据此回落到原有的报错路径)。
-func stopLocalTunnel(egress string) bool {
-	if egress == "" {
-		return false
+// resolveLifecycle 按对象名解析(KTD8/R3):先任务清单(含已停止的,all=true),再本机 holder,
+// 最后意图文件;同名同时命中任务与隧道时任务优先,沿用 runLogs/runStop 的既有顺序。三种
+// 「查不到」被区分开(R1/R4),调用方各按其措辞答复。
+func resolveLifecycle(name string, deps lifecycleDeps) lifecycleTarget {
+	out := lifecycleTarget{NodeRunning: deps.NodeRunning, Target: deps.Target}
+	if name == "" {
+		return out
 	}
-	if !daemon.Get(daemon.PidFile("node")).Running {
-		return false
+	if deps.ListTasks == nil {
+		out.Unreachable = taskBackendUnavailable
+	} else if tasks, err := deps.ListTasks(); err != nil {
+		out.Unreachable = err.Error()
+	} else {
+		for _, t := range tasks {
+			if t.ID == name {
+				node := t.Node
+				if node == "" {
+					node = deps.Target
+				}
+				return lifecycleTarget{Kind: lifecycleKindTask, Node: node, Task: t, Target: deps.Target, NodeRunning: deps.NodeRunning}
+			}
+		}
 	}
-	resp, err := sendTunnelControl(tunnelSockPath(), tunControlMsg{Op: tunOpClose, Egress: egress})
-	if err != nil || !resp.OK {
-		return false
+	// 第二、三级:本机隧道 —— node 在运行时问 holder,未运行时读意图文件。清单都问不到
+	// (Unreachable)时仍继续查隧道:本地隧道不经中转,停/看日志必须照常可用(R4 的隧道侧)。
+	if deps.Tunnels != nil {
+		states, err := deps.Tunnels()
+		if err == nil {
+			for _, st := range states {
+				if st.Egress == name {
+					return lifecycleTarget{Kind: lifecycleKindTunnel, State: st, Target: deps.Target, NodeRunning: deps.NodeRunning}
+				}
+			}
+		} else if out.Unreachable == "" {
+			out.Unreachable = err.Error()
+		}
 	}
-	fmt.Printf("Stopped tunnel %s\n", egress)
-	return true
+	return out
+}
+
+// lifecycleCreateHint 是可创建对象的两种方式,任务与隧道并列给出(R1)。
+const lifecycleCreateHint = "`relay run <cmd> -d` (task) or `relay run -t tunnel -p <[host:]port> -e <egress>` (tunnel)"
+
+// lifecycleUnresolvedError 生成「名字解析不到对象」的说明文案(R1/R4)。返回的文案不含动词前缀,
+// 由调用方补「start failed: 」这类头。四种情形分别答复:
+//   - 用户用 -e/--node 限定了执行方且它答了话 → 确定的「这个执行方上没有这个名字」,带 id(R4);
+//   - 用户限定了执行方但问不到 → 带 id + 可能离线(R4),同样不提示重建;
+//   - 清单/现状问不到 → 执行方可能离线、可用 -e 指定,不提示重建(R4);
+//   - 都能问但名字不在其中 → 不把「查不到」说成「不存在」(R4),并给出创建方式(R1)。
+func lifecycleUnresolvedError(name string, t lifecycleTarget) string {
+	switch {
+	case t.Target != "" && t.Unreachable == "":
+		return fmt.Sprintf("no task or tunnel named %q (task lookup was limited to executor %q); to create one: %s", name, t.Target, lifecycleCreateHint)
+	case t.Target != "":
+		return fmt.Sprintf("cannot look up %q on executor %q: %s (that executor may be offline)", name, t.Target, t.Unreachable)
+	case t.Unreachable != "":
+		return fmt.Sprintf("cannot look up %q: %s (the executor may be offline; pass -e/--executor <executor_id> to address it directly)", name, t.Unreachable)
+	default:
+		return fmt.Sprintf("no task or tunnel named %q found (an offline executor's tasks cannot be listed this way; use -e/--executor <executor_id> to address one directly); to create one: %s", name, lifecycleCreateHint)
+	}
+}
+
+// lifecycleVerb 是根级两个「让对象跑起来」的动词:start 对已在运行的任务不重启(R2),
+// restart 总是先停掉再重开(R9/R11)。
+type lifecycleVerb int
+
+const (
+	verbStart lifecycleVerb = iota
+	verbRestart
+)
+
+func (v lifecycleVerb) String() string {
+	if v == verbStart {
+		return "start"
+	}
+	return "restart"
+}
+
+func (v lifecycleVerb) pastTense() string {
+	if v == verbStart {
+		return "Started"
+	}
+	return "Restarted"
+}
+
+// taskStatusRunning 是任务记录里「运行中」的状态值(supervisor 的 TaskStatusRunning)。
+const taskStatusRunning = "running"
+
+// runStart 是根级 `relay start`(R1/R2/R13):让一个已存在的任务或隧道恢复运行。
+func runStart() { runLifecycleVerb(verbStart) }
+
+// runRestart 是根级 `relay restart`(R9):让一个已存在的任务或隧道按记录重开。
+func runRestart() { runLifecycleVerb(verbRestart) }
+
+// runLifecycleVerb 是 start/restart 两个根级动词的共享骨架:按名字解析(KTD8) → 分派到任务侧
+// (经中转下发 U1 的 MsgTaskRestart)或隧道侧(经本机 holder 控制消息),再按 R13 幂等补登记
+// 本机转发规则。任何一步失败都以非零码退出(R4 任务侧;隧道侧在 node 未运行时降级说明)。
+func runLifecycleVerb(verb lifecycleVerb) {
+	name, execVal, nodeVal := *startTarget, *startExec, *startNode
+	if verb == verbRestart {
+		name, execVal, nodeVal = *restartTarget, *restartExec, *restartNode
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+	tb := taskSupervisorBackend(cfg)
+	target := resolveNodeTarget(nodeVal, execVal)
+	nodeRunning := nodeDaemonRunning()
+
+	listCtx, cancelList := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelList()
+	res := resolveLifecycle(name, lifecycleDepsFor(listCtx, tb, target, nodeRunning))
+	switch res.Kind {
+	case lifecycleKindTask:
+		if err := runTaskLifecycle(verb, cfg, tb, res); err != nil {
+			fmt.Fprintf(os.Stderr, "%s failed: %v\n", verb, err)
+			os.Exit(1)
+		}
+	case lifecycleKindTunnel:
+		if err := runTunnelLifecycle(verb, cfg, res); err != nil {
+			fmt.Fprintf(os.Stderr, "%s failed: %v\n", verb, err)
+			os.Exit(1)
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "%s failed: %v\n", verb, lifecycleUnresolvedError(name, res))
+		os.Exit(1)
+	}
+}
+
+// applyTaskLifecycle 是任务动词的动作部分(纯决策 + 一次协议调用,便于单测断言 R2 的「不重启」):
+// start 作用于已在运行的任务时不重启、不报错,但仍返回端口规格供调用方按 R13 补登记转发;
+// 否则下发同 id 重启(U1 的 MsgTaskRestart,R9)。返回是否真的重新下发。
+func applyTaskLifecycle(verb lifecycleVerb, tb backend.TaskSupervisorBackend, node string, task backend.TaskInfo) ([]portfwd.Spec, bool, error) {
+	if verb == verbStart && task.Status == taskStatusRunning {
+		return task.Ports, false, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := tb.TaskRestart(ctx, node, task.ID); err != nil {
+		return nil, false, fmt.Errorf("task %s on executor %s: %w", task.ID, node, err)
+	}
+	return task.Ports, true, nil
+}
+
+// runTaskLifecycle 对解析出的任务记录执行 start/restart 并补登记本机转发(R13)。tb 在解析到任务
+// 时非 nil(清单查询成功过),这里仍防御性判空以免未来调用点失守。
+func runTaskLifecycle(verb lifecycleVerb, cfg *config.Config, tb backend.TaskSupervisorBackend, res lifecycleTarget) error {
+	if tb == nil {
+		return errors.New(taskBackendUnavailable)
+	}
+	ports, restarted, err := applyTaskLifecycle(verb, tb, res.Node, res.Task)
+	if err != nil {
+		return err
+	}
+	if !restarted {
+		// R2:已在运行的对象不重启、不报错 —— 但仍按 R13 补登记本机转发规则(本机 node 重启后
+		// 恢复端口的唯一路径),故这里绝不提前返回。
+		fmt.Printf("task %s is already running (node %s)\n", res.Task.ID, res.Node)
+	} else {
+		fmt.Printf("%s task %s (node %s)\n", verb.pastTense(), res.Task.ID, res.Node)
+	}
+	// R13/R21:按任务记录里的完整端口规格(含绑定主机)幂等重登记本机转发 —— stop 之后再 start、
+	// 或本机 node 重启之后再 start,已发布的本地端口都按原绑定面恢复可用。
+	return reRegisterTaskForwards(cfg, forwardSockPath(), res.Task.ID, res.Node, ports, res.NodeRunning)
+}
+
+// reRegisterTaskForwards 按任务记录里的端口规格(含绑定主机)幂等重登记本机转发规则(R13/KTD5):
+// 先确保本地 node(转发持有者)在线,再经 forward.sock 下发 register。措辞与非零退出姿态与
+// detach 创建路径完全一致(见 sendForwardRegister 的调用处)。空规格直接返回。
+// nodeRunning 由调用方传入:已知本机 node 在运行时不必再拨一次控制 socket 探活,register 自己
+// 就会连上去 —— 那是同一个注册动作的第二次连接。
+func reRegisterTaskForwards(cfg *config.Config, sockPath, taskID, node string, specs []portfwd.Spec, nodeRunning bool) error {
+	if len(specs) == 0 {
+		return nil
+	}
+	if !nodeRunning {
+		if err := ensureLocalRelayNode(cfg, sockPath); err != nil {
+			return fmt.Errorf("port-forward: %w", err)
+		}
+	}
+	ptrs := make([]*PortForwardSpec, 0, len(specs))
+	for i := range specs {
+		ptrs = append(ptrs, &specs[i])
+	}
+	registered, rejected, err := sendForwardRegister(sockPath, taskID, node, ptrs)
+	if err != nil {
+		return fmt.Errorf("port-forward register error: %w", err)
+	}
+	warnNonLoopbackForwards(ptrs, registered)
+	reportForwardRegistration(registered, rejected, taskID)
+	return nil
+}
+
+// reportForwardRegistration 回显一次转发登记的落地情况:仍然在听的地址打到 stdout,被拒绝的
+// 打到 stderr。detach 创建路径与 R13 的补登记路径共用同一份措辞。
+func reportForwardRegistration(registered, rejected []string, taskID string) {
+	for _, a := range registered {
+		fmt.Printf("➜ [port-forward] %s still listening (task %s)\n", a, taskID)
+	}
+	for _, r := range rejected {
+		fmt.Fprintf(os.Stderr, "WARNING: %s (task %s)\n", r, taskID)
+	}
+}
+
+// warnNonLoopbackForwards 在调用方的 stderr 上逐条打印非 loopback 绑定的告警。holder 侧也记一条
+// 到 node.log,但那是 node 的 stderr(daemon 已重定向),发起者本人看不到,故非前台(经 holder 注册)
+// 的路径必须由 CLI 自己复述 —— 措辞与前台的 StartPortForwardsForeground 完全一致,同一件事不再有
+// 两种说法。前台路径自己已告警,不在调用点重复。
+// 只对 registered 里确实在听的地址告警:被 holder 拒绝(端口冲突、绑定失败)的规格从未监听,
+// 报「listening on ...」是假告警,而紧随其后的拒绝告警已经说明了原因(address 生成方式与
+// holder 的 opRegister 相同,故可直接比对)。
+func warnNonLoopbackForwards(specs []*PortForwardSpec, registered []string) {
+	listening := make(map[string]struct{}, len(registered))
+	for _, a := range registered {
+		listening[a] = struct{}{}
+	}
+	for _, spec := range specs {
+		if isLoopbackAddr(spec.BindHost) {
+			continue
+		}
+		addr := fmt.Sprintf("%s:%d", spec.BindHost, spec.LocalPort)
+		if _, ok := listening[addr]; !ok {
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "WARNING: listening on %q (non-loopback). This port has no auth.\n", addr)
+	}
+}
+
+// runTunnelLifecycle 对解析出的隧道执行 start/restart(动作在 CLI 侧没有 create 语义,名字必须
+// 已由 resolveLifecycle 解析出来,R1)。start 可以把 node 拉起来(与 `relay run -t tunnel` 一致);
+// restart 在 node 未运行时直接报错 —— 没有可重开的东西,不隐式拉起(R4 隧道侧)。
+func runTunnelLifecycle(verb lifecycleVerb, cfg *config.Config, res lifecycleTarget) error {
+	t := res.State
+	if verb == verbStart {
+		return startTunnel(cfg, t.Egress, t.Listen, t.Restart, os.Stderr)
+	}
+	if !res.NodeRunning {
+		return fmt.Errorf("local node is not running; nothing to restart for %s (start it with `relay node start`, then `relay start %s`)", t.Egress, t.Egress)
+	}
+	resp, err := sendTunnelControl(tunnelSockPath(), tunControlMsg{Op: tunOpRestart, Egress: t.Egress})
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("restart tunnel %s: %s", t.Egress, resp.Error)
+	}
+	// 重开的是意图文件里记下的监听面:非 loopback 时与创建路径(warnw)一样由 CLI 复述告警,
+	// 否则 `relay restart <egress>` 会静默地把一个无认证入口重新挂上网。
+	if !isLoopbackAddr(t.Listen) {
+		fmt.Fprint(os.Stderr, tunnelNonLoopbackWarning(t.Listen))
+	}
+	if resp.Warning != "" {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", resp.Warning)
+	}
+	fmt.Printf("tunnel %s restarted\n", t.Egress)
+	return nil
+}
+
+// tunnelStatesForRead 返回本机 node 侧可读的隧道现状(KTD8 的隧道两级来源):node 在运行时问
+// holder(内存态是权威,含已停止条目);node 未运行时降级读意图文件并把 state 一律标成 stopped
+// (R19:没有任何进程持有监听,文件里残留的 running 已不再成立)。
+func tunnelStatesForRead(statePath, sockPath string, nodeRunning bool) ([]tunnelState, error) {
+	if !nodeRunning {
+		states, err := loadTunnels(statePath)
+		if err != nil {
+			return nil, err
+		}
+		for i := range states {
+			states[i].State = "stopped"
+		}
+		return states, nil
+	}
+	resp, err := sendTunnelControl(sockPath, tunControlMsg{Op: tunOpList})
+	if err != nil {
+		return nil, err
+	}
+	if !resp.OK {
+		return nil, errors.New(resp.Error)
+	}
+	return resp.Tunnels, nil
 }
 
 // statusTimeout 是 `relay status` 单条命令的上限(含对中转 status 请求的等待)。

@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/user/relay/internal/portfwd"
 )
 
 type TaskStatus string
@@ -21,18 +23,24 @@ const (
 	StatusFailed  TaskStatus = "failed"
 )
 
-// TaskMeta 描述可序列化的任务元数据
+// TaskMeta 描述可序列化的任务元数据。
+// Ports 以结构化规格落盘(含绑定主机,R21);升级前记录的 ports 是展示字符串数组,
+// 由 portfwd.Spec 的反序列化按历史默认绑定 127.0.0.1 还原,旧记录无需迁移(KTD9)。
 type TaskMeta struct {
-	ID        string     `json:"id"`
-	Cmd       string     `json:"cmd"`
-	Cwd       string     `json:"cwd"`
-	PID       int        `json:"pid"`
-	Ports     []string   `json:"ports,omitempty"`
-	Status    TaskStatus `json:"status"`
-	ExitCode  int        `json:"exit_code"`
-	StartTime time.Time  `json:"start_time"`
-	EndTime   *time.Time `json:"end_time,omitempty"`
-	LogPath   string     `json:"log_path"`
+	ID        string         `json:"id"`
+	Cmd       string         `json:"cmd"`
+	Cwd       string         `json:"cwd"`
+	PID       int            `json:"pid"`
+	Ports     []portfwd.Spec `json:"ports,omitempty"`
+	Status    TaskStatus     `json:"status"`
+	ExitCode  int            `json:"exit_code"`
+	StartTime time.Time      `json:"start_time"`
+	EndTime   *time.Time     `json:"end_time,omitempty"`
+	LogPath   string         `json:"log_path"`
+	// Restart 是任务的 restart 策略（always|no）；空值按 no 读。首次运行或重启都保留记录。
+	Restart string `json:"restart,omitempty"`
+	// CreatedAt 是首次创建时间，重启时保持不变；StartTime 表示最近一次启动。
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Task 托管的后台运行任务
@@ -44,13 +52,18 @@ type Task struct {
 	logFile   *os.File
 	listeners map[chan string]struct{}
 	done      chan struct{}
+	// superseded 标记该任务对象已被同 id 的新实例取代:它的收尾不再写回记录。旧实例的收尾
+	// goroutine 在新实例落盘之后才 persist 时,会把 status/pid/end_time 覆盖回旧值,而两个
+	// Task 各持自己的锁,没有任何东西能给这两次写排序。
+	superseded bool
 }
 
 func newTask(id, cmdStr, cwd string, dir string) *Task {
 	return newTaskWithPorts(id, cmdStr, cwd, nil, dir)
 }
 
-func newTaskWithPorts(id, cmdStr, cwd string, ports []string, dir string) *Task {
+func newTaskWithPorts(id, cmdStr, cwd string, ports []portfwd.Spec, dir string) *Task {
+	now := time.Now()
 	return &Task{
 		meta: TaskMeta{
 			ID:        id,
@@ -58,7 +71,8 @@ func newTaskWithPorts(id, cmdStr, cwd string, ports []string, dir string) *Task 
 			Cwd:       cwd,
 			Ports:     ports,
 			Status:    StatusRunning,
-			StartTime: time.Now(),
+			StartTime: now,
+			CreatedAt: now,
 			LogPath:   filepath.Join(dir, "run.log"),
 		},
 		dir:       dir,
@@ -67,10 +81,33 @@ func newTaskWithPorts(id, cmdStr, cwd string, ports []string, dir string) *Task 
 	}
 }
 
+// Meta 返回任务元数据的副本。
 func (t *Task) Meta() TaskMeta {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.meta
+}
+
+// markSuperseded 声明该任务对象已被同 id 的新实例取代,其生命周期收尾不再写回 meta.json。
+// 仅由同 id 重启路径在拉起替代实例之前调用。
+func (t *Task) markSuperseded() {
+	t.mu.Lock()
+	t.superseded = true
+	t.mu.Unlock()
+}
+
+// setRestartPolicy 更新并持久化任务的 restart 策略。仅由显式的入站 relay stop 路径调用
+// (StopTaskAndClearPolicy);执行方优雅停机走 StopAll,绝不触碰策略(R7/KD5)。
+func (t *Task) setRestartPolicy(policy string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	// 记录里的旧值按同一规则读出来就是目标值时不必重写:空值与 no 语义相同,从没带过
+	// --restart 的任务被 stop 时不再产生第二次磁盘写。
+	if NormalizeRestart(t.meta.Restart) == NormalizeRestart(policy) {
+		return
+	}
+	t.meta.Restart = policy
+	_ = t.persist()
 }
 
 func (t *Task) broadcast(line string) {

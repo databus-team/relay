@@ -29,54 +29,42 @@ const (
 	handshakeTimeout = 10 * time.Second
 )
 
-// tunnelRestartPolicyValue 把 --restart/--no-restart 解析为标准策略值(always|no)。
-// --no-restart 是 --restart=no 的快捷方式(且优先);缺省与空值都归一为 no。
-func tunnelRestartPolicyValue() (string, error) {
-	if *tunnelNoRestart {
+// restartPolicyValue 把一对重启策略旗标(策略字符串 + --no-restart 布尔)归一为标准策略值
+// (always|no)。纯函数,不读全局旗标:relay run 的任务与隧道两种模式共用同一份校验,
+// --no-restart 优先,缺省与空值都归一为 no。
+func restartPolicyValue(policy string, noRestart bool) (string, error) {
+	if noRestart {
 		return tunRestartNo, nil
 	}
-	switch policy := strings.ToLower(strings.TrimSpace(*tunnelRestartPolicy)); policy {
+	switch p := strings.ToLower(strings.TrimSpace(policy)); p {
 	case "", tunRestartNo:
 		return tunRestartNo, nil
 	case tunRestartAlways:
 		return tunRestartAlways, nil
 	default:
-		return "", fmt.Errorf("invalid --restart %q (want always|no)", policy)
+		return "", fmt.Errorf("invalid --restart %q (want always|no)", p)
 	}
 }
 
-// runTunnelStart 启动一条由本地 node 持有的 SOCKS5 隧道:先确保 node(agent 角色)在线,
-// 再经 holder unix socket 下发 open 消息(携带 egress/listen/restart 策略)。只有 start 会
-// 自动拉起 node;stop/restart 只控制既有隧道,不隐式启动常驻进程。
-func runTunnelStart() error {
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
+// startTunnel 是隧道创建的共享动作:确保本机 node(holder)在线,再下发 open 控制消息。
+// 唯一入口是 `relay run -t tunnel`(KD6),控制消息代码不外分叉。
+func startTunnel(cfg *config.Config, target, listen, policy string, warnw io.Writer) error {
 	if cfg.Backend.Type != "relay" {
 		return fmt.Errorf("tunnel requires backend.type=relay, got %q", cfg.Backend.Type)
 	}
-
-	// 出口 node 选择:`-w` 是「执行方注册的节点身份 executor_id」(见 `relay status` 的
-	// `executors[].executor_id`),不是本地工作区名。
-	target, err := tunnelRequireExecutor()
-	if err != nil {
-		return err
-	}
-
-	policy, err := tunnelRestartPolicyValue()
-	if err != nil {
-		return err
-	}
-
 	if err := ensureLocalRelayNode(cfg, tunnelSockPath()); err != nil {
 		return err
 	}
+	return openTunnelViaHolder(tunnelSockPath(), target, listen, policy, warnw)
+}
 
-	resp, err := sendTunnelControl(tunnelSockPath(), tunControlMsg{
+// openTunnelViaHolder 经本地 node 的控制 unix socket 下发 open 并处理应答/告警。
+// warnw 接收非 loopback 与持久化告警(生产即调用方 stderr;测试可注入缓冲以断言文案)。
+func openTunnelViaHolder(sockPath, target, listen, policy string, warnw io.Writer) error {
+	resp, err := sendTunnelControl(sockPath, tunControlMsg{
 		Op:      tunOpOpen,
 		Egress:  target,
-		Listen:  *tunnelListen,
+		Listen:  listen,
 		Restart: policy,
 	})
 	if err != nil {
@@ -84,18 +72,24 @@ func runTunnelStart() error {
 	}
 	if !resp.OK {
 		// 最常见的失败是 holder 绑不上监听地址——多半是残留的旧 `tunnel-<egress>` 独立 daemon
-		// 还占着同一端口,附上可操作的清理提示。
+		// 还占着同一端口。此处就地清掉它(与 stop 的收尾同一动作,见 stopLegacyTunnelDaemon):
+		// create 刚失败,该 egress 既没有任务也没有持久化意图,提示里的 `relay stop <egress>`
+		// 解析不出对象、走不到 stopLocalTunnel,是条死路。清掉后如实报「已停掉,可重试」;
+		// 只有清不掉时才回落到原提示(仍保留 kill 兜底)。
+		if stopLegacyTunnelDaemon(target) {
+			return fmt.Errorf("start tunnel %s: %s; a legacy tunnel daemon %s was holding the listen address and has been stopped — retry the command", target, resp.Error, tunnelInstanceName(target))
+		}
 		return fmt.Errorf("start tunnel %s: %s%s", target, resp.Error, tunnelLegacyDaemonHint(target))
 	}
 	// 非 loopback 绑定 = 一个无认证、网络上任意主机可用的 SOCKS5 入口。holder 侧也会记一条到
 	// node.log,但那是 node 的 stderr(daemon 已重定向),发起者本人看不到,故 CLI 同样打到 stderr。
-	if !isLoopbackAddr(*tunnelListen) {
-		fmt.Fprint(os.Stderr, tunnelNonLoopbackWarning(*tunnelListen))
+	if !isLoopbackAddr(listen) {
+		fmt.Fprint(warnw, tunnelNonLoopbackWarning(listen))
 	}
 	if resp.Warning != "" {
-		fmt.Fprintf(os.Stderr, "Warning: %s\n", resp.Warning)
+		fmt.Fprintf(warnw, "Warning: %s\n", resp.Warning)
 	}
-	fmt.Printf("tunnel %s started: SOCKS5 on %s -> egress %s (restart=%s)\n", target, *tunnelListen, target, policy)
+	fmt.Printf("tunnel %s started: SOCKS5 on %s -> egress %s (restart=%s)\n", target, listen, target, policy)
 	return nil
 }
 
@@ -113,48 +107,91 @@ func tunnelLegacyDaemonHint(egress string) string {
 	if !st.Running {
 		return ""
 	}
-	return fmt.Sprintf("; a legacy tunnel daemon %s is still running (pid %d) and may hold the listen address — remove it with `relay tunnel stop -w %s` or `kill %d`", inst, st.Pid, egress, st.Pid)
+	return fmt.Sprintf("; a legacy tunnel daemon %s is still running (pid %d) and may hold the listen address — remove it with `relay stop %s` or `kill %d`", inst, st.Pid, egress, st.Pid)
 }
 
-// runTunnelStop 停止一条由本地 node 持有的隧道。node 未运行时视为「已经没有该隧道可停」,
-// 幂等成功;最后总是顺带清理可能残留的旧独立 tunnel daemon。
-func runTunnelStop() {
-	target, err := tunnelRequireExecutor()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return
+// stopLegacyTunnelDaemon 尽力停掉某 egress 对应的旧式独立 `tunnel-<egress>` daemon(已废弃的每出口
+// daemon 形态),返回是否确有进程被停。它是隧道 stop 的收尾与「创建失败时排除占位者」共用的同一份
+// 清理:egress 是执行方身份,可能含非法文件名字符,实例名由 tunnelInstanceName 净化。
+func stopLegacyTunnelDaemon(egress string) bool {
+	inst := tunnelInstanceName(egress)
+	if !daemon.Get(daemon.PidFile(inst)).Running {
+		return false
 	}
+	daemonStop(inst)
+	return true
+}
 
-	if !daemon.Get(daemon.PidFile("node")).Running {
-		// node 未运行:没有 holder 可下发 close,但持久化意图仍须移除。否则 `--restart=always`
-		// 的条目会在下次 node 启动时被 restore 重放,与「关闭并遗忘」(docker rm)语义相悖。
-		removed, rerr := removePersistedTunnel(tunnelStatePath(), target)
+// tunnelStopOutcome 是一次隧道停止请求的结果。区分「不认识这个名字」与「确实停掉了」,因为
+// R1(名字不存在要报错)与 R2(已停止的对象再停一次不算失败)对这两种情形要求不同的答复。
+type tunnelStopOutcome int
+
+const (
+	// tunnelStopUnknown:node 在运行但 holder 拒绝(没有该 egress / 传输失败)—— 名字不在。
+	// 拒绝/传输的底层原因不再被吞掉,随 err 一起交回调用方(见 stopLocalTunnel),便于区分报告。
+	tunnelStopUnknown tunnelStopOutcome = iota
+	// tunnelStopClosed:经 holder 关闭成功(关闭监听、在途连接并移除意图)。
+	tunnelStopClosed
+	// tunnelStopRemoved:node 未运行,仅从意图文件移除(R18)。
+	tunnelStopRemoved
+	// tunnelStopAbsent:node 未运行且意图文件里也没有 —— 已忘掉的对象。
+	tunnelStopAbsent
+)
+
+// stopSucceeded 报告一次隧道 stop 是否真的把对象停/忘掉了(R2 的幂等语义:Closed 与 Removed
+// 都算成功;Unknown/Absent 是「名字不在」,由调用方决定是否报错)。
+func stopSucceeded(out tunnelStopOutcome, err error) bool {
+	return err == nil && (out == tunnelStopClosed || out == tunnelStopRemoved)
+}
+
+// stopLocalTunnel 是本机隧道「停」的唯一实现(R18):node 在运行时经 holder 下发 close(关闭监听与
+// 在途连接、移除意图);node 未运行时降级为直接移除意图文件里的条目(否则 `--restart=always` 会在
+// 下次 node 启动时被 restore 重放,与「关闭并遗忘」(docker rm)语义相悖)。两条路径最后都清理可能
+// 残留的旧式独立 tunnel daemon。停不掉时(tunnelStopUnknown)第二个返回值带上底层原因——传输失败
+// 与 holder 拒绝都如实透出,不再塌缩成「名字不在」;成功/已停止/已忘掉三类结果的文案保持不变。
+// statePath/sockPath/nodeRunning 由调用方注入,便于在不碰真实
+// ~/.relay 的前提下覆盖 node 未运行这一分支(见 lifecycle_test.go)。
+func stopLocalTunnel(statePath, sockPath, egress string, nodeRunning bool) (tunnelStopOutcome, error) {
+	if egress == "" {
+		return tunnelStopUnknown, nil
+	}
+	// 旧部署形态的独立隧道 daemon(已废弃):若还在跑,一并清理,避免它继续占用监听地址
+	// (与旧每出口 daemon 时代的 stop 收尾一致)。egress 是执行方身份,可能含非法文件名字符,
+	// 实例名由 tunnelInstanceName 净化。
+	defer stopLegacyTunnelDaemon(egress)
+
+	if !nodeRunning {
+		// node 未运行:没有 holder 可下发 close,但持久化意图仍须移除。
+		removed, rerr := removePersistedTunnel(statePath, egress)
 		switch {
 		case rerr != nil:
-			fmt.Fprintf(os.Stderr, "Warning: remove persisted tunnel %s: %v\n", target, rerr)
+			fmt.Fprintf(os.Stderr, "Warning: remove persisted tunnel %s: %v\n", egress, rerr)
+			return tunnelStopUnknown, rerr
 		case removed:
-			fmt.Printf("node not running; removed persisted tunnel %s\n", target)
+			fmt.Printf("node not running; removed persisted tunnel %s\n", egress)
+			return tunnelStopRemoved, nil
 		default:
-			fmt.Printf("node not running; no tunnel for %s to stop\n", target)
-		}
-	} else {
-		resp, err := sendTunnelControl(tunnelSockPath(), tunControlMsg{Op: tunOpClose, Egress: target})
-		switch {
-		case err != nil:
-			fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
-		case !resp.OK:
-			fmt.Fprintf(os.Stderr, "Warning: stop tunnel %s: %s\n", target, resp.Error)
-		default:
-			if resp.Warning != "" {
-				fmt.Fprintf(os.Stderr, "Warning: %s\n", resp.Warning)
-			}
-			fmt.Printf("tunnel %s stopped\n", target)
+			fmt.Printf("node not running; no tunnel for %s to stop\n", egress)
+			return tunnelStopAbsent, nil
 		}
 	}
-
-	// 旧部署形态的独立隧道 daemon(已废弃):若还在跑,一并清理,避免它继续占用监听地址。
-	if legacy := daemon.Get(daemon.PidFile(tunnelInstanceName(target))); legacy.Running {
-		daemonStop(tunnelInstanceName(target))
+	resp, err := sendTunnelControl(sockPath, tunControlMsg{Op: tunOpClose, Egress: egress})
+	switch {
+	case err != nil:
+		// 传输层失败(控制 socket 不可达等):Warning 照打,但底层原因也随 err 交回调用方 ——
+		// 否则「停不掉」会与「名字不在」混为一谈(调用方只会报 no task or tunnel named X)。
+		fmt.Fprintf(os.Stderr, "Warning: stop tunnel %s: %v\n", egress, err)
+		return tunnelStopUnknown, err
+	case !resp.OK:
+		// holder 明确拒绝(如没有该 egress):同样保留它的原话,不静默降级。
+		fmt.Fprintf(os.Stderr, "Warning: stop tunnel %s: %s\n", egress, resp.Error)
+		return tunnelStopUnknown, errors.New(resp.Error)
+	default:
+		if resp.Warning != "" {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", resp.Warning)
+		}
+		fmt.Printf("tunnel %s stopped\n", egress)
+		return tunnelStopClosed, nil
 	}
 }
 
@@ -182,31 +219,6 @@ func removePersistedTunnel(statePath, egress string) (bool, error) {
 		return false, err
 	}
 	return true, nil
-}
-
-// runTunnelRestart 重启一条 node 持有的隧道(按原 egress/listen/restart 策略重开,无需重敲旗标)。
-// node 未运行时直接报错而不自动拉起:restart 只对既有隧道有意义。
-func runTunnelRestart() error {
-	target, err := tunnelRequireExecutor()
-	if err != nil {
-		return err
-	}
-	if !daemon.Get(daemon.PidFile("node")).Running {
-		return fmt.Errorf("local node is not running; nothing to restart for %s (start it with `relay node start`, then `relay tunnel start -w %s`)", target, target)
-	}
-
-	resp, err := sendTunnelControl(tunnelSockPath(), tunControlMsg{Op: tunOpRestart, Egress: target})
-	if err != nil {
-		return err
-	}
-	if !resp.OK {
-		return fmt.Errorf("restart tunnel %s: %s", target, resp.Error)
-	}
-	if resp.Warning != "" {
-		fmt.Fprintf(os.Stderr, "Warning: %s\n", resp.Warning)
-	}
-	fmt.Printf("tunnel %s restarted\n", target)
-	return nil
 }
 
 // handleTunnelConn 处理一条本地 SOCKS5 连接:SOCKS5 握手解 → TunnelOpen → 建连成功后

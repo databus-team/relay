@@ -3,23 +3,77 @@ package backend
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"math/rand"
 	"net"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	bk "github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/config"
+	"github.com/user/relay/internal/portfwd"
 	"github.com/user/relay/internal/relay/client"
 	"github.com/user/relay/internal/relay/protocol"
 	"github.com/user/relay/internal/relay/server"
+	"github.com/user/relay/internal/supervisor"
 	"github.com/user/relay/internal/sync/git"
 )
+
+// withSupervisorBaseDir 把执行方的任务目录接到临时目录,避免用例碰到真实的 ~/.relay/tasks。
+// 返回的目录同时是该用例的任务根目录。
+func withSupervisorBaseDir(t *testing.T) string {
+	t.Helper()
+	baseDir := t.TempDir()
+	prevDir := supervisorBaseDir
+	supervisorBaseDir = baseDir
+	t.Cleanup(func() { supervisorBaseDir = prevDir })
+	return baseDir
+}
+
+// TestNewSupervisor_OnePerBaseDir 覆盖 B1:同一个任务目录在本进程只有一个 supervisor。
+// 执行方会反复构造 backend(命令轮询每轮一次、文件事件各一次),每个 backend 各建一份会让同一批
+// 任务被反复加载与回写,Cleanup 还会拿着两份互不知情的内存视图对同一批任务各杀一次。
+func TestNewSupervisor_OnePerBaseDir(t *testing.T) {
+	firstDir := withSupervisorBaseDir(t)
+	first, err := newSupervisor()
+	if err != nil {
+		t.Fatalf("new supervisor: %v", err)
+	}
+	again, err := newSupervisor()
+	if err != nil {
+		t.Fatalf("new supervisor (同目录第二次): %v", err)
+	}
+	if first != again {
+		t.Errorf("同一任务目录建出了两份 supervisor")
+	}
+
+	supervisorsMu.Lock()
+	registeredSup, registered := supervisors[firstDir]
+	supervisorsMu.Unlock()
+	if !registered || registeredSup != first {
+		t.Errorf("supervisor 未按目录登记进 supervisors,Cleanup 停不掉它托管的任务")
+	}
+
+	// 换一个目录仍然是独立的一份:以目录为键,测试接缝才互不串台。
+	otherDir := withSupervisorBaseDir(t)
+	if otherDir == firstDir {
+		t.Fatalf("临时目录重复: %s", otherDir)
+	}
+	other, err := newSupervisor()
+	if err != nil {
+		t.Fatalf("new supervisor (另一目录): %v", err)
+	}
+	if other == first {
+		t.Errorf("不同任务目录复用了同一份 supervisor")
+	}
+}
 
 func newTestHub(t *testing.T, watchDir string) (*httptest.Server, string) {
 	t.Helper()
@@ -721,6 +775,10 @@ func TestEndToEnd_TaskSupervisor(t *testing.T) {
 	defer SetExecutorRole(false)
 	defer client.CloseAll()
 
+	// 任务目录隔离到临时目录,不碰真实 ~/.relay。
+	withSupervisorBaseDir(t)
+	defer Cleanup()
+
 	watchDir := t.TempDir()
 	ts, wsURL := newTestHub(t, watchDir)
 	defer ts.Close()
@@ -759,10 +817,12 @@ func TestEndToEnd_TaskSupervisor(t *testing.T) {
 		t.Fatalf("requester does not implement GitSyncExecBackend")
 	}
 
-	// 3. 后台脱机执行任务 (detach = true, 带 ports)
+	// 3. 后台脱机执行任务 (detach = true, 带 ports)。绑定面用非回环值,顺带钉住 R21:
+	// 记录必须原样带走 BindHost,不能退化成 String() 的展示形态。
+	taskPorts := []portfwd.Spec{{BindHost: "0.0.0.0", LocalPort: 8080, RemoteHost: "127.0.0.1", RemotePort: 8080}}
 	var taskIDOut strings.Builder
 	start := time.Now()
-	exit, err := gb.ExecStreamWithPorts(ctx, "node-1", "printf 'task_step_1\n'; sleep 0.3; printf 'task_step_2\n'; sleep 5", "", 10, nil, true, []string{"8080:8080"}, func(c bk.ExecChunk) {
+	exit, err := gb.ExecStreamWithPorts(ctx, "node-1", "printf 'task_step_1\n'; sleep 0.3; printf 'task_step_2\n'; sleep 5", "", 10, nil, true, taskPorts, "", func(c bk.ExecChunk) {
 		taskIDOut.WriteString(c.Data)
 	})
 	dur := time.Since(start)
@@ -796,8 +856,8 @@ func TestEndToEnd_TaskSupervisor(t *testing.T) {
 			if tk.Status != "running" {
 				t.Errorf("expected running status, got: %s", tk.Status)
 			}
-			if len(tk.Ports) != 1 || tk.Ports[0] != "8080:8080" {
-				t.Errorf("expected ports [8080:8080], got %v", tk.Ports)
+			if !reflect.DeepEqual(tk.Ports, taskPorts) {
+				t.Errorf("expected ports %+v, got %+v", taskPorts, tk.Ports)
 			}
 			break
 		}
@@ -845,6 +905,150 @@ func TestEndToEnd_TaskSupervisor(t *testing.T) {
 	}
 	if !stoppedFound {
 		t.Fatalf("task %s not found in all tasks list", taskID)
+	}
+}
+
+// 端到端:测试任务重启 (relay restart)。请求经中转按 ExecutorID 路由到指定执行方,
+// 由执行方在原 id 上重跑记录中的命令;对不存在的任务 id、错误的执行方与离线执行方
+// 都必须在超时内返回可读错误,而不是挂起。
+func TestEndToEnd_TaskRestart(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
+	defer client.CloseAll()
+
+	// 任务目录隔离到临时目录,不碰真实 ~/.relay。
+	baseDir := withSupervisorBaseDir(t)
+	defer Cleanup()
+
+	watchDir := t.TempDir()
+	ts, wsURL := newTestHub(t, watchDir)
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// 1. 两个执行方在线:node-1 持有任务,node-2 用于验证请求不会误投。
+	for _, id := range []string{"node-1", "node-2"} {
+		if _, err := NewRelayBackend(map[string]interface{}{
+			"url":         wsURL,
+			"token":       "tok-exe",
+			"executor_id": id,
+			"watch_dir":   ".",
+			"executor":    true,
+		}); err != nil {
+			t.Fatalf("executor %s backend: %v", id, err)
+		}
+	}
+
+	// 2. 请求方
+	reqBackend, err := NewRelayBackend(map[string]interface{}{
+		"url":         wsURL,
+		"token":       "tok-req",
+		"executor_id": "node-1",
+		"watch_dir":   ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+
+	tb, ok := reqBackend.(bk.TaskSupervisorBackend)
+	if !ok {
+		t.Fatalf("requester does not implement TaskSupervisorBackend")
+	}
+	gb, ok := reqBackend.(bk.GitSyncExecBackend)
+	if !ok {
+		t.Fatalf("requester does not implement GitSyncExecBackend")
+	}
+
+	// 3. node-2 的任务清单查询要能正常应答。
+	if _, err := tb.TaskList(ctx, "node-2", true); err != nil {
+		t.Fatalf("node-2 task list: %v", err)
+	}
+
+	// 4. 在 node-1 上后台起一个长命任务
+	var taskIDOut strings.Builder
+	exit, err := gb.ExecStreamWithPorts(ctx, "node-1", "printf 'restart_me\n'; sleep 30", "", 10, nil, true, nil, "", func(c bk.ExecChunk) {
+		taskIDOut.WriteString(c.Data)
+	})
+	if err != nil {
+		t.Fatalf("exec detach failed: %v", err)
+	}
+	if exit != 0 {
+		t.Fatalf("detach exit code: %d", exit)
+	}
+	taskID := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(taskIDOut.String()), protocol.ForwardTaskIDMarker))
+	if !strings.HasPrefix(taskID, "t-") {
+		t.Fatalf("invalid taskID output: %q", taskIDOut.String())
+	}
+	// defer 晚于函数的客户端关闭注册,按 LIFO 先于 client.CloseAll() 执行。
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tb.TaskStop(stopCtx, "node-1", taskID)
+	}()
+
+	// 4. 重启运行中的任务:收到成功应答,任务仍以原 id 处于运行态
+	if err := tb.TaskRestart(ctx, "node-1", taskID); err != nil {
+		t.Fatalf("task restart: %v", err)
+	}
+	tasks, err := tb.TaskList(ctx, "node-1", false)
+	if err != nil {
+		t.Fatalf("task list after restart: %v", err)
+	}
+	var running bool
+	for _, tk := range tasks {
+		if tk.ID == taskID {
+			running = true
+			if tk.Status != "running" {
+				t.Errorf("expected task running after restart, got: %s", tk.Status)
+			}
+			break
+		}
+	}
+	if !running {
+		t.Fatalf("task %s not running after restart (identity must be preserved)", taskID)
+	}
+
+	// 5. 不存在的 task id:失败应答且错误可读,不挂起
+	missingCtx, cancelMissing := context.WithTimeout(ctx, 3*time.Second)
+	defer cancelMissing()
+	err = tb.TaskRestart(missingCtx, "node-1", "t-does-not-exist")
+	if err == nil {
+		t.Fatalf("expected error for unknown task id")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("unknown task id should fail fast, got timeout: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected readable 'not found' error, got: %v", err)
+	}
+
+	// 6. 路由:地址指向 node-2 时不得投到持有该任务的 node-1。supervisor 按任务目录每进程唯一,
+	// 两台进程内执行方因此共用同一份;把 node-2 指向另一个任务目录,复现真实部署里「任务只存在于
+	// 创建它的那个执行方」这一事实。
+	otherCtx, cancelOther := context.WithTimeout(ctx, 3*time.Second)
+	defer cancelOther()
+	supervisorBaseDir = t.TempDir()
+	err = tb.TaskRestart(otherCtx, "node-2", taskID)
+	supervisorBaseDir = baseDir
+	if err == nil {
+		t.Fatalf("request addressed to node-2 must not reach node-1")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("misrouted request should fail fast, got timeout: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected node-2's 'not found' error, got: %v", err)
+	}
+
+	// 7. 执行方离线:在超时内拿到错误而不是一直等待
+	offlineCtx, cancelOffline := context.WithTimeout(ctx, 3*time.Second)
+	defer cancelOffline()
+	err = tb.TaskRestart(offlineCtx, "node-ghost", taskID)
+	if err == nil {
+		t.Fatalf("expected error for offline executor")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("offline executor should fail fast, got timeout: %v", err)
 	}
 }
 
@@ -1095,5 +1299,327 @@ func TestEndToEnd_GitUndoAndStatus(t *testing.T) {
 		t.Errorf("expected scratch.txt to be restored, got error: %v", err)
 	} else if string(scratchContent) != "remote scratch\n" {
 		t.Errorf("scratch.txt = %q, want 'remote scratch\\n'", string(scratchContent))
+	}
+}
+
+// readSeedMetaStartTime 读取磁盘元数据里的最近启动时间,用于验证重放的 once 守卫。
+func readSeedMetaStartTime(t *testing.T, baseDir, id string) time.Time {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(baseDir, id, "meta.json"))
+	if err != nil {
+		t.Fatalf("read meta %s: %v", id, err)
+	}
+	var m struct {
+		StartTime time.Time `json:"start_time"`
+	}
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("unmarshal meta %s: %v", id, err)
+	}
+	return m.StartTime
+}
+
+// TestEndToEnd_ExecutorStartupReplaysAlwaysTasks 覆盖执行方进程启动时的重放(R6、KTD4、KTD10):
+// 真实执行方(经 in-process hub 注册)启动路径触发一次重放后,上一次进程留下的 always 任务
+// (含优雅停机写成 stopped 的)自动回到运行态,no 任务保持停止;同进程内第二次触发是 no-op,
+// 不会杀起重放。
+func TestEndToEnd_ExecutorStartupReplaysAlwaysTasks(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
+	defer client.CloseAll()
+
+	// 任务目录隔离到临时目录,不碰真实 ~/.relay。
+	baseDir := withSupervisorBaseDir(t)
+	defer Cleanup()
+
+	// 上一次执行方进程留下的两个任务,随后优雅停机(只写 stopped,策略保留)。
+	seed, err := supervisor.New(baseDir)
+	if err != nil {
+		t.Fatalf("seed supervisor: %v", err)
+	}
+	alwaysTask, err := seed.StartTaskWithPolicy("sleep 30", "", nil, supervisor.RestartAlways, nil)
+	if err != nil {
+		t.Fatalf("seed always task: %v", err)
+	}
+	noTask, err := seed.StartTaskWithPolicy("sleep 30", "", nil, supervisor.RestartNo, nil)
+	if err != nil {
+		t.Fatalf("seed no task: %v", err)
+	}
+	alwaysID, noID := alwaysTask.Meta().ID, noTask.Meta().ID
+	seed.StopAll()
+
+	watchDir := t.TempDir()
+	ts, wsURL := newTestHub(t, watchDir)
+	defer ts.Close()
+
+	// 真实执行方启动:以 executor 角色注册到 in-process hub(与 relay watch 同一路径)。
+	if _, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-exe", "executor_id": "node-1", "watch_dir": ".", "executor": true,
+	}); err != nil {
+		t.Fatalf("executor backend: %v", err)
+	}
+
+	// 执行方进程启动路径显式触发一次重放(KTD4)。
+	ReplayAlwaysTasks()
+
+	reqBackend, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-req", "executor_id": "node-1", "watch_dir": ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+	tb, ok := reqBackend.(bk.TaskSupervisorBackend)
+	if !ok {
+		t.Fatalf("requester does not implement TaskSupervisorBackend")
+	}
+
+	ctx := context.Background()
+	tasks, err := tb.TaskList(ctx, "node-1", true)
+	if err != nil {
+		t.Fatalf("task list: %v", err)
+	}
+	byID := map[string]bk.TaskInfo{}
+	for _, tk := range tasks {
+		byID[tk.ID] = tk
+	}
+
+	gotAlways, ok := byID[alwaysID]
+	if !ok {
+		t.Fatalf("replayed always task %s missing from task list", alwaysID)
+	}
+	if gotAlways.Status != string(supervisor.StatusRunning) {
+		t.Errorf("always task not replayed: want running, got %s", gotAlways.Status)
+	}
+	if gotAlways.Restart != supervisor.RestartAlways {
+		t.Errorf("always task policy lost over the wire: got %q", gotAlways.Restart)
+	}
+	if gotAlways.CreatedAt == 0 {
+		t.Errorf("task briefing should carry the first-created time")
+	}
+
+	gotNo, ok := byID[noID]
+	if !ok {
+		t.Fatalf("no task %s missing from task list", noID)
+	}
+	if gotNo.Status == string(supervisor.StatusRunning) {
+		t.Errorf("no task must not be replayed, got %s", gotNo.Status)
+	}
+	if gotNo.Restart != supervisor.RestartNo {
+		t.Errorf("no task policy: want %q, got %q", supervisor.RestartNo, gotNo.Restart)
+	}
+
+	// 同进程内再次触发是 no-op:任务不会被杀起重放。
+	startBefore := readSeedMetaStartTime(t, baseDir, alwaysID)
+	ReplayAlwaysTasks()
+	startAfter := readSeedMetaStartTime(t, baseDir, alwaysID)
+	if !startAfter.Equal(startBefore) {
+		t.Errorf("replay guard failed: second trigger relaunched the task (%s -> %s)", startBefore, startAfter)
+	}
+}
+
+// TestEndToEnd_ExplicitStopClearsRestartPolicy 覆盖 relay stop 清除策略(R7/KD5):带 always 的
+// detach 任务经中转真正创建并携带策略,stop 后元数据策略变 no,执行方下次启动不重放它。
+func TestEndToEnd_ExplicitStopClearsRestartPolicy(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
+	defer client.CloseAll()
+
+	baseDir := withSupervisorBaseDir(t)
+	defer Cleanup()
+
+	watchDir := t.TempDir()
+	ts, wsURL := newTestHub(t, watchDir)
+	defer ts.Close()
+
+	if _, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-exe", "executor_id": "node-1", "watch_dir": ".", "executor": true,
+	}); err != nil {
+		t.Fatalf("executor backend: %v", err)
+	}
+	reqBackend, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-req", "executor_id": "node-1", "watch_dir": ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+	gb, ok := reqBackend.(bk.GitSyncExecBackend)
+	if !ok {
+		t.Fatalf("requester does not implement GitSyncExecBackend")
+	}
+
+	ctx := context.Background()
+	var out strings.Builder
+	exit, err := gb.ExecStreamWithPorts(ctx, "node-1", "sleep 30", "", 10, nil, true, nil, supervisor.RestartAlways, func(c bk.ExecChunk) {
+		out.WriteString(c.Data)
+	})
+	if err != nil {
+		t.Fatalf("exec detach: %v", err)
+	}
+	if exit != 0 {
+		t.Fatalf("exec detach exit: %d", exit)
+	}
+	taskID := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(out.String()), protocol.ForwardTaskIDMarker))
+	if !strings.HasPrefix(taskID, "t-") {
+		t.Fatalf("invalid taskID: %q", out.String())
+	}
+
+	tb := reqBackend.(bk.TaskSupervisorBackend)
+	find := func() bk.TaskInfo {
+		t.Helper()
+		list, err := tb.TaskList(ctx, "node-1", true)
+		if err != nil {
+			t.Fatalf("task list: %v", err)
+		}
+		for _, tk := range list {
+			if tk.ID == taskID {
+				return tk
+			}
+		}
+		t.Fatalf("task %s not found in task list", taskID)
+		return bk.TaskInfo{}
+	}
+
+	if got := find().Restart; got != supervisor.RestartAlways {
+		t.Fatalf("policy not carried to executor metadata: got %q", got)
+	}
+
+	if err := tb.TaskStop(ctx, "node-1", taskID); err != nil {
+		t.Fatalf("task stop: %v", err)
+	}
+
+	stopped := find()
+	if stopped.Restart != supervisor.RestartNo {
+		t.Errorf("explicit stop must clear the policy: got %q", stopped.Restart)
+	}
+	if stopped.Status == string(supervisor.StatusRunning) {
+		t.Errorf("task should be stopped, got %s", stopped.Status)
+	}
+
+	// 执行方下次启动不重放它。
+	sup, err := supervisor.New(baseDir)
+	if err != nil {
+		t.Fatalf("reload supervisor: %v", err)
+	}
+	if results := sup.ReplayAlways(); len(results) != 0 {
+		t.Fatalf("unexpected replay results: %+v", results)
+	}
+	reloaded, err := sup.GetTask(taskID)
+	if err != nil {
+		t.Fatalf("get reloaded task: %v", err)
+	}
+	if reloaded.Meta().Status == supervisor.StatusRunning {
+		t.Errorf("explicitly stopped task must not be replayed on executor startup")
+	}
+}
+
+// TestEndToEnd_PortSpecRoundTripIsLossless 覆盖 U6a 的完整链路(R21/KTD9):
+// CLI 侧解析 → 执行请求(wire) → 执行方任务记录(meta.json) → 任务简报(wire) → CLI 侧表格。
+// 绑定主机必须全程无损 —— 旧形态只留 String() 的展示字符串,-p 0.0.0.0:8080 会与 -p 8080 落成
+// 同一个 "8080",此后重登记只能悄悄收窄回环。
+func TestEndToEnd_PortSpecRoundTripIsLossless(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
+	defer client.CloseAll()
+
+	// 任务目录隔离到临时目录,不碰真实 ~/.relay。
+	baseDir := withSupervisorBaseDir(t)
+	defer Cleanup()
+
+	watchDir := t.TempDir()
+	ts, wsURL := newTestHub(t, watchDir)
+	defer ts.Close()
+
+	if _, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-exe", "executor_id": "node-1", "watch_dir": ".", "executor": true,
+	}); err != nil {
+		t.Fatalf("executor backend: %v", err)
+	}
+	reqBackend, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-req", "executor_id": "node-1", "watch_dir": ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+
+	// CLI 与执行方同源的解析:五种形态解析后上行,不只是把字符串转个手。
+	var specs []portfwd.Spec
+	for _, raw := range []string{"8080", "8080:9000", "0.0.0.0:8080", "0.0.0.0:8080:9000", "8080:db.local:5432"} {
+		spec, err := portfwd.Parse(raw, portfwd.DefaultBind)
+		if err != nil {
+			t.Fatalf("parse %q: %v", raw, err)
+		}
+		specs = append(specs, *spec)
+	}
+
+	ctx := context.Background()
+	gb, ok := reqBackend.(bk.GitSyncExecBackend)
+	if !ok {
+		t.Fatalf("requester does not implement GitSyncExecBackend")
+	}
+	var out strings.Builder
+	exit, err := gb.ExecStreamWithPorts(ctx, "node-1", "sleep 30", "", 10, nil, true, specs, "", func(c bk.ExecChunk) {
+		out.WriteString(c.Data)
+	})
+	if err != nil {
+		t.Fatalf("exec detach: %v", err)
+	}
+	if exit != 0 {
+		t.Fatalf("exec detach exit: %d", exit)
+	}
+	taskID := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(out.String()), protocol.ForwardTaskIDMarker))
+	if !strings.HasPrefix(taskID, "t-") {
+		t.Fatalf("invalid taskID: %q", out.String())
+	}
+
+	// 1) 记录侧:执行方磁盘上的 meta.json 逐字段无损,且确实带上了绑定面。
+	metaBytes, err := os.ReadFile(filepath.Join(baseDir, taskID, "meta.json"))
+	if err != nil {
+		t.Fatalf("read task meta: %v", err)
+	}
+	var onDisk struct {
+		Ports []portfwd.Spec `json:"ports"`
+	}
+	if err := json.Unmarshal(metaBytes, &onDisk); err != nil {
+		t.Fatalf("unmarshal task meta: %v", err)
+	}
+	if !reflect.DeepEqual(onDisk.Ports, specs) {
+		t.Errorf("recorded ports = %+v, want %+v", onDisk.Ports, specs)
+	}
+	var rawPorts struct {
+		Ports []map[string]json.RawMessage `json:"ports"`
+	}
+	if err := json.Unmarshal(metaBytes, &rawPorts); err != nil {
+		t.Fatalf("unmarshal raw meta: %v", err)
+	}
+	for i, p := range rawPorts.Ports {
+		if _, ok := p["bind"]; !ok {
+			t.Errorf("recorded ports[%d] has no bind field: %v (record degraded to display strings)", i, p)
+		}
+	}
+
+	// 2) 简报侧:经 wire 回到 CLI 的结果同样无损(relay ps 读到的是这一份)。
+	tb, ok := reqBackend.(bk.TaskSupervisorBackend)
+	if !ok {
+		t.Fatalf("requester does not implement TaskSupervisorBackend")
+	}
+	tasks, err := tb.TaskList(ctx, "node-1", true)
+	if err != nil {
+		t.Fatalf("task list: %v", err)
+	}
+	var briefed bk.TaskInfo
+	var found bool
+	for _, tk := range tasks {
+		if tk.ID == taskID {
+			briefed, found = tk, true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("task %s not found in task list", taskID)
+	}
+	if !reflect.DeepEqual(briefed.Ports, specs) {
+		t.Errorf("briefed ports = %+v, want %+v", briefed.Ports, specs)
+	}
+	if briefed.Ports[2].BindHost != "0.0.0.0" {
+		t.Errorf("briefed -p 0.0.0.0:8080 bind = %q, want 0.0.0.0 (not narrowed to loopback)", briefed.Ports[2].BindHost)
 	}
 }

@@ -20,11 +20,11 @@ type CommandCategory struct {
 var categories = []CommandCategory{
 	{
 		Title: "Core Commands:",
-		Names: []string{"run", "ps", "logs", "stop"},
+		Names: []string{"run", "start", "restart", "ps", "logs", "stop"},
 	},
 	{
 		Title: "Cluster & Network:",
-		Names: []string{"nodes", "tunnel"},
+		Names: []string{"nodes"},
 	},
 	{
 		Title: "Workspace & Sync:",
@@ -255,7 +255,7 @@ func renderHelp(app *kingpin.ApplicationModel, selCmd *kingpin.CmdModel, flags [
 			}
 		}
 
-		// 分组 Commands (既支持顶级命令如 tunnel，也支持扁平子命令如 job run)
+		// 分组 Commands (既支持顶级命令如 nodes，也支持扁平子命令如 job run)
 		cmdMap := make(map[string]*kingpin.CmdModel)
 		for _, cmd := range app.Commands {
 			if !cmd.Hidden {

@@ -14,7 +14,8 @@ A Go-based daemon for monitoring remote directories and executing actions when f
 - **Remote Exec & Git Sync**: Forward commands via WebSocket with real-time streaming; incremental Git diff sync runs **by default** before execution (opt out with `--no-sync`), with shadow snapshot protection
 - **Task Supervisor (Docker-style UX)**: Detached background execution (`exec -d`), task listing (`ps`), live log tailing (`logs -f`), and process group termination (`stop`)
 - **Port Forwarding (Docker-style -p)**: Forward local ports to remote command/service (`relay run -p 8080:8080`) over full-duplex tunnel stream without requiring network allowlist rules
-- **SOCKS5 Egress Tunnel (node-held)**: `relay tunnel start` opens a local SOCKS5 endpoint whose egress runs on a chosen executor's network (`network_allow` enforced executor-side, deny by default); held by the local `relay node` like `docker run`, persisted to `~/.relay/tunnels.json`, replayed on node restart (`--restart=always|no`), and listed by `relay ps`/`stop`/`logs`
+- **SOCKS5 Egress Tunnel (node-held)**: `relay run -t tunnel -p 127.0.0.1:1080 -e <egress>` opens a local SOCKS5 endpoint whose egress runs on a chosen executor's network (`network_allow` enforced executor-side, deny by default); held by the local `relay node` like `docker run`, persisted to `~/.relay/tunnels.json`, replayed on node restart (`--restart=always|no`), and operated by `relay ps`/`start`/`restart`/`stop`/`logs`
+- **Unified Object Lifecycle**: tasks and tunnels share one verb set — `relay run` creates, `relay start`/`restart`/`stop`/`logs` act on existing objects by name (task ID or tunnel egress)
 - **One-Click Undo & Drift Diff**: Restore overwritten remote workspaces instantly (`relay undo`) and inspect cross-node drift & file conflicts (`relay diff`)
 - **Config Hot-Reload**: Push config to a running watcher without restart
 - **Pluggable Backends**: Local filesystem, native relay (WebSocket), MCP SDK (HTTP SSE), JumpServer API
@@ -163,10 +164,20 @@ relay run -w web-app-patches -p 8080:8080 "npm run dev"
 # Detached execution: Run in background (returns Task ID immediately, Docker-like UX)
 relay run -w web-app-patches -d "npm run dev"
 # Output: t-a1b2c3d4-1718000000
+
+# Detach with a restart policy: the executor re-runs it on its next start
+relay run -w web-app-patches -d --restart=always "npm run dev"
+relay run -w web-app-patches -d --no-restart "npm run dev"   # shortcut for --restart=no (the default)
+
+# Tunnel mode: create a node-held SOCKS5 tunnel instead of running a command
+relay run -t tunnel -p 127.0.0.1:1080 -e site-a
+relay run --type=tunnel -p 0.0.0.0:1080 -e site-a --restart=always
 ```
 
 Forwards a command to the remote side for execution. Requires a backend that supports `Exec` (local, fs_mcp, relay). The `-w` flag sets the working directory to the watch's `local_dir`. When omitted, `-w` is inferred from the cwd when it can be; otherwise `run/exec` falls back to its no-workspace behavior. Use `--node / -e <id>` to address a specific node by its ID directly.
-- **`-p, --publish [local:]remote`**: Forward local ports to the remote command (e.g. `-p 8080` or `-p 3000:8080`), automatically tearing down the forwarders when the command exits. Temporary development port forwards do not require `network_allow` whitelist rules.
+- **`-p, --publish [host:][local:]remote`**: Forward local ports to the remote command (e.g. `-p 8080`, `-p 3000:8080`, or `-p 0.0.0.0:8080` to bind a non-loopback host), automatically tearing down the forwarders when the command exits. Temporary development port forwards do not require `network_allow` whitelist rules.
+- **`-t, --type task|tunnel`**: what `relay run` creates. Default `task` runs a command on the remote; `tunnel` creates a node-held SOCKS5 tunnel *instead* — exactly one `-p <[host:]port>` (no default, no remote half), the egress picked by `-e/--executor`, and no positional command. Task-only flags (`-d`, `--no-sync`, `-f`, `-w`) are rejected in tunnel mode rather than ignored. See the [tunnel section](#tunnel--local-socks5-egress-tunnel).
+- **`--restart always|no` / `--no-restart`**: the restart policy. For tasks it requires `-d` (a foreground run has no managed task to carry it) and is written to the task metadata; in tunnel mode it is written to the tunnel intent. In both cases the only recovery event is the next start of the owning daemon (executor for tasks, local node for tunnels).
 - **Detach + publish (`` `relay run -d -p `...` ``)** keeps the local ports alive after the CLI exits via the local `relay node` daemon. The node runs as `agent` (omitting `node.roles` defaults to `agent`; an explicit `roles: [hub]` is rejected with a clear error); `relay run -d -p` auto-starts it if needed. The local control socket `~/.relay/forward.sock` accepts register/unregister from any local process (unauthenticated) — keep the machine trusted; it is not exposed over the network.
 - **Git sync (ON by default — opt out with `--no-sync`):** Automatically detects uncommitted local Git modifications and untracked files, packs an incremental diff payload, and applies it to the remote workspace before executing the command. Includes base commit drift validation and automatic remote shadow snapshot backup (`refs/relay/backups/*`). Note: it carries **only the local working-tree diff, never unpushed commits**, and its source is the workspace's `local_dir` — which must be a valid Git repo **on the CLI machine** (otherwise sync is silently skipped).
 - `-f, --force-remote`: Force a sync even when the local tree is clean (creates a shadow snapshot on the remote first, then overwrites remote state).
@@ -185,10 +196,21 @@ relay ps -e node-1 -a
 
 Displays tasks managed by the node's TaskSupervisor across macOS, Linux, and Windows:
 ```
-TASK ID                 STATUS     PID      UPTIME       COMMAND
-t-a1b2c3d4-1718000000   running    12345    12m34s       npm run dev
-t-e5f6g7h8-1718000500   stopped    -        -            pytest tests/ (exit: 0)
+TYPE     TASK ID                 NODE             STATUS                         PORTS            RESTART  EXIT   CREATED          COMMAND
+task     t-a1b2c3d4-1718000000   node-1           running                        8080             always   -      12m34s ago       npm run dev
+task     t-e5f6g7h8-1718000500   node-1           stopped                        -                no       0      3h ago           pytest tests/ (exit: 0)
 ```
+
+Rows come in two kinds, distinguished by the `TYPE` column: `task` rows are remote detach tasks and
+`tunnel` rows are node-held tunnels (egress in `COMMAND`, listen address in `PORTS`).
+
+- **`RESTART`** is the object's restart policy (`always`/`no`) — for a task the value recorded in its
+  metadata by `relay run -d --restart=...`, for a tunnel the value in its intent.
+- **`CREATED`** is the time the object was **first** created — for a `task` row. A restart (`relay restart`)
+  only updates the last-start time, so a task's `CREATED` does not reset. A `tunnel` row instead shows its
+  last (re)bind time, so `relay restart <egress>` does move it.
+- **`PORTS`** is the *recorded intent*, not proof that the local port is being listened on right now (see
+  the tunnel section).
 
 ### logs — Stream & Tail Task Logs
 
@@ -202,13 +224,52 @@ relay logs -e node-1 t-a1b2c3d4-1718000000 --tail 50
 
 Subscribes to live task output broadcast or retrieves persisted log entries from disk.
 
-### stop — Terminate Background Task
+### stop — Terminate Background Task or Tunnel
 
 ```bash
-relay stop -e node-1 t-a1b2c3d4-1718000000
+relay stop -e node-1 t-a1b2c3d4-1718000000   # task, by ID
+relay stop site-a                            # tunnel, by egress
 ```
 
 Stops a running task. The executor cleans up the entire process tree using process groups/signals on Unix or `taskkill /T /F` on Windows, leaving no orphaned server processes behind.
+
+`stop` also **clears the task's restart policy**, so a task carrying `--restart=always` does not come back
+when the executor next starts. The record and its log are kept. On the tunnel side `stop` is `docker rm`
+semantics: it closes the listener and **removes the intent**, so the tunnel is forgotten (see the
+[tunnel section](#tunnel--local-socks5-egress-tunnel)). Stopping an already-stopped object is not an error.
+
+### start / restart — Reopen an Existing Task or Tunnel
+
+`relay run` creates objects; `start` and `restart` only act on objects that already exist. Both name the
+object the same way — a **task ID** or a **tunnel egress** — and both are refused if the name is unknown
+(with a pointer at how to create one). When a name matches a task and a tunnel at once, the task wins.
+
+```bash
+relay start t-a1b2c3d4-1718000000   # re-run a stopped/exited task under the same ID
+relay start site-a                  # reopen a stopped node-held tunnel on its recorded listen address
+relay restart t-a1b2c3d4-1718000000 # same, but stop the live instance first
+relay restart site-a                # same, for a tunnel
+```
+
+- **`start` never creates.** If nothing has that name, it errors instead of building one — use `relay run`
+  (or `relay run -t tunnel`) for that.
+- **`start` on something already running does not restart it** and does not fail; it just returns. The same
+  goes for `stop` on something already stopped.
+- **Restarting keeps identity.** A task keeps the same ID, the same task directory and its original
+  `CREATED` time; only the last-start time moves. Only the recorded command, working directory and ports are
+  replayed — not the original environment, shell choice, or git diff sync.
+- **A `stop`ped tunnel is forgotten**, so `start <egress>` cannot bring it back; only `relay run -t tunnel`
+  can, and it must name the listen address again.
+- **Local port-forward rules come back via `start`/`restart`.** The rules live in the local node's memory
+  and are dropped when the node restarts (and removed by `relay stop`), so a task that returns — whether by
+  `relay start` or by the executor replaying it — does not bring its published local port back on its own.
+  `relay start <task-id>` / `relay restart <task-id>` re-register them from the task's recorded ports
+  (bind host included), idempotently.
+
+Task-side verbs fail with a non-zero exit when the target executor is offline or the transit is
+unreachable; only when that executor is known, or when you named it with `-e/--executor`, does the error
+carry its executor ID. Tunnel-side verbs degrade when the local node is not running and say so, rather than
+reporting "no such task or tunnel".
 
 ### nodes — List Cluster Topology & Roles
 
@@ -454,38 +515,54 @@ connects to the target; the transit only forwards bytes (never lands, never pars
 Whitelist is enforced **executor-side** and **deny by default**; an empty/missing `network_allow` rejects
 every tunnel connect.
 
+A tunnel is a long-lived object like a detach task, so it uses the same lifecycle surface: **`relay run`
+creates it**, and `relay start`/`restart`/`stop`/`logs` operate on it by name. There is no `relay tunnel`
+sub-command.
+
 Tunnels are **held by the local `relay node`** (agent role): the node plays the dockerd role and owns the
 local listener, while the CLI only sends control messages over a unix socket (`~/.relay/tunnel.sock`). A
 tunnel therefore survives the launching shell/SSH session, and its intent is persisted to
 `~/.relay/tunnels.json` (`docker run` runtime state, not config) so the node can replay it on its next start.
 
 ```sh
-relay tunnel start -w site-a --listen 127.0.0.1:1080   # open; ensures the local node is running
+relay run -t tunnel -p 127.0.0.1:1080 -e site-a   # create; ensures the local node is running
 curl --socks5-hostname 127.0.0.1:1080 http://intra.a.internal/ping
 
-relay ps                         # list node-held tunnels (TYPE tunnel rows) + detach tasks
-relay tunnel restart -w site-a   # reopen the same egress without retyping --listen/--restart
-relay tunnel stop -w site-a      # close + forget the tunnel (docker rm semantics)
+relay ps                                         # list node-held tunnels (TYPE tunnel rows) + detach tasks
+relay restart site-a                             # reopen the same egress without retyping -p/-e/--restart
+relay stop site-a                                # close + forget the tunnel (docker rm semantics)
+relay logs site-a -f                             # stream the tunnel's log lines
 ```
 
-`relay tunnel` has no read verbs: listing is `relay ps`, logs are `relay logs <egress>`. The tunnel row's
-STATUS carries egress reachability, because a live local listener says nothing about the far end of the
-three-hop chain (local → transit → egress): `running (egress ready 11ms)`, `running (egress offline)`,
-`running (egress notready)`, or `running (egress unknown)` when the transit can't be queried.
+`-p` takes exactly one `[host:]port`: the local listen address, with no remote half (a tunnel has no target
+port to forward to) and no default value — a tunnel that publishes nothing would be useless, so omitting
+`-p` is an error. The host part is the bind address and defaults to the loopback: `-p 1080` is
+`127.0.0.1:1080`, while `-p 0.0.0.0:1080` binds every interface. The egress is selected with
+`-e/--executor`, by the executor's node identity **executor_id** (the `executors[].executor_id` shown by
+`relay status --json`); it is passed straight through to the transit and routed by executor_id, with no
+workspace mapping. `-w` is **not** accepted in tunnel mode — it means workspace, and tunnels are not
+workspace-scoped.
+
+The tunnel row's STATUS carries egress reachability, because a live local listener says nothing about the
+far end of the three-hop chain (local → transit → egress): `running (egress ready 11ms)`,
+`running (egress offline)`, `running (egress notready)`, or `running (egress unknown)` when the transit
+can't be queried.
 
 **Restart policy (`--restart=always|no`, default `no`).** The recovery event is the node's next start
 (tunnels are goroutines inside the node process). `always` reopens the listener when the node starts; `no`
 keeps the entry but shows it `stopped` (visible under `relay ps -a`). `--no-restart` is a shortcut for
 `--restart=no`. Because **restarting the node drops every tunnel** (they live in that one process, as do the
 detached `-p` port-forwards), use `--restart=always` if you depend on a tunnel, or reopen it per-tunnel with
-`relay tunnel restart -w <egress>`.
+`relay restart <egress>`.
 
 **Unified control plane.** Node-held tunnels appear alongside remote detach tasks:
 
 ```sh
 relay ps                 # TYPE column: `tunnel` rows (egress in COMMAND, listen in PORTS) + `task` rows
 relay ps -a              # also lists `stopped` tunnels
-relay stop site-a        # stops a tunnel by its egress (also still stops a task by task ID)
+relay start site-a       # reopen a stopped tunnel (never creates one)
+relay restart site-a     # stop the live listener, then reopen it on the recorded address
+relay stop site-a        # close + forget the tunnel
 relay logs site-a -f     # streams the tunnel's lines from ~/.relay/node.log (prefix `[tunnel site-a]`)
 ```
 
@@ -496,31 +573,56 @@ rather than failing. `--json` exposes it as `egress_status` / `egress_ready`.
 
 `relay ps` still lists local tunnels when the transit is unreachable — only the remote task list degrades.
 
-- `--executor` (`-w` alias) selects the egress executor by its node identity **executor_id** (the
-  `executors[].executor_id` shown by `relay status --json`) — required for `start`/`restart`/`stop`. It is
-  passed straight through to the transit and routed to the target executor by executor_id (no workspace mapping).
-- Default bind is loopback `127.0.0.1`; binding a non-loopback address prints a loud warning (no auth).
+**Two behaviours that are easy to misread:**
+
+- **`PORTS` is the recorded intent, not a live check.** It is what the tunnel was created with; it does not
+  prove the local port is listening right now. After a node restart the node replays only the entries whose
+  policy is `always`, and after a `stop` there is nothing left to replay at all.
+- **A `stop`ped tunnel is forgotten.** `relay stop <egress>` removes the intent from `~/.relay/tunnels.json`,
+  so `relay start <egress>` will *not* recreate it — it can only reopen an entry that still exists. To build
+  it again you must re-run `relay run -t tunnel -p <[host:]port> -e <egress>` with the listen address.
+
+Other notes:
+
+- Default bind is loopback `127.0.0.1`; binding a non-loopback address prints a loud warning to the caller's
+  stderr (no auth) — the tunnel has no authentication of its own.
+- The `relay node` must be running to hold the listener; `relay run -t tunnel` and `relay start <egress>`
+  start it if needed, while `restart`/`stop`/`logs` never start it implicitly and report the degraded state.
 - Server must enable the tunnel channel (`tunnel_enabled: true` in the `server:` section); otherwise
   tunnel requests are rejected.
 - Optionally bound the concurrent-tunnel cap with `server.max_tunnels`; default 256.
 
+**Migrating from the retired `relay tunnel` namespace.** The whole `relay tunnel` command is gone; here is
+the old → new mapping:
+
+| Old | New |
+|---|---|
+| `relay tunnel start -w X --listen A --restart=always` | `relay run -t tunnel -p A -e X --restart=always` |
+| `relay tunnel stop -w X` | `relay stop X` |
+| `relay tunnel restart -w X` | `relay restart X` |
+| `relay tunnel status` | `relay ps` (retired earlier) |
+
+Two flag changes to watch for: the egress selector went from `-w/--executor` to **`-e/--executor`**, and
+`-w` now means *workspace* (and is rejected in tunnel mode); and the listen address went from
+`--listen <addr>` to **`-p <[host:]port>`** (with `--bind-host` as the default host for a bare port).
+
 **Upgrading from the old per-egress daemon model.** Earlier releases ran one detached `tunnel-<executor>`
-daemon per egress. That is retired. Stop any leftover daemon first — `relay tunnel stop -w <egress>`, or
-`kill $(cat ~/.relay/tunnel-<egress>.pid)` — otherwise it still holds the local port and the new node-held
-`relay tunnel start` fails to bind (it detects the stale daemon and reports the exact cleanup command).
-`relay tunnel run` (foreground), `relay tunnel status` (use `relay ps`) and `relay tunnel upgrade`
-(use `relay node upgrade`) are removed; tunnel logs now go through `relay logs`.
+daemon per egress. That is retired. Stop any leftover daemon first — `relay stop <egress>`, or
+`kill $(cat ~/.relay/tunnel-<egress>.pid)` — otherwise it still holds the local port and creating a tunnel
+fails to bind (it detects the stale daemon and reports the exact cleanup command). The old
+`relay tunnel run` (foreground), `relay tunnel status` (use `relay ps`) and `relay tunnel upgrade` (use
+`relay node upgrade`) were removed earlier; tunnel logs go through `relay logs`.
 
 **Dual-executor / concurrent tunnels (multi-executor):** one transit can host **two (or more)** remote
-executors at once, each on its own watch/workspace. Start two tunnels, each binding its own local port and
+executors at once, each on its own watch/workspace. Create two tunnels, each binding its own local port and
 selecting its own egress — access each executor's intranet targets independently without interference.
 Closing one tunnel never affects the others; `relay status` / the version ledger list every online executor
 per watch so you can see which egresses are available:
 
 ```sh
 # executor M1 (watch site-a) and M2 (watch site-b) both online on the same transit
-relay tunnel start -w site-a --listen 127.0.0.1:1080   # egress M1
-relay tunnel start -w site-b --listen 127.0.0.1:1081   # egress M2, independent
+relay run -t tunnel -p 127.0.0.1:1080 -e site-a   # egress M1
+relay run -t tunnel -p 127.0.0.1:1081 -e site-b   # egress M2, independent
 
 curl --socks5-hostname 127.0.0.1:1080 http://a-intra.pvt/00
 curl --socks5-hostname 127.0.0.1:1081 https://b-intra.pvt/api
@@ -528,7 +630,7 @@ curl --socks5-hostname 127.0.0.1:1081 https://b-intra.pvt/api
 
 **`network_allow` is per-executor.** Each executor's `backend.config` carries the allowlist for the
 egress it may reach. In a multi-executor deployment put each executor's own whitelist in that executor's
-config (so `relay tunnel start -w site-a` is gated by site-a's allowlist, `-w site-b` by site-b's).
+config (so the tunnel through site-a is gated by site-a's allowlist, the one through site-b by site-b's).
 Format: `host|IP|CIDR[@port]` — `@` port is optional (`443`, `80,443`, `8000-9000`); missing `@` = any port.
 The transit and local CLI never need `network_allow`; only the executor enforces it.
 

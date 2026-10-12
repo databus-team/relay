@@ -434,7 +434,7 @@ type StatusResponse struct {
 
 ### 4.9 出网隧道 (本地 SOCKS5 → executor)
 
-`relay tunnel --listen 127.0.0.1:<port> --watch <work>` 本地起一条 SOCKS5 端点,把每个客户端对
+`relay run -t tunnel -p 127.0.0.1:<port> -e <egress>` 本地起一条 SOCKS5 端点,把每个客户端对
 CONNECT 目标的访问经中转转发到所选 executor 的网络出口。**出口(真实 TCP 连接)只在 executor**:它校验
 自己的 `network_allow` 白名单后向目标建连;中转只做字节流透明转发(不落盘、不解析、不执行)。目标白名单在
 executor 侧强制,**默认拒绝**;空/缺省 `network_allow` 拒绝一切建连(fail-closed)。
@@ -475,10 +475,40 @@ type TunnelEnd  struct { StreamID string `json:"stream_id"`; Reason string `json
 **动态注册**(`MsgRegisterExecutor`),不要求预先出现在中转 watch 白名单——中转只是路由层。`relay status`
 与版本台账按 executor 逐条列出所有在线执行方及其构建版本,用户据此得知有哪些出口可选。`relay exec` / `relay push`
 经 `-w <workspace>`(路由到该 workspace 绑定的 executor)或 `-e/--executor <id>`(按 executor_id 节点直连,无需 workspace)
-选定目标执行方;`relay tunnel --executor <id>` 的取值同样直接取**执行方注册的 executor_id**(见 `relay status --json`
+选定目标执行方;`relay run -t tunnel -e <id>` 的取值同样直接取**执行方注册的 executor_id**(见 `relay status --json`
 的 `executors[].executor_id`),与 `exec`/`push` 的 `-w`(工作区名,再映射到该执行方)不同、也不做 cwd 推断,
-`--executor` 必填。`relay status` 不需要 `-w`:它报告整座部署。多台 executor 在线时,本地可并排多条
-`relay tunnel`(不同 `--listen` 端口、各自 `--executor`),分别经各自执行方访问各自内网白名单目标,互不干扰。
+`-e/--executor` 必填(隧道没有工作区那一半)。`relay status` 不需要 `-w`:它报告整座部署。多台 executor 在线时,本地可并排多条
+隧道(`relay run -t tunnel -p <不同端口> -e <各自 egress>`),分别经各自执行方访问各自内网白名单目标,互不干扰。
+
+### 4.11 任务生命周期消息 (task_list / task_stop / task_restart / task_logs)
+
+长命后台任务由执行方的 TaskSupervisor 持有;中转不保存任何任务状态,只按请求中的
+`executor_id` 原样转发给已注册的执行方(`forwardToExecutor`),答复再按请求方归属回投。
+错误一律走 `MsgError`(`request_id` 对应请求),成功回 `MsgResponse` ACK。
+
+| 消息 | 请求体 | 应答 |
+|---|---|---|
+| `task_list` | `TaskListRequest{executor_id, all}` | `TaskListResponse{ok, error, tasks}`;`executor_id` 为空时由中转并发聚合整网 |
+| `task_stop` | `TaskStopRequest{executor_id, task_id}` | ACK(`{ok:true}`)或 `MsgError` |
+| `task_restart` | `TaskRestartRequest{executor_id, task_id}` | ACK(`{ok:true}`)或 `MsgError` |
+| `task_logs` | `TaskLogsRequest{executor_id, task_id, follow, tail_lines}` | 流式 `MsgExecOutput` 分块,末帧 `MsgResponse` |
+
+**`task_restart`** 请求执行方在**原 task id、原任务目录**上重跑记录中的命令与工作目录
+(端口等元数据一并沿用),因此任务身份与端口转发规则在重启后保持不变。执行方的新进程
+起不来、或该 id 在本地不存在时,应答 `MsgError` 并携带可读原因(如 `task not found`),
+请求方据此报错而不重试。这是一次性请求应答,不走 `task_logs` 的流式路径。
+
+```json
+// 请求 (Client → Transit → Executor)
+{
+  "type": "task_restart",
+  "id": "<请求 id, 也是回投的 request_id>",
+  "payload": { "executor_id": "node-1", "task_id": "t-1a2b3c4d" }
+}
+```
+
+调用方必须自带超时 context:老执行方不认识该消息(不做跨版本协议兼容)时,
+超时是唯一的兜底,避免无限等待。
 
 ---
 

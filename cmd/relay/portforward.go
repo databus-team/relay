@@ -9,92 +9,81 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/user/relay/internal/portfwd"
 	relaybackend "github.com/user/relay/internal/relay/backend"
 )
 
-// PortForwardSpec 描述一条端口转发规则。json tag 使其可直接作为 node<->CLI 控制 socket 的 wire 类型。
-type PortForwardSpec struct {
-	BindHost   string `json:"bind"`
-	LocalPort  int    `json:"local_port"`
-	RemoteHost string `json:"remote_host"`
-	RemotePort int    `json:"remote_port"`
-}
+// PortForwardSpec 是端口转发规格在 CLI 侧的别名:规范类型在 internal/portfwd,由 CLI、协议、
+// 后端与 supervisor 共用。保留旧名字使控制 socket 与既有调用点无需改动(KTD9)。
+type PortForwardSpec = portfwd.Spec
 
-// String 返回规格的标准字符串表示，例如 "8080"、"8080:9000" 或 "8080:db.local:5432"
-func (s *PortForwardSpec) String() string {
-	if s.RemoteHost != "" && s.RemoteHost != "127.0.0.1" && s.RemoteHost != "localhost" {
-		return fmt.Sprintf("%d:%s:%d", s.LocalPort, s.RemoteHost, s.RemotePort)
-	}
-	if s.LocalPort == s.RemotePort {
-		return strconv.Itoa(s.LocalPort)
-	}
-	return fmt.Sprintf("%d:%d", s.LocalPort, s.RemotePort)
-}
-
-// parsePortForwardSpec 解析形如 "8080", "8080:8080", "0.0.0.0:8080:8080", "8080:db.local:5432" 的规格
+// parsePortForwardSpec 解析端口转发规格,语法与拒绝用例见 portfwd.Parse。
 func parsePortForwardSpec(raw, defaultBind string) (*PortForwardSpec, error) {
+	return portfwd.Parse(raw, defaultBind)
+}
+
+// TunnelListenSpec 是隧道模式下 -p 的解析结果：只有监听地址，没有远端半段(KTD6)
+type TunnelListenSpec struct {
+	BindHost string `json:"bind"`
+	Port     int    `json:"port"`
+}
+
+// Addr 返回 net.Listen 可用的 "host:port" 监听地址。
+// 必须用 net.JoinHostPort 而非 "%s:%d"：IPv6 字面量要加方括号("::1" -> "[::1]:1080")，
+// 否则 net.Listen 会以 "too many colons in address" 拒绝。
+func (s *TunnelListenSpec) Addr() string {
+	return net.JoinHostPort(s.BindHost, strconv.Itoa(s.Port))
+}
+
+// parseTunnelListenSpec 解析隧道模式的 -p，只接受 "[host:]port"(R14/KTD6)。
+// 隧道没有"远端半段"，因此 "local:remote" 与更多段一律报错，不做静默截取
+func parseTunnelListenSpec(raw, defaultBind string) (*TunnelListenSpec, error) {
 	if defaultBind == "" {
-		defaultBind = "127.0.0.1"
+		defaultBind = portfwd.DefaultBind
+	}
+	// 先试 net.SplitHostPort：只有它认得以方括号包裹的 IPv6 字面量("[::1]:1080")。
+	// 裸端口("1080")与无方括号的 IPv6 在此因"too many colons / missing port"失配，
+	// 落到下面的冒号分段分支，语义与改动前一致。
+	if host, portStr, err := net.SplitHostPort(raw); err == nil {
+		// 首段是纯数字说明给的是"本地:远端"两段式，隧道没有远端半段，必须拒绝
+		if _, err := strconv.Atoi(host); err == nil {
+			return nil, fmt.Errorf("tunnel -p accepts only [host:]port, got %q: a tunnel has no remote half", raw)
+		}
+		// 空绑定主机是刻意拒绝的(KTD6)：net.Listen(":8080") 会绑定所有网卡，
+		// 而 isLoopbackAddr("") 却把它当回环，等号两边不一致。
+		if host == "" {
+			return nil, fmt.Errorf("tunnel -p accepts only [host:]port, got %q: bind host must not be empty", raw)
+		}
+		p, err := strconv.Atoi(portStr)
+		if err != nil || p <= 0 || p > 65535 {
+			return nil, fmt.Errorf("invalid port: %q (tunnel -p expects [host:]port)", portStr)
+		}
+		return &TunnelListenSpec{BindHost: host, Port: p}, nil
 	}
 	parts := strings.Split(raw, ":")
 	switch len(parts) {
 	case 1:
-		// "8080"
+		// "1080"
 		p, err := strconv.Atoi(parts[0])
 		if err != nil || p <= 0 || p > 65535 {
-			return nil, fmt.Errorf("invalid port: %q", parts[0])
+			return nil, fmt.Errorf("invalid port: %q (tunnel -p expects [host:]port)", parts[0])
 		}
-		return &PortForwardSpec{
-			BindHost:   defaultBind,
-			LocalPort:  p,
-			RemoteHost: "127.0.0.1",
-			RemotePort: p,
-		}, nil
+		return &TunnelListenSpec{BindHost: defaultBind, Port: p}, nil
 	case 2:
-		// "8080:9000"
-		lp, err1 := strconv.Atoi(parts[0])
-		rp, err2 := strconv.Atoi(parts[1])
-		if err1 != nil || lp <= 0 || lp > 65535 {
-			return nil, fmt.Errorf("invalid local port: %q", parts[0])
+		// "127.0.0.1:1080"
+		if _, err := strconv.Atoi(parts[0]); err == nil {
+			return nil, fmt.Errorf("tunnel -p accepts only [host:]port, got %q: a tunnel has no remote half", raw)
 		}
-		if err2 != nil || rp <= 0 || rp > 65535 {
-			return nil, fmt.Errorf("invalid remote port: %q", parts[1])
+		if parts[0] == "" {
+			return nil, fmt.Errorf("tunnel -p accepts only [host:]port, got %q: bind host must not be empty", raw)
 		}
-		return &PortForwardSpec{
-			BindHost:   defaultBind,
-			LocalPort:  lp,
-			RemoteHost: "127.0.0.1",
-			RemotePort: rp,
-		}, nil
-	case 3:
-		// "0.0.0.0:8080:9000" 或 "8080:remotehost:9000"
-		if lp, err := strconv.Atoi(parts[0]); err == nil {
-			// 首段是数字: 8080:remotehost:9000
-			rp, rerr := strconv.Atoi(parts[2])
-			if rerr != nil || rp <= 0 || rp > 65535 {
-				return nil, fmt.Errorf("invalid remote port: %q", parts[2])
-			}
-			return &PortForwardSpec{
-				BindHost:   defaultBind,
-				LocalPort:  lp,
-				RemoteHost: parts[1],
-				RemotePort: rp,
-			}, nil
+		p, err := strconv.Atoi(parts[1])
+		if err != nil || p <= 0 || p > 65535 {
+			return nil, fmt.Errorf("invalid port: %q (tunnel -p expects [host:]port)", parts[1])
 		}
-		// 首段是 host: 0.0.0.0:8080:9000
-		lp, err1 := strconv.Atoi(parts[1])
-		rp, err2 := strconv.Atoi(parts[2])
-		if err1 != nil || lp <= 0 || lp > 65535 || err2 != nil || rp <= 0 || rp > 65535 {
-			return nil, fmt.Errorf("invalid port in %q", raw)
-		}
-		return &PortForwardSpec{
-			BindHost:   parts[0],
-			LocalPort:  lp,
-			RemoteHost: "127.0.0.1",
-			RemotePort: rp,
-		}, nil
+		return &TunnelListenSpec{BindHost: parts[0], Port: p}, nil
 	default:
-		return nil, fmt.Errorf("unrecognized port format %q (expected [local:]remote or local:remoteHost:remotePort)", raw)
+		return nil, fmt.Errorf("tunnel -p accepts only [host:]port, got %q", raw)
 	}
 }
 
