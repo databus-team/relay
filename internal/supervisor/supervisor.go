@@ -279,8 +279,13 @@ func (s *Supervisor) launch(task *Task, env []string) error {
 
 	task.cmd = cmd
 	task.meta.PID = cmd.Process.Pid
+	// 收拢进程树要赶在 shell fork 出命令之前(见 processTree.attach);失败只退回旧的
+	// taskkill 路径(可能漏掉后代),不该让任务起不来,故只留痕不报错。
+	if err := task.tree.attach(cmd.Process.Pid); err != nil {
+		_, _ = fmt.Fprintf(logFile, "[process-tree] %v; Stop 将退回 taskkill(子进程可能逃逸)\n", err)
+	}
 	if err := task.persist(); err != nil {
-		_ = killProcessTree(cmd.Process.Pid)
+		_ = task.tree.kill(cmd.Process.Pid)
 		logFile.Close()
 		return fmt.Errorf("persist task meta: %w", err)
 	}
@@ -303,6 +308,8 @@ func (s *Supervisor) launch(task *Task, env []string) error {
 	go func() {
 		wg.Wait()
 		waitErr := cmd.Wait()
+		// 进程已退出,句柄不再有用;留着会按任务数泄漏内核对象。
+		task.tree.release()
 
 		task.mu.Lock()
 		now := time.Now()

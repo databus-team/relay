@@ -8,6 +8,16 @@ import (
 	"time"
 )
 
+// processTree 在 unix 上不需要额外机制:子进程启动时自成进程组(Setpgid),
+// killProcessTree 对整个进程组发信号即可覆盖全部后代。
+type processTree struct{}
+
+func (p *processTree) attach(pid int) error { return nil }
+
+func (p *processTree) kill(pid int) error { return killProcessTree(pid) }
+
+func (p *processTree) release() {}
+
 func prepareCmdAttr(c *exec.Cmd) {
 	c.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,

@@ -60,6 +60,8 @@ type Task struct {
 	// goroutine 在新实例落盘之后才 persist 时,会把 status/pid/end_time 覆盖回旧值,而两个
 	// Task 各持自己的锁,没有任何东西能给这两次写排序。
 	superseded bool
+	// tree 收拢本任务的进程树,Stop 时一次性终止(Windows 上靠 job,unix 上靠进程组)。
+	tree processTree
 }
 
 func newTask(id, cmdStr, cwd string, dir string) *Task {
@@ -152,7 +154,7 @@ func (t *Task) Stop() error {
 	t.meta.EndTime = &now
 	t.mu.Unlock()
 
-	err := killProcessTree(pid)
+	err := t.tree.kill(pid)
 	t.mu.Lock()
 	_ = t.persist()
 	t.mu.Unlock()
