@@ -347,7 +347,7 @@ U2 → U1 → U3 建立执行方侧能力：先有 supervisor 的同 id 重启�
   2. 位置命令参数在 kingpin 层改为可选，由代码校验：任务模式必须给命令，隧道模式必须没有命令。
   3. 隧道模式复用现有的创建动作：确保本机 node 在运行、下发 open 控制消息（含监听地址与 restart 策略）、非 loopback 时把告警也打到调用方 stderr。
   4. 模式矩阵中标注为报错的组合一律显式报错，不静默忽略。
-- **Patterns to follow:** 现有 `runTunnelStart` 的创建流程与 `ensureLocalRelayNode`；`runExec` 既有的参数校验报错风格。
+- **Patterns to follow:** 既有隧道创建流程（现由 `startTunnel`/`openTunnelViaHolder` 承载）与 `ensureLocalRelayNode`；`runExec` 既有的参数校验报错风格。
 - **Test scenarios:**
   - `relay run -t tunnel -p 127.0.0.1:1080 -e site-a` 创建出监听该地址的隧道，意图写入 `tunnels.json`。
   - 隧道模式缺 `-p`、`-p` 给两次、或 `-p` 写成 `8080:9000`：分别报错且不创建任何东西。
@@ -407,7 +407,7 @@ U2 → U1 → U3 建立执行方侧能力：先有 supervisor 的同 id 重启�
   6. `relay stop` 的两条路径共用同一实现（R18），node 未运行时也移除意图；对已停止的对象不报错，并照常执行策略清除／意图移除（R2、R7）。
   7. `relay ps` 的任务行新增 RESTART 列显示策略，`--json` 复用现有 `restart` 字段；CREATED 改取首次创建时间（R12、R20）。
 - **Execution note:** 端口转发恢复这条要先写回归用例：`stop` 之后 `start`，本地端口按原绑定面重新可连。
-- **Patterns to follow:** `runLogs`/`runStop` 已有的"任务优先、隧道兜底、失败降级"结构；`stopLocalTunnel` 与 `runTunnelStop` 的差异正是要合并掉的那处漂移。
+- **Patterns to follow:** `runLogs`/`runStop` 已有的"任务优先、隧道兜底、失败降级"结构；两条 stop 路径之间的差异正是要合并掉的那处漂移。
 - **Test scenarios:**
   - 对一个已停止的任务执行 `start`：以同 id 重新运行，且其记录的端口在本机按原绑定面重新可连（含 `-p 0.0.0.0:8080` 一例）。
   - 对正在运行的任务执行 `start`：不重启进程，但本机转发规则被补登记（先制造"node 重启后规则丢失"的状态），断言端口重新可连且没有冲突告警。

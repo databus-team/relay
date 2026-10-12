@@ -30,8 +30,8 @@ const (
 )
 
 // restartPolicyValue 把一对重启策略旗标(策略字符串 + --no-restart 布尔)归一为标准策略值
-// (always|no)。纯函数,不读全局旗标:relay run 的任务/隧道两种模式与 relay tunnel start
-// 共用同一份校验,--no-restart 优先,缺省与空值都归一为 no。
+// (always|no)。纯函数,不读全局旗标:relay run 的任务与隧道两种模式共用同一份校验,
+// --no-restart 优先,缺省与空值都归一为 no。
 func restartPolicyValue(policy string, noRestart bool) (string, error) {
 	if noRestart {
 		return tunRestartNo, nil
@@ -46,37 +46,8 @@ func restartPolicyValue(policy string, noRestart bool) (string, error) {
 	}
 }
 
-// tunnelRestartPolicyValue 把 relay tunnel start 的 --restart/--no-restart 解析为标准策略值(always|no)。
-func tunnelRestartPolicyValue() (string, error) {
-	return restartPolicyValue(*tunnelRestartPolicy, *tunnelNoRestart)
-}
-
-// runTunnelStart 启动一条由本地 node 持有的 SOCKS5 隧道:先确保 node(agent 角色)在线,
-// 再经 holder unix socket 下发 open 消息(携带 egress/listen/restart 策略)。只有 start 会
-// 自动拉起 node;stop/restart 只控制既有隧道,不隐式启动常驻进程。
-func runTunnelStart() error {
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
-
-	// 出口 node 选择:`-w` 是「执行方注册的节点身份 executor_id」(见 `relay status` 的
-	// `executors[].executor_id`),不是本地工作区名。
-	target, err := tunnelRequireExecutor()
-	if err != nil {
-		return err
-	}
-
-	policy, err := tunnelRestartPolicyValue()
-	if err != nil {
-		return err
-	}
-
-	return startTunnel(cfg, target, *tunnelListen, policy, os.Stderr)
-}
-
 // startTunnel 是隧道创建的共享动作:确保本机 node(holder)在线,再下发 open 控制消息。
-// 旧入口 `relay tunnel start` 与新入口 `relay run -t tunnel` 共用,避免控制消息代码分叉。
+// 唯一入口是 `relay run -t tunnel`(KD6),控制消息代码不外分叉。
 func startTunnel(cfg *config.Config, target, listen, policy string, warnw io.Writer) error {
 	if cfg.Backend.Type != "relay" {
 		return fmt.Errorf("tunnel requires backend.type=relay, got %q", cfg.Backend.Type)
@@ -136,19 +107,7 @@ func tunnelLegacyDaemonHint(egress string) string {
 	if !st.Running {
 		return ""
 	}
-	return fmt.Sprintf("; a legacy tunnel daemon %s is still running (pid %d) and may hold the listen address — remove it with `relay tunnel stop -w %s` or `kill %d`", inst, st.Pid, egress, st.Pid)
-}
-
-// runTunnelStop 停止一条由本地 node 持有的隧道(旧入口,`relay tunnel stop`)。与根级
-// `relay stop <egress>` 共用 stopLocalTunnel 这一份实现(R18):node 未运行时的意图移除不再
-// 各自实现,杜绝再次分叉。旧动词对「没有这条隧道」不判失败(结果由 stopLocalTunnel 如实汇报)。
-func runTunnelStop() {
-	target, err := tunnelRequireExecutor()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return
-	}
-	stopLocalTunnel(tunnelStatePath(), tunnelSockPath(), target, nodeDaemonRunning())
+	return fmt.Sprintf("; a legacy tunnel daemon %s is still running (pid %d) and may hold the listen address — remove it with `relay stop %s` or `kill %d`", inst, st.Pid, egress, st.Pid)
 }
 
 // stopLegacyTunnelDaemon 尽力停掉某 egress 对应的旧式独立 `tunnel-<egress>` daemon(已废弃的每出口
@@ -260,31 +219,6 @@ func removePersistedTunnel(statePath, egress string) (bool, error) {
 		return false, err
 	}
 	return true, nil
-}
-
-// runTunnelRestart 重启一条 node 持有的隧道(按原 egress/listen/restart 策略重开,无需重敲旗标)。
-// node 未运行时直接报错而不自动拉起:restart 只对既有隧道有意义。
-func runTunnelRestart() error {
-	target, err := tunnelRequireExecutor()
-	if err != nil {
-		return err
-	}
-	if !daemon.Get(daemon.PidFile("node")).Running {
-		return fmt.Errorf("local node is not running; nothing to restart for %s (start it with `relay node start`, then `relay tunnel start -w %s`)", target, target)
-	}
-
-	resp, err := sendTunnelControl(tunnelSockPath(), tunControlMsg{Op: tunOpRestart, Egress: target})
-	if err != nil {
-		return err
-	}
-	if !resp.OK {
-		return fmt.Errorf("restart tunnel %s: %s", target, resp.Error)
-	}
-	if resp.Warning != "" {
-		fmt.Fprintf(os.Stderr, "Warning: %s\n", resp.Warning)
-	}
-	fmt.Printf("tunnel %s restarted\n", target)
-	return nil
 }
 
 // handleTunnelConn 处理一条本地 SOCKS5 连接:SOCKS5 握手解 → TunnelOpen → 建连成功后

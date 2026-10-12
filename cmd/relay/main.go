@@ -164,19 +164,8 @@ var (
 	serverRemoteBin    = serverRemoteCmd.Flag("binary", "Path to the new relay binary to send (default: current executable)").String()
 	serverRemoteExpect = serverRemoteCmd.Flag("expect", "Expected transit version after swap (default: this relay's version.String())").String()
 
-	tunnelCmd      = kingpin.Command("tunnel", "Open SOCKS5 egress tunnel through remote node")
-	tunnelListen   = tunnelCmd.Flag("listen", "Local SOCKS5 listen address").Default("127.0.0.1:1080").String()
-	tunnelExecName = tunnelCmd.Flag("executor", "Egress executor's executor_id (see `relay status` -> executors[].executor_id)").Short('w').HintAction(getNodeHints).String()
-	tunnelNodeName = tunnelCmd.Flag("node", "Egress node ID (alias for --executor)").HintAction(getNodeHints).String()
-
-	// tunnel 子命令:隧道由本地 node 持有(类比 dockerd),CLI 仅作控制面经 unix socket 下发
-	// open/close/restart/list。故没有 run(常驻进程已并入 node),也没有独立的 logs/upgrade/status
-	// —— 读取统一走 `relay ps`(TYPE tunnel 行)与 `relay logs <egress>`,tunnel 侧只留写动词。
-	tunnelStartCmd      = tunnelCmd.Command("start", "Start a SOCKS5 tunnel held by the local node")
-	tunnelRestartPolicy = tunnelStartCmd.Flag("restart", "Restart policy on node restart: always|no").Default("no").String()
-	tunnelNoRestart     = tunnelStartCmd.Flag("no-restart", "Shortcut for --restart=no").Bool()
-	_                   = tunnelCmd.Command("stop", "Stop a node-held tunnel")
-	_                   = tunnelCmd.Command("restart", "Restart a node-held tunnel (reopen without retyping flags)")
+	// 隧道没有独立命名空间:创建走 `relay run -t|--type=tunnel`(R14/KD6),生命周期走根级
+	// `start`/`restart`/`stop`/`logs`(R1),读取统一走 `relay ps`(TYPE tunnel 行)。
 
 	// Undo command - 一键恢复远端工作区影子快照 (防误操作与冲突覆盖)
 	undoCmd      = kingpin.Command("undo", "Restore remote workspace shadow snapshot")
@@ -295,24 +284,6 @@ func main() {
 			daemonUpgrade("watch", *watchUpgradePath)
 		case "run":
 			runWatch()
-		default:
-			app.Usage(os.Args[1:])
-		}
-	case selectedCmd == "tunnel" || strings.HasPrefix(selectedCmd, "tunnel "):
-		sub := strings.TrimSpace(strings.TrimPrefix(selectedCmd, "tunnel"))
-		switch sub {
-		case "start":
-			if err := runTunnelStart(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		case "stop":
-			runTunnelStop()
-		case "restart":
-			if err := runTunnelRestart(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
 		default:
 			app.Usage(os.Args[1:])
 		}
@@ -477,15 +448,6 @@ func tunnelInstanceName(executor string) string {
 		}
 	}
 	return b.String()
-}
-
-// tunnelRequireExecutor 校验隧道控制类操作(启动/停止/重启/升级)必须携带 node/executor 并返回目标节点 ID。
-func tunnelRequireExecutor() (string, error) {
-	target := resolveNodeTarget(*tunnelNodeName, *tunnelExecName)
-	if target == "" {
-		return "", fmt.Errorf("Specify --node or --executor with the egress node ID (see `relay status` -> `executors[].executor_id`)")
-	}
-	return target, nil
 }
 
 func runWatch() {

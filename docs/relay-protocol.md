@@ -434,7 +434,7 @@ type StatusResponse struct {
 
 ### 4.9 出网隧道 (本地 SOCKS5 → executor)
 
-`relay tunnel --listen 127.0.0.1:<port> --watch <work>` 本地起一条 SOCKS5 端点,把每个客户端对
+`relay run -t tunnel -p 127.0.0.1:<port> -e <egress>` 本地起一条 SOCKS5 端点,把每个客户端对
 CONNECT 目标的访问经中转转发到所选 executor 的网络出口。**出口(真实 TCP 连接)只在 executor**:它校验
 自己的 `network_allow` 白名单后向目标建连;中转只做字节流透明转发(不落盘、不解析、不执行)。目标白名单在
 executor 侧强制,**默认拒绝**;空/缺省 `network_allow` 拒绝一切建连(fail-closed)。
@@ -475,10 +475,10 @@ type TunnelEnd  struct { StreamID string `json:"stream_id"`; Reason string `json
 **动态注册**(`MsgRegisterExecutor`),不要求预先出现在中转 watch 白名单——中转只是路由层。`relay status`
 与版本台账按 executor 逐条列出所有在线执行方及其构建版本,用户据此得知有哪些出口可选。`relay exec` / `relay push`
 经 `-w <workspace>`(路由到该 workspace 绑定的 executor)或 `-e/--executor <id>`(按 executor_id 节点直连,无需 workspace)
-选定目标执行方;`relay tunnel --executor <id>` 的取值同样直接取**执行方注册的 executor_id**(见 `relay status --json`
+选定目标执行方;`relay run -t tunnel -e <id>` 的取值同样直接取**执行方注册的 executor_id**(见 `relay status --json`
 的 `executors[].executor_id`),与 `exec`/`push` 的 `-w`(工作区名,再映射到该执行方)不同、也不做 cwd 推断,
-`--executor` 必填。`relay status` 不需要 `-w`:它报告整座部署。多台 executor 在线时,本地可并排多条
-`relay tunnel`(不同 `--listen` 端口、各自 `--executor`),分别经各自执行方访问各自内网白名单目标,互不干扰。
+`-e/--executor` 必填(隧道没有工作区那一半)。`relay status` 不需要 `-w`:它报告整座部署。多台 executor 在线时,本地可并排多条
+隧道(`relay run -t tunnel -p <不同端口> -e <各自 egress>`),分别经各自执行方访问各自内网白名单目标,互不干扰。
 
 ### 4.11 任务生命周期消息 (task_list / task_stop / task_restart / task_logs)
 

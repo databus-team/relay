@@ -207,7 +207,7 @@ func (h *forwardHolder) pumpFwdConn(fw *fwdForwarder, conn net.Conn) {
 
 // ensureLocalRelayNode 确保本地 node daemon 处于运行状态(未运行则启动),
 // 并等待其控制 socket(sockPath:端口转发 holder 的 forward.sock,或隧道 holder 的 tunnel.sock)
-// 就绪——以成功拨号为准,而非仅存在文件。CLI 侧 `relay run -d -p` 与 `relay tunnel start` 前调用。
+// 就绪——以成功拨号为准,而非仅存在文件。CLI 侧 `relay run -d -p` 与 `relay run -t tunnel` 前调用。
 // holder 只在 node 的 agent 角色块内启动,因此:
 //   - node 未运行且本配置不能归一化为 agent 角色(显式 roles:[hub])时,自动拉起只会有/无 holder,
 //     直接给出可操作错误而非启动一个无用的纯 hub node;

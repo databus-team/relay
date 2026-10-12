@@ -303,7 +303,7 @@ func (c *Client) handleInboundTunnelEnd(msg protocol.Message) {
 // 不再静默丢字节(那会破坏字节流完整性),而是 fail-closed 关闭并让调用方断开连接。
 var errTunnelBufferOverrun = errors.New("tunnel: requester buffer overrun, stream aborted")
 
-// tunnelStream 供本地 relay tunnel 使用的一条出站隧道:远端 → 本地的字节走 dataCh;
+// tunnelStream 供本机 node 的隧道使用的一条出站隧道:远端 → 本地的字节走 dataCh;
 // 本地 → 远端的字节经 Send 发出。dataCh 是**有界**的:消费端(本地 SOCKS 泵)太慢、
 // 队列满时不再丢弃字节,而是 fail-closed 中止整条隧道(errTunnelBufferOverrun),避免
 // 字节流静默损坏(开发中继中最隐蔽的一类数据完整性缺陷)。

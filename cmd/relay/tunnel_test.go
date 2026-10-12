@@ -28,47 +28,6 @@ func TestTunnelInstanceName(t *testing.T) {
 	}
 }
 
-// tunnelRestartPolicyValue 应把 --restart/--no-restart 归一为 always|no,--no-restart 优先,
-// 缺省为 no,非法值报错。直接置位包级旗标指针并在 defer 中还原。
-func TestTunnelRestartPolicyValue(t *testing.T) {
-	origPolicy, origNoRestart := *tunnelRestartPolicy, *tunnelNoRestart
-	defer func() { *tunnelRestartPolicy, *tunnelNoRestart = origPolicy, origNoRestart }()
-
-	cases := []struct {
-		name      string
-		policy    string
-		noRestart bool
-		want      string
-		wantErr   bool
-	}{
-		{name: "no-restart flag", policy: "always", noRestart: true, want: tunRestartNo},
-		{name: "default empty", policy: "", want: tunRestartNo},
-		{name: "always", policy: "always", want: tunRestartAlways},
-		{name: "no", policy: "no", want: tunRestartNo},
-		{name: "trim and lowercase", policy: "  ALWAYS ", want: tunRestartAlways},
-		{name: "invalid", policy: "bogus", wantErr: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			*tunnelRestartPolicy = tc.policy
-			*tunnelNoRestart = tc.noRestart
-			got, err := tunnelRestartPolicyValue()
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("tunnelRestartPolicyValue(%q, noRestart=%v) = %q, want error", tc.policy, tc.noRestart, got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("tunnelRestartPolicyValue(%q, noRestart=%v): %v", tc.policy, tc.noRestart, err)
-			}
-			if got != tc.want {
-				t.Errorf("tunnelRestartPolicyValue(%q, noRestart=%v) = %q, want %q", tc.policy, tc.noRestart, got, tc.want)
-			}
-		})
-	}
-}
-
 // handshakeOverTCP 用真实 TCP 连接跑一次 SOCKS5 握手(SOCKS 客户端在服务端侧),
 // 返回解析出的目标。TCP 全双工避免 net.Pipe 的同步阻塞问题。
 func handshakeOverTCP(t *testing.T, req []byte) (string, uint16, error) {

@@ -87,8 +87,8 @@ type cmdSpec struct {
 }
 
 var topCommands = []string{
-	"run", "ps", "logs", "stop",
-	"nodes", "tunnel",
+	"run", "start", "restart", "ps", "logs", "stop",
+	"nodes",
 	"push", "pull", "diff", "undo", "ws", "sync",
 	"node", "version", "server-remote", "completion", "job",
 	"server", "watch", "list", "cleanup",
@@ -100,7 +100,7 @@ var globalFlags = []string{
 
 var commandSpecs = map[string]cmdSpec{
 	"run": {
-		flags: []string{"-w", "--watch", "-e", "--executor", "--node", "-f", "--force-remote", "--no-sync", "-d", "--detach", "-p", "--publish", "--bind-host"},
+		flags: []string{"-w", "--watch", "-e", "--executor", "--node", "-f", "--force-remote", "--no-sync", "-d", "--detach", "-p", "--publish", "--bind-host", "-t", "--type", "--restart", "--no-restart"},
 	},
 	"nodes": {
 		flags: []string{"--json", "-u", "--usage"},
@@ -112,6 +112,12 @@ var commandSpecs = map[string]cmdSpec{
 		flags: []string{"-f", "--follow", "--tail", "-e", "--executor", "--node"},
 	},
 	"stop": {
+		flags: []string{"-e", "--executor", "--node"},
+	},
+	"start": {
+		flags: []string{"-e", "--executor", "--node"},
+	},
+	"restart": {
 		flags: []string{"-e", "--executor", "--node"},
 	},
 	"push": {
@@ -141,10 +147,6 @@ var commandSpecs = map[string]cmdSpec{
 	"job": {
 		subcmds: []string{"run"},
 		flags:   []string{"-w", "--watch"},
-	},
-	"tunnel": {
-		subcmds: []string{"start", "stop", "restart"},
-		flags:   []string{"--listen", "-w", "--executor", "--node", "--restart", "--no-restart"},
 	},
 	"server": {
 		subcmds: []string{"run", "start", "stop", "status", "restart", "upgrade"},
