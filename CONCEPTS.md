@@ -5,22 +5,25 @@
 ## Detached execution
 
 ### Detach task
-A command launched remotely via `relay run -d` (or `exec -d`) that keeps running after the CLI session ends. It is supervised by a TaskSupervisor on the executor, which owns its process group, log, and cleanup, and exposes a task identifier used by `relay ps`, `relay logs`, and `relay stop`. Detaching is how long-running servers survive the 30s foreground cap.
+A command launched remotely via `relay run -d` (or `exec -d`) that keeps running after the CLI session ends. It is supervised by a TaskSupervisor on the executor, which owns its process group, log, and cleanup, and exposes a task identifier used by `relay ps`, `relay logs`, `relay stop`, `relay start`, and `relay restart`. Detaching is how long-running servers survive the 30s foreground cap.
 
 A detach task's stdout/stderr are redirected to its own task log by the executor; the exec session stream itself carries only task-control lines (the task ID hand-off), not the command's output.
 
 ### Task ID
-A short string (`t-<hash>`) assigned to a detach task at launch, used to address it in `relay ps/logs/stop`. The CLI obtains it at launch so it can later name the task.
+A short string (`t-<hash>`) assigned to a detach task at launch, used to address it in `relay ps/logs/stop/start/restart`. The CLI obtains it at launch so it can later name the task. A task keeps its ID across a restart — the executor re-runs the recorded command in the same task directory rather than creating a new task.
+
+### Task restart policy
+Per-task `restart=always|no` (default `no`) stored in the task's metadata. The recovery event is the executor's own start: `always` tasks are re-run when the supervisor starts, and it is the only automatic recovery — a crashed process is not restarted on its own. `relay stop <task-id>` clears the policy as it kills the process, so a stopped task never comes back by itself; the record and its log stay readable. A re-run replays the recorded command, working directory, and ports only — the original environment and the default-on git diff sync are not replayed.
 
 ## Port forwarding
 
 ### Local port-forward
-A forwarding rule held by the local `relay node` after a `relay run -d -p` launch: the node listens on the local port, and each inbound connection is pumped over a tunnel to the remote executor's detached task. The node plays the dockerd role — it is the daemon that holds the listen and the port map, and the CLI only registers the rule to it over a unix control socket. The rule is removed when the task is stopped.
+A forwarding rule held by the local `relay node` after a `relay run -d -p` launch: the node listens on the local port, and each inbound connection is pumped over a tunnel to the remote executor's detached task. The node plays the dockerd role — it is the daemon that holds the listen and the port map, and the CLI only registers the rule to it over a unix control socket. The rules live in the node's memory, so they are lost when the node restarts; `relay stop` removes them, and `relay start`/`relay restart` re-register them from the task's recorded ports.
 
 ## Tunnels
 
 ### Node-held tunnel
-A SOCKS5 egress endpoint held by the local `relay node` (agent role), created with `relay tunnel start` — the
+A SOCKS5 egress endpoint held by the local `relay node` (agent role), created with `relay run -t tunnel` — the
 tunnel counterpart of the local port-forward. The node listens on the local address and pumps each inbound
 SOCKS5 connection over a tunnel to the chosen executor's network egress; the executor still validates its own
 `network_allow`. The CLI only sends control messages (`open`/`close`/`restart`/`list`) over the unix control
