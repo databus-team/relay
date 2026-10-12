@@ -1,5 +1,9 @@
 package protocol
 
+// ForwardTaskIDMarker 是 detach 执行时 executor 回写任务 ID 的 stdout 行前缀标记。
+// 使 CLI 端能精确识别任务 ID,而不与任务自身的 stdout 混淆(任务可能先于 ID 回写打印任意输出)。
+const ForwardTaskIDMarker = "__relay_task_id__"
+
 // MessageType 定义所有消息类型
 type MessageType string
 
@@ -135,20 +139,20 @@ type ExecChunk struct {
 // 节点身份(其 backend.config.executor_id),与中转 watch 存储目录是两回事。
 type RegisterExecutorRequest struct {
 	ExecutorID string        `json:"executor_id"`
-	Action     string        `json:"action"`            // "add" / "remove"
-	Version    string        `json:"version,omitempty"` // 执行方 relay 构建版本(用于 relay version 对比)
-	OS         string        `json:"os,omitempty"`      // 执行方操作系统 (runtime.GOOS)
-	Arch       string        `json:"arch,omitempty"`    // 执行方 CPU 架构 (runtime.GOARCH)
-	Resource   ResourceStats `json:"resource,omitempty"`// 执行方资源基准 (轻量静态规格)
+	Action     string        `json:"action"`             // "add" / "remove"
+	Version    string        `json:"version,omitempty"`  // 执行方 relay 构建版本(用于 relay version 对比)
+	OS         string        `json:"os,omitempty"`       // 执行方操作系统 (runtime.GOOS)
+	Arch       string        `json:"arch,omitempty"`     // 执行方 CPU 架构 (runtime.GOARCH)
+	Resource   ResourceStats `json:"resource,omitempty"` // 执行方资源基准 (轻量静态规格)
 }
 
 // VersionInfo 描述部署中一个 relay 节点的构建信息,用于 `relay version` 跨机对比。
 type VersionInfo struct {
-	Role       string `json:"role"`                  // "local"|"transit"|"executor"
-	ExecutorID string `json:"executor_id,omitempty"` // executor 的节点身份;其余角色为空
-	Version    string `json:"version"`
-	Commit     string `json:"commit,omitempty"`
-	BuildTime  string `json:"build_time,omitempty"`
+	Role       string   `json:"role"`                  // "local"|"transit"|"executor"
+	ExecutorID string   `json:"executor_id,omitempty"` // executor 的节点身份;其余角色为空
+	Version    string   `json:"version"`
+	Commit     string   `json:"commit,omitempty"`
+	BuildTime  string   `json:"build_time,omitempty"`
 	GOOS       string   `json:"goos"`
 	GOARCH     string   `json:"goarch"`
 	Go         string   `json:"go"`
@@ -498,4 +502,3 @@ type GitUndoResponse struct {
 	SafetyRef   string `json:"safety_ref,omitempty"`
 	Error       string `json:"error,omitempty"`
 }
-

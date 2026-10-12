@@ -41,12 +41,12 @@ var (
 	watchCmd = kingpin.Command("watch", "Workspace watcher daemon (deprecated, use node instead)")
 
 	// 子命令定义
-	_ = watchCmd.Command("run", "Run watcher in foreground")
-	_ = watchCmd.Command("start", "Start watcher daemon in background")
-	_ = watchCmd.Command("stop", "Stop running watcher daemon")
-	_ = watchCmd.Command("status", "Show status of watcher daemon")
-	_ = watchCmd.Command("restart", "Restart watcher daemon")
-	watchUpgradeCmd = watchCmd.Command("upgrade", "Upgrade watcher daemon binary")
+	_                = watchCmd.Command("run", "Run watcher in foreground")
+	_                = watchCmd.Command("start", "Start watcher daemon in background")
+	_                = watchCmd.Command("stop", "Stop running watcher daemon")
+	_                = watchCmd.Command("status", "Show status of watcher daemon")
+	_                = watchCmd.Command("restart", "Restart watcher daemon")
+	watchUpgradeCmd  = watchCmd.Command("upgrade", "Upgrade watcher daemon binary")
 	watchUpgradePath = watchUpgradeCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 
 	// Pull command - download single file (requires filename)
@@ -136,8 +136,8 @@ var (
 	versionJSONOut = versionCmd.Flag("json", "Output as JSON").Bool()
 
 	// server-remote command - 一键部署中转(受控自升级):上传新二进制 → 中转自检 → 换装 → 核验。
-	serverRemoteCmd = kingpin.Command("server-remote", "Deploy and self-upgrade transit server remotely")
-	serverRemoteBin = serverRemoteCmd.Flag("binary", "Path to the new relay binary to send (default: current executable)").String()
+	serverRemoteCmd    = kingpin.Command("server-remote", "Deploy and self-upgrade transit server remotely")
+	serverRemoteBin    = serverRemoteCmd.Flag("binary", "Path to the new relay binary to send (default: current executable)").String()
 	serverRemoteExpect = serverRemoteCmd.Flag("expect", "Expected transit version after swap (default: this relay's version.String())").String()
 
 	tunnelCmd      = kingpin.Command("tunnel", "Open SOCKS5 egress tunnel through remote node")
@@ -146,19 +146,18 @@ var (
 	tunnelNodeName = tunnelCmd.Flag("node", "Egress node ID (alias for --executor)").HintAction(getNodeHints).String()
 
 	// tunnel 子命令
-	_ = tunnelCmd.Command("run", "Run SOCKS5 egress tunnel in foreground")
-	_ = tunnelCmd.Command("start", "Start tunnel daemon in background")
-	_ = tunnelCmd.Command("stop", "Stop running tunnel daemon")
-	tunnelStatusCmd = tunnelCmd.Command("status", "Show status of tunnel daemon and egress readiness")
-	tunnelJSON      = tunnelStatusCmd.Flag("json", "Output as JSON").Bool()
-	tunnelLogsCmd   = tunnelCmd.Command("logs", "Tail or stream tunnel daemon logs")
-	tunnelFollow    = tunnelLogsCmd.Flag("follow", "Follow log output").Short('f').Bool()
-	tunnelTail      = tunnelLogsCmd.Flag("tail", "Number of lines to show from the end").Default("100").Int()
-	tunnelLogsTarget = tunnelLogsCmd.Arg("target", "Target node ID").HintAction(getNodeHints).String()
-	_ = tunnelCmd.Command("restart", "Restart tunnel daemon")
-	tunnelUpgradeCmd = tunnelCmd.Command("upgrade", "Upgrade tunnel daemon binary")
+	_                 = tunnelCmd.Command("run", "Run SOCKS5 egress tunnel in foreground")
+	_                 = tunnelCmd.Command("start", "Start tunnel daemon in background")
+	_                 = tunnelCmd.Command("stop", "Stop running tunnel daemon")
+	tunnelStatusCmd   = tunnelCmd.Command("status", "Show status of tunnel daemon and egress readiness")
+	tunnelJSON        = tunnelStatusCmd.Flag("json", "Output as JSON").Bool()
+	tunnelLogsCmd     = tunnelCmd.Command("logs", "Tail or stream tunnel daemon logs")
+	tunnelFollow      = tunnelLogsCmd.Flag("follow", "Follow log output").Short('f').Bool()
+	tunnelTail        = tunnelLogsCmd.Flag("tail", "Number of lines to show from the end").Default("100").Int()
+	tunnelLogsTarget  = tunnelLogsCmd.Arg("target", "Target node ID").HintAction(getNodeHints).String()
+	_                 = tunnelCmd.Command("restart", "Restart tunnel daemon")
+	tunnelUpgradeCmd  = tunnelCmd.Command("upgrade", "Upgrade tunnel daemon binary")
 	tunnelUpgradePath = tunnelUpgradeCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
-
 
 	// Undo command - 一键恢复远端工作区影子快照 (防误操作与冲突覆盖)
 	undoCmd      = kingpin.Command("undo", "Restore remote workspace shadow snapshot")
@@ -191,7 +190,6 @@ func main() {
 		backend.SetDebug(true)
 		logx.SetDebug(true)
 	}
-
 
 	parseCtx, parseErr := kingpin.CommandLine.ParseContext(os.Args[1:])
 	if parseErr == nil && parseCtx != nil {
@@ -350,7 +348,6 @@ func main() {
 		app.Usage(os.Args[1:])
 	}
 }
-
 
 // daemonStart 已运行则提示,否则 detached 拉起 `relay <name> run -c <config>` 并记录 pid。
 func daemonStart(name string) error {
@@ -1208,6 +1205,16 @@ func runExec() {
 		defer stopPF()
 	}
 
+	// detach 模式 + 端口转发:确保本地 node daemon(端口转发持有者)运行并等待其控制 socket 就绪。
+	// 与前台 -p 不同,这里本地监听由常驻 node 维持而非当前 CLI 进程。
+	var detachTaskID string
+	if len(pfSpecs) > 0 && *execDetach {
+		if err := ensureLocalRelayNode(cfg, forwardSockPath()); err != nil {
+			fmt.Fprintf(os.Stderr, "Port-forward error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	// Get command directory, default to /tmp/relay-commands
 	commandDir := "/tmp/relay-commands"
 	if dir, ok := cfg.Backend.Config["command_dir"].(string); ok {
@@ -1273,6 +1280,13 @@ func runExec() {
 		}
 		exit, err := eb.ExecStreamWithPorts(ctx, targetExecutor, cmd, execCwd, 0, gitSyncPayload, *execDetach, portStrs, func(chunk backend.ExecChunk) {
 			if chunk.Stdout {
+				// detach 时从 stdout 捕获任务 ID(marker 前缀精确解析)。
+				if *execDetach && detachTaskID == "" {
+					if id, ok := captureDetachTaskID(chunk.Data); ok {
+						detachTaskID = id
+						return // 标记行不回显给用户 stdout
+					}
+				}
 				os.Stdout.WriteString(chunk.Data)
 			} else {
 				os.Stderr.WriteString(chunk.Data)
@@ -1281,6 +1295,29 @@ func runExec() {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Exec error: %v\n", err)
 			os.Exit(1)
+		}
+		// detach + 端口转发:远端任务已启动,向本地 node 注册端口转发以维持常驻监听。
+		if *execDetach && len(pfSpecs) > 0 {
+			if detachTaskID == "" {
+				// 未捕获任务 ID 是硬故障:远端任务已 detach,本地端口将不可达,静默 exit 0 会误导用户。
+				fmt.Fprintf(os.Stderr, "Error: failed to capture task ID from remote; local port-forward not registered\n")
+				os.Exit(1)
+			}
+			registered, rejected, regErr := sendForwardRegister(forwardSockPath(), detachTaskID, targetExecutor, pfSpecs)
+			if regErr != nil {
+				fmt.Fprintf(os.Stderr, "Port-forward register error: %v\n", regErr)
+				os.Exit(1)
+			}
+			for _, a := range registered {
+				fmt.Printf("➜ [port-forward] %s still listening (task %s)\n", a, detachTaskID)
+			}
+			for _, r := range rejected {
+				fmt.Fprintf(os.Stderr, "WARNING: %s (task %s)\n", r, detachTaskID)
+			}
+			// 已输出转发行,不再重复 echo task ID(转发行内已含 task id)。
+		} else if *execDetach && detachTaskID != "" {
+			// detach 无 -p 时,CLI 需把解析出的任务 ID 回显给用户(--detach 承诺返回 TaskID)。
+			fmt.Println(detachTaskID)
 		}
 		if exit != 0 {
 			os.Exit(exit)
@@ -1483,21 +1520,28 @@ func runStop() {
 		os.Exit(1)
 	}
 	fmt.Printf("Stopped task %s\n", *stopTaskID)
+
+	// 联动撤销本地 node 持有的对应端口转发(若存在):远端任务已停,释放本机监听。
+	// 仅当本机 node daemon 在运行(其 holder 才持有本地转发)时尝试 unregister;node 未运行
+	// (含 kill -9 残留的陈旧 socket)时该任务本就没有本地转发,静默跳过避免误导性告警。
+	if d := daemon.Get(daemon.PidFile("node")); d.Running {
+		if err := sendForwardUnregister(forwardSockPath(), *stopTaskID); err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: failed to stop local port-forward for task %s: %v\n", *stopTaskID, err)
+		}
+	}
 }
 
 // statusTimeout 是 `relay status` 单条命令的上限(含对中转 status 请求的等待)。
 const statusTimeout = 15 * time.Second
 
-
-
 // PeerNodeItem 描述拓扑中的一个对等节点
 type PeerNodeItem struct {
-	ID       string `json:"id"`
-	Role     string `json:"role"`
-	Status   string `json:"status"`
-	Platform string `json:"platform"`
-	CPU      string `json:"cpu"`
-	Memory   string `json:"memory"`
+	ID       string   `json:"id"`
+	Role     string   `json:"role"`
+	Status   string   `json:"status"`
+	Platform string   `json:"platform"`
+	CPU      string   `json:"cpu"`
+	Memory   string   `json:"memory"`
 	Version  string   `json:"version"`
 	Latency  string   `json:"latency"`
 	Args     []string `json:"args,omitempty"`

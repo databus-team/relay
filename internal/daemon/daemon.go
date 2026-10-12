@@ -28,6 +28,9 @@ func PidFile(name string) string { return filepath.Join(baseDir(), name+".pid") 
 // LogFile 返回 <name>.log 的路径。
 func LogFile(name string) string { return filepath.Join(baseDir(), name+".log") }
 
+// SockFile 返回 <name>.sock 的路径(缺省在 ~/.relay 下),与 PidFile/LogFile 共用同一 baseDir 保证。
+func SockFile(name string) string { return filepath.Join(baseDir(), name+".sock") }
+
 // Instance 描述一个多实例 daemon 的单个实例,供 `ListInstances` 返回。
 type Instance struct {
 	Name    string     // 实例标识,如 `tunnel-<executor>`

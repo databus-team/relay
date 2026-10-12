@@ -19,12 +19,12 @@ var (
 	nodeCmd = kingpin.Command("node", "Run unified peer node daemon (hub and agent roles)")
 
 	// 子命令定义
-	_ = nodeCmd.Command("run", "Run node daemon in foreground")
-	_ = nodeCmd.Command("start", "Start node daemon in background")
-	_ = nodeCmd.Command("stop", "Stop running node daemon")
-	_ = nodeCmd.Command("status", "Show status of node daemon")
-	_ = nodeCmd.Command("restart", "Restart node daemon")
-	nodeUpgradeCmd = nodeCmd.Command("upgrade", "Upgrade node daemon binary")
+	_               = nodeCmd.Command("run", "Run node daemon in foreground")
+	_               = nodeCmd.Command("start", "Start node daemon in background")
+	_               = nodeCmd.Command("stop", "Stop running node daemon")
+	_               = nodeCmd.Command("status", "Show status of node daemon")
+	_               = nodeCmd.Command("restart", "Restart node daemon")
+	nodeUpgradeCmd  = nodeCmd.Command("upgrade", "Upgrade node daemon binary")
 	nodeUpgradePath = nodeUpgradeCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 	nodeConfigPath  = nodeCmd.Flag("server-config", "Path to server config file (YAML, for backward compatibility)").String()
 )
@@ -128,6 +128,21 @@ func runNode() error {
 				return
 			}
 			w.SetPushJobHandler(runLocalJobsForPush)
+
+			// 端口转发持有者:本机 node 作为 dockerd,接收 CLI 的 register 控制以维持
+			// `relay run -d -p` 的本地转发,即使发起 CLI 已退出仍保持监听。
+			go func() {
+				rb, err := getRelayBackend(cfg)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "[Node] Port-forward holder disabled: %v\n", err)
+					return
+				}
+				defer rb.Close()
+				holder := newForwardHolder(ctx, rb, forwardSockPath())
+				if err := holder.Run(); err != nil && err != context.Canceled {
+					fmt.Fprintf(os.Stderr, "[Node] Port-forward holder error: %v\n", err)
+				}
+			}()
 
 			if err := w.Run(ctx); err != nil && err != context.Canceled {
 				fmt.Fprintf(os.Stderr, "[Node] Agent error: %v\n", err)

@@ -12,12 +12,12 @@ import (
 	relaybackend "github.com/user/relay/internal/relay/backend"
 )
 
-// PortForwardSpec 描述一条端口转发规则
+// PortForwardSpec 描述一条端口转发规则。json tag 使其可直接作为 node<->CLI 控制 socket 的 wire 类型。
 type PortForwardSpec struct {
-	BindHost   string
-	LocalPort  int
-	RemoteHost string
-	RemotePort int
+	BindHost   string `json:"bind"`
+	LocalPort  int    `json:"local_port"`
+	RemoteHost string `json:"remote_host"`
+	RemotePort int    `json:"remote_port"`
 }
 
 // String 返回规格的标准字符串表示，例如 "8080"、"8080:9000" 或 "8080:db.local:5432"

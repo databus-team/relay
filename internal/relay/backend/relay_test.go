@@ -16,6 +16,7 @@ import (
 	bk "github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/config"
 	"github.com/user/relay/internal/relay/client"
+	"github.com/user/relay/internal/relay/protocol"
 	"github.com/user/relay/internal/relay/server"
 	"github.com/user/relay/internal/sync/git"
 )
@@ -776,9 +777,11 @@ func TestEndToEnd_TaskSupervisor(t *testing.T) {
 		t.Errorf("detach command took too long: %s (expected non-blocking)", dur)
 	}
 
-	taskID := strings.TrimSpace(taskIDOut.String())
+	taskIDRaw := strings.TrimSpace(taskIDOut.String())
+	// backend 层 detach 输出现在以 ForwardTaskIDMarker 为前缀回写任务 ID,供调用方精确识别。
+	taskID := strings.TrimSpace(strings.TrimPrefix(taskIDRaw, protocol.ForwardTaskIDMarker))
 	if !strings.HasPrefix(taskID, "t-") {
-		t.Fatalf("invalid taskID output: %q", taskID)
+		t.Fatalf("invalid taskID output: %q", taskIDRaw)
 	}
 
 	// 4. 查询任务列表 (ps)

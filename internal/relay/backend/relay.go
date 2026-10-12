@@ -275,8 +275,6 @@ func Cleanup() {
 	}
 }
 
-
-
 func (b *RelayBackend) getSupervisor() *supervisor.Supervisor {
 	b.supMu.Lock()
 	defer b.supMu.Unlock()
@@ -738,7 +736,8 @@ func (b *RelayBackend) handleInboundExec(sess *client.ExecSession) {
 			return
 		}
 		log.Printf("[exec -d] task started: id=%s pid=%d (watch=%s, ports=%v)", task.Meta().ID, task.Meta().PID, sess.ExecutorID(), task.Meta().Ports)
-		_ = sess.Write(true, fmt.Sprintf("%s\n", task.Meta().ID))
+		// 任务 ID 以带标记的单行回写,CLI 端据此前缀精确捕获,避免与任务自身的 stdout 混淆。
+		_ = sess.Write(true, fmt.Sprintf("%s%s\n", protocol.ForwardTaskIDMarker, task.Meta().ID))
 		_ = sess.Done(protocol.ExecResponse{
 			ExitCode: 0,
 			Stdout:   task.Meta().ID,
