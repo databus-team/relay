@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -90,23 +92,23 @@ var (
 	execCmdStr = execCmd.Arg("command", "Command to execute (multiple words are joined)").Required().Strings()
 
 	// ps command - 查询后台任务
-	psCmd  = kingpin.Command("ps", "List managed background tasks (similar to docker ps)")
+	psCmd  = kingpin.Command("ps", "List managed background tasks and node-held tunnels (similar to docker ps)")
 	psAll  = psCmd.Flag("all", "Show all tasks (default shows running only)").Short('a').Bool()
 	psExec = psCmd.Flag("executor", "Filter tasks by executor node").Short('e').HintAction(getNodeHints).String()
 	psNode = psCmd.Flag("node", "Filter tasks by node ID (alias for --executor)").HintAction(getNodeHints).String()
 	psJSON = psCmd.Flag("json", "Output as JSON").Bool()
 
 	// logs command - 查看任务日志
-	logsCmd    = kingpin.Command("logs", "Tail or stream background task logs (similar to docker logs)")
-	logsTaskID = logsCmd.Arg("task-id", "Task ID to view").Required().String()
+	logsCmd    = kingpin.Command("logs", "Tail or stream background task logs, or a node-held tunnel's log (similar to docker logs)")
+	logsTaskID = logsCmd.Arg("task-id", "Task ID or tunnel egress to view").Required().String()
 	logsFollow = logsCmd.Flag("follow", "Follow log output").Short('f').Bool()
 	logsTail   = logsCmd.Flag("tail", "Number of lines to show from the end").Default("100").Int()
 	logsExec   = logsCmd.Flag("executor", "Target executor node").Short('e').HintAction(getNodeHints).String()
 	logsNode   = logsCmd.Flag("node", "Target node ID (alias for --executor)").HintAction(getNodeHints).String()
 
 	// stop command - 终止后台任务
-	stopCmd    = kingpin.Command("stop", "Terminate running task process tree (similar to docker stop)")
-	stopTaskID = stopCmd.Arg("task-id", "Task ID to stop").Required().String()
+	stopCmd    = kingpin.Command("stop", "Terminate a running task process tree or a node-held tunnel (similar to docker stop)")
+	stopTaskID = stopCmd.Arg("task-id", "Task ID or tunnel egress to stop").Required().String()
 	stopExec   = stopCmd.Flag("executor", "Target executor node").Short('e').HintAction(getNodeHints).String()
 	stopNode   = stopCmd.Flag("node", "Target node ID (alias for --executor)").HintAction(getNodeHints).String()
 
@@ -1301,6 +1303,90 @@ func runExec() {
 	fmt.Print(result)
 }
 
+// psRow 是 relay ps 的统一行:本地 node 持有的隧道 + 远端 detach 任务合并呈现。
+type psRow struct {
+	Type    string `json:"type"` // "task" | "tunnel"
+	ID      string `json:"id"`
+	Node    string `json:"node,omitempty"`
+	Status  string `json:"status"`
+	Ports   string `json:"ports,omitempty"`   // task: comma-joined; tunnel: the listen address
+	Exit    string `json:"exit,omitempty"`    // task: exit code or "-"
+	Created string `json:"created,omitempty"` // 相对时间("3m ago")
+	Command string `json:"command"`           // task: cmd; tunnel: "egress <egress>"
+	Egress  string `json:"egress,omitempty"`  // tunnel only
+	Restart string `json:"restart,omitempty"` // tunnel only
+}
+
+// taskToPSRow 把一个远端 detach 任务投影为统一行。纯函数,便于单测。
+// 字段裁剪复刻旧 runPs 行为:Node 空 → (unknown),Cmd 超 35 字符 → 前 32 + "..."。
+func taskToPSRow(t backend.TaskInfo) psRow {
+	nodeDisp := t.Node
+	if nodeDisp == "" {
+		nodeDisp = "(unknown)"
+	}
+	portsDisp := "-"
+	if len(t.Ports) > 0 {
+		portsDisp = strings.Join(t.Ports, ",")
+		if len(portsDisp) > 16 {
+			portsDisp = portsDisp[:13] + "..."
+		}
+	}
+	exitDisp := "-"
+	if t.Status != "running" {
+		exitDisp = fmt.Sprintf("%d", t.ExitCode)
+	}
+	cmdDisp := t.Cmd
+	if len(cmdDisp) > 35 {
+		cmdDisp = cmdDisp[:32] + "..."
+	}
+	return psRow{
+		Type:    "task",
+		ID:      t.ID,
+		Node:    nodeDisp,
+		Status:  t.Status,
+		Ports:   portsDisp,
+		Exit:    exitDisp,
+		Created: formatRelativeTime(time.Unix(t.StartTime, 0)),
+		Command: cmdDisp,
+	}
+}
+
+// tunnelToPSRow 把本地 node 持有的一条隧道投影为统一行。纯函数,便于单测。
+func tunnelToPSRow(ts tunnelState) psRow {
+	createdDisp := "-"
+	if !ts.Started.IsZero() {
+		createdDisp = formatRelativeTime(ts.Started)
+	}
+	return psRow{
+		Type:    "tunnel",
+		ID:      ts.Egress,
+		Node:    ts.Egress,
+		Status:  ts.State,
+		Ports:   ts.Listen,
+		Exit:    "-",
+		Created: createdDisp,
+		Command: "egress " + ts.Egress,
+		Egress:  ts.Egress,
+		Restart: ts.Restart,
+	}
+}
+
+// filterTunnelsForPS 按 ps 语义过滤隧道:指定 target 时只留该 egress;未加 -a 时只留 running
+// (加 -a 连 stopped 意图一并展示,与 docker ps -a 一致)。
+func filterTunnelsForPS(states []tunnelState, target string, all bool) []tunnelState {
+	out := make([]tunnelState, 0, len(states))
+	for _, st := range states {
+		if target != "" && st.Egress != target {
+			continue
+		}
+		if !all && st.State != "running" {
+			continue
+		}
+		out = append(out, st)
+	}
+	return out
+}
+
 func runPs() {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -1308,36 +1394,55 @@ func runPs() {
 		os.Exit(1)
 	}
 
-	b, err := getBackendWithAdaptiveLoopback(cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create backend: %v\n", err)
-		os.Exit(1)
-	}
-
-	tb, ok := b.(backend.TaskSupervisorBackend)
-	if !ok {
-		fmt.Fprintf(os.Stderr, "Backend %q does not support task supervisor\n", cfg.Backend.Type)
-		os.Exit(1)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
 	targetNode := resolveNodeTarget(*psNode, *psExec)
-	tasks, err := tb.TaskList(ctx, targetNode, *psAll)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ps failed: %v\n", err)
-		os.Exit(1)
+
+	// 远端任务是「尽力而为」:本地 node 持有的隧道不经中转,后端建不出来(或中转暂不可达)
+	// 也必须照常展示本地隧道,故这里只告警不退出。
+	var tasks []backend.TaskInfo
+	if b, berr := getBackendWithAdaptiveLoopback(cfg); berr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: create backend: %v\n", berr)
+	} else if tb, ok := b.(backend.TaskSupervisorBackend); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ts, lerr := tb.TaskList(ctx, targetNode, *psAll)
+		cancel()
+		if lerr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: list remote tasks: %v\n", lerr)
+		} else {
+			tasks = ts
+		}
+	}
+
+	// 本地隧道只在 node 在运行时才可能被持有;node 未运行即视为无隧道(不隐式拉起)。
+	var tunnels []tunnelState
+	if daemon.Get(daemon.PidFile("node")).Running {
+		resp, terr := sendTunnelControl(tunnelSockPath(), tunControlMsg{Op: tunOpList})
+		switch {
+		case terr != nil:
+			fmt.Fprintf(os.Stderr, "Warning: list local tunnels: %v\n", terr)
+		case !resp.OK:
+			fmt.Fprintf(os.Stderr, "Warning: list local tunnels: %s\n", resp.Error)
+		default:
+			tunnels = filterTunnelsForPS(resp.Tunnels, targetNode, *psAll)
+		}
+	}
+
+	// 合并:任务行在前,隧道行在后。
+	rows := make([]psRow, 0, len(tasks)+len(tunnels))
+	for _, t := range tasks {
+		rows = append(rows, taskToPSRow(t))
+	}
+	for _, ts := range tunnels {
+		rows = append(rows, tunnelToPSRow(ts))
 	}
 
 	if *psJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(tasks)
+		_ = enc.Encode(rows)
 		return
 	}
 
-	if len(tasks) == 0 {
+	if len(rows) == 0 {
 		if *psAll {
 			fmt.Println("No tasks found.")
 		} else {
@@ -1346,29 +1451,9 @@ func runPs() {
 		return
 	}
 
-	fmt.Printf("%-12s %-16s %-10s %-16s %-6s %-16s %s\n", "TASK ID", "NODE", "STATUS", "PORTS", "EXIT", "CREATED", "COMMAND")
-	for _, t := range tasks {
-		createdStr := formatRelativeTime(time.Unix(t.StartTime, 0))
-		exitStr := "-"
-		if t.Status != "running" {
-			exitStr = fmt.Sprintf("%d", t.ExitCode)
-		}
-		cmdDisp := t.Cmd
-		if len(cmdDisp) > 35 {
-			cmdDisp = cmdDisp[:32] + "..."
-		}
-		nodeDisp := t.Node
-		if nodeDisp == "" {
-			nodeDisp = "(unknown)"
-		}
-		portsDisp := "-"
-		if len(t.Ports) > 0 {
-			portsDisp = strings.Join(t.Ports, ",")
-			if len(portsDisp) > 16 {
-				portsDisp = portsDisp[:13] + "..."
-			}
-		}
-		fmt.Printf("%-12s %-16s %-10s %-16s %-6s %-16s %s\n", t.ID, nodeDisp, t.Status, portsDisp, exitStr, createdStr, cmdDisp)
+	fmt.Printf("%-8s %-12s %-16s %-10s %-16s %-6s %-16s %s\n", "TYPE", "TASK ID", "NODE", "STATUS", "PORTS", "EXIT", "CREATED", "COMMAND")
+	for _, r := range rows {
+		fmt.Printf("%-8s %-12s %-16s %-10s %-16s %-6s %-16s %s\n", r.Type, r.ID, r.Node, r.Status, r.Ports, r.Exit, r.Created, r.Command)
 	}
 }
 
@@ -1407,15 +1492,26 @@ func runLogs() {
 
 	ctx := context.Background()
 	targetNode := resolveNodeTarget(*logsNode, *logsExec)
+	// 显式给了 -e/-w 时按任务直接寻址(与 runStop 同构),不再做任务名解析;
+	// 只有在未指定目标时才在任务台账里反查节点,查不到即回退到本地隧道日志。
+	knownTask := targetNode != ""
 	if targetNode == "" {
 		if tasks, err := tb.TaskList(ctx, "", true); err == nil {
 			for _, t := range tasks {
 				if t.ID == *logsTaskID {
 					targetNode = t.Node
+					knownTask = true
 					break
 				}
 			}
 		}
+	}
+	if !knownTask {
+		if showTunnelLogs(*logsTaskID, *logsFollow, *logsTail) {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "logs failed: no task or tunnel named %s\n", *logsTaskID)
+		os.Exit(1)
 	}
 	err = tb.TaskLogs(ctx, targetNode, *logsTaskID, *logsFollow, *logsTail, func(chunk backend.ExecChunk) {
 		if chunk.Stdout {
@@ -1427,6 +1523,136 @@ func runLogs() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "logs failed: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+// tunnelLogLineMatches 判断一行 node 日志是否属于指定 egress 的隧道。隧道日志统一带字面前缀
+// `[tunnel <egress>]`;此处要求连右括号一起匹配,避免 egress 前缀相同的隧道互相误吞
+// (如 `eg-node` 不应匹配 `[tunnel eg-node-2]`)。纯函数,便于单测。
+func tunnelLogLineMatches(line, egress string) bool {
+	return strings.Contains(line, "[tunnel "+egress+"]")
+}
+
+// readTunnelLogLines 全量读取 node 日志中属于 egress 的行(隧道已并入 node 进程,日志同文件)。
+func readTunnelLogLines(logPath, egress string) ([]string, error) {
+	f, err := os.Open(logPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var out []string
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		if line := sc.Text(); tunnelLogLineMatches(line, egress) {
+			out = append(out, line)
+		}
+	}
+	return out, sc.Err()
+}
+
+// showTunnelLogs 把 `relay logs <egress>` 落到 node 日志上,只呈现该隧道的行。返回 false 表示
+// 没有可展示的内容(node 未运行/日志文件不存在/无匹配行),由调用方决定报错文案。
+func showTunnelLogs(egress string, follow bool, tailLines int) bool {
+	if tailLines <= 0 {
+		tailLines = 100
+	}
+	logPath := daemon.LogFile("node")
+	lines, err := readTunnelLogLines(logPath, egress)
+	if err != nil || len(lines) == 0 {
+		fmt.Fprintf(os.Stderr, "node log has no lines for tunnel %q (the node may be running in the foreground; its tunnel logs go to stderr, not %s).\n", egress, shortenPath(logPath))
+		return false
+	}
+
+	start := 0
+	if len(lines) > tailLines {
+		start = len(lines) - tailLines
+	}
+	for _, l := range lines[start:] {
+		fmt.Println(l)
+	}
+
+	if follow {
+		followTunnelLog(logPath, egress)
+	}
+	return true
+}
+
+// followTunnelLog 轮询 node 日志新增内容,只打印属于 egress 的行,直到收到 SIGINT/SIGTERM。
+func followTunnelLog(logPath, egress string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		<-sigCh
+		cancel()
+	}()
+
+	// 从当前文件末尾起追,避免重复打印刚刚 tail 过的内容。
+	var offset int64
+	if fi, err := os.Stat(logPath); err == nil {
+		offset = fi.Size()
+	}
+	pending := "" // 跨轮次的半行缓冲
+
+	ticker := time.NewTicker(300 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			f, err := os.Open(logPath)
+			if err != nil {
+				continue
+			}
+			fi, err := f.Stat()
+			if err != nil {
+				_ = f.Close()
+				continue
+			}
+			if fi.Size() < offset { // rotate/truncate:从头再读
+				offset, pending = 0, ""
+			}
+			if fi.Size() == offset {
+				_ = f.Close()
+				continue
+			}
+			if _, err := f.Seek(offset, io.SeekStart); err != nil {
+				_ = f.Close()
+				continue
+			}
+			buf := make([]byte, 32*1024)
+			chunk := make([]byte, 0, 4096)
+			for {
+				n, rerr := f.Read(buf)
+				if n > 0 {
+					chunk = append(chunk, buf[:n]...)
+					offset += int64(n)
+				}
+				if rerr != nil {
+					break
+				}
+			}
+			_ = f.Close()
+
+			pending += string(chunk)
+			for {
+				idx := strings.IndexByte(pending, '\n')
+				if idx < 0 {
+					break
+				}
+				line := pending[:idx]
+				pending = pending[idx+1:]
+				if tunnelLogLineMatches(line, egress) {
+					fmt.Println(line)
+				}
+			}
+		}
 	}
 }
 
@@ -1463,7 +1689,19 @@ func runStop() {
 			}
 		}
 	}
+	// ID 不是已知任务:退回本地 node 持有的隧道(egress 身份,如 `relay stop eg-node`)。
+	if targetNode == "" {
+		if stopLocalTunnel(*stopTaskID) {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "stop failed: no task or tunnel named %s\n", *stopTaskID)
+		os.Exit(1)
+	}
 	if err := tb.TaskStop(ctx, targetNode, *stopTaskID); err != nil {
+		// 兜底:ID 也可能恰是一条隧道 egress。任务停不掉时再试一次本地隧道,能关掉就不算失败。
+		if stopLocalTunnel(*stopTaskID) {
+			return
+		}
 		fmt.Fprintf(os.Stderr, "stop failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -1477,6 +1715,23 @@ func runStop() {
 			fmt.Fprintf(os.Stderr, "WARNING: failed to stop local port-forward for task %s: %v\n", *stopTaskID, err)
 		}
 	}
+}
+
+// stopLocalTunnel 关闭本地 node 持有的一条隧道(供 relay stop 复用)。node 未运行、socket
+// 不可达或 holder 未命中该 egress 时均返回 false(调用方据此回落到原有的报错路径)。
+func stopLocalTunnel(egress string) bool {
+	if egress == "" {
+		return false
+	}
+	if !daemon.Get(daemon.PidFile("node")).Running {
+		return false
+	}
+	resp, err := sendTunnelControl(tunnelSockPath(), tunControlMsg{Op: tunOpClose, Egress: egress})
+	if err != nil || !resp.OK {
+		return false
+	}
+	fmt.Printf("Stopped tunnel %s\n", egress)
+	return true
 }
 
 // statusTimeout 是 `relay status` 单条命令的上限(含对中转 status 请求的等待)。
