@@ -88,8 +88,9 @@ var (
 	// -t/--type 选择创建的对象:缺省 task(在远端跑命令);tunnel 则在本机 node 上开一条 SOCKS5 隧道。
 	execType = execCmd.Flag("type", "Object type to create: task (default) or tunnel").Short('t').String()
 	// --restart/--no-restart 是任务与隧道共用的重启策略旗标对(隧道模式写入隧道意图 R14;
-	// 任务的写入/校验由任务模式实现负责)。校验抽成 restartPolicyValue 纯函数共用。
-	execRestartPolicy = execCmd.Flag("restart", "Restart policy on node restart: always|no").Default("no").String()
+	// 任务的写入/校验由任务模式实现负责)。缺省留空以便区分「未给出」与「显式 --restart=no」,
+	// 任务模式据此要求 -d(R5);取值校验抽成 restartPolicyValue 纯函数共用。
+	execRestartPolicy = execCmd.Flag("restart", "Restart policy on node restart: always|no").String()
 	execNoRestart     = execCmd.Flag("no-restart", "Shortcut for --restart=no").Bool()
 	// 支持多词命令:relay run git status 会收成 ["git","status"] 再空格 join。
 	// 含以 - 开头参数的命令(如 git log --oneline)仍须整体加引号,避免被当 flag。
@@ -501,6 +502,10 @@ func runWatch() {
 	// 这样配置里的 executor: true 只在 relay watch 生效;本地 CLI(exec/push/sync)
 	// 即便共用同一份包含 executor 的配置,也不会自注册为执行方、把命令转发回本机。
 	relaybackend.SetExecutorRole(true)
+
+	// 执行方进程启动路径:显式构造 supervisor 并重放策略为 always 的任务一次(KTD4)。
+	// 每进程只触发一次;单条失败不阻塞启动,原因写入该任务自己的日志。
+	relaybackend.ReplayAlwaysTasks()
 
 	w, err := watcher.New(cfg, cfgPath)
 	if err != nil {
@@ -1127,6 +1132,22 @@ func resolveTunnelMode(in tunnelModeInput) (*tunnelModeRequest, error) {
 	return &tunnelModeRequest{Listen: listen, Egress: egress, Restart: policy}, nil
 }
 
+// resolveTaskRestartPolicy 校验任务模式的 --restart/--no-restart(R5):取值复用与隧道共用的
+// restartPolicyValue 纯函数;任一旗标显式给出时都要求 -d/--detach —— 前台执行没有可承载策略
+// 的受管任务,带它时直接报错,不静默忽略。纯函数,不读全局旗标,便于单测与隧道命名空间退役后
+// 独立使用。
+func resolveTaskRestartPolicy(policy string, noRestart, detach bool) (string, error) {
+	resolved, err := restartPolicyValue(policy, noRestart)
+	if err != nil {
+		return "", err
+	}
+	explicit := strings.TrimSpace(policy) != "" || noRestart
+	if explicit && !detach {
+		return "", fmt.Errorf("--restart/--no-restart requires -d/--detach (a foreground run has no managed task to carry a restart policy)")
+	}
+	return resolved, nil
+}
+
 // requireTaskCommand 校验任务模式必须有位置命令。kingpin 层不再声明 Required,
 // 改为按模式校验(KTD7:隧道模式必须没有命令,任务模式必须有)。
 func requireTaskCommand(command []string) error {
@@ -1145,12 +1166,19 @@ func runExec() {
 
 	// 模式分支(KTD7):置于工作区/执行方解析之前,隧道模式直接走创建流程,不解析工作区,
 	// 也不需要命令;任务模式(默认)保持既有行为。两种路径的旗标规则互不干扰。
+	var taskRestart string
 	switch mode := strings.ToLower(strings.TrimSpace(*execType)); mode {
 	case "", "task":
 		if err := requireTaskCommand(*execCmdStr); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+		policy, err := resolveTaskRestartPolicy(*execRestartPolicy, *execNoRestart, *execDetach)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		taskRestart = policy
 	case "tunnel":
 		req, err := resolveTunnelMode(tunnelModeInput{
 			Command:   *execCmdStr,
@@ -1336,7 +1364,7 @@ func runExec() {
 		for _, spec := range pfSpecs {
 			portStrs = append(portStrs, spec.String())
 		}
-		exit, err := eb.ExecStreamWithPorts(ctx, targetExecutor, cmd, execCwd, 0, gitSyncPayload, *execDetach, portStrs, func(chunk backend.ExecChunk) {
+		exit, err := eb.ExecStreamWithPorts(ctx, targetExecutor, cmd, execCwd, 0, gitSyncPayload, *execDetach, portStrs, taskRestart, func(chunk backend.ExecChunk) {
 			if chunk.Stdout {
 				// detach 时从 stdout 捕获任务 ID(marker 前缀精确解析)。
 				if *execDetach && detachTaskID == "" {

@@ -352,8 +352,9 @@ type ExecRequest struct {
 	Cwd        string          `json:"cwd,omitempty"`
 	Timeout    int             `json:"timeout"`
 	GitSync    *GitSyncPayload `json:"git_sync,omitempty"`
-	Detach     bool            `json:"detach,omitempty"` // true = 后台托管运行并立即返回 TaskID
-	Ports      []string        `json:"ports,omitempty"`  // 关联的端口映射信息, 如 ["8080:8080"]
+	Detach     bool            `json:"detach,omitempty"`  // true = 后台托管运行并立即返回 TaskID
+	Ports      []string        `json:"ports,omitempty"`   // 关联的端口映射信息, 如 ["8080:8080"]
+	Restart    string          `json:"restart,omitempty"` // 后台任务的 restart 策略(always|no), 仅 detach 时有意义
 }
 
 // TaskInfo 描述跨机传输的任务简报
@@ -368,6 +369,8 @@ type TaskInfo struct {
 	ExitCode  int      `json:"exit_code"`
 	StartTime int64    `json:"start_time"`
 	EndTime   int64    `json:"end_time,omitempty"`
+	Restart   string   `json:"restart,omitempty"`    // restart 策略(always|no)
+	CreatedAt int64    `json:"created_at,omitempty"` // 首次创建时间(unix 秒),重启不重置
 }
 
 // TaskListRequest 查询任务列表

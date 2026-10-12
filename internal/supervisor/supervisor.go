@@ -20,6 +20,20 @@ var (
 	ErrTaskNotFound = errors.New("task not found")
 )
 
+// 任务的 restart 策略(R5)。策略为 always 的任务只在执行方进程启动时被重放(R6)。
+const (
+	RestartAlways = "always"
+	RestartNo     = "no"
+)
+
+// NormalizeRestart 把策略归一为 always|no:空值与未知值按 no 读(KTD3,旧记录无需迁移)。
+func NormalizeRestart(policy string) string {
+	if policy == RestartAlways {
+		return RestartAlways
+	}
+	return RestartNo
+}
+
 type Supervisor struct {
 	baseDir string
 	mu      sync.RWMutex
@@ -159,6 +173,11 @@ func (s *Supervisor) StartTask(cmdStr, cwd string, env []string) (*Task, error) 
 
 // StartTaskWithPorts 启动一个携带端口映射信息的后台守护任务
 func (s *Supervisor) StartTaskWithPorts(cmdStr, cwd string, ports []string, env []string) (*Task, error) {
+	return s.StartTaskWithPolicy(cmdStr, cwd, ports, RestartNo, env)
+}
+
+// StartTaskWithPolicy 在 StartTaskWithPorts 的基础上记录 restart 策略(KTD3、R5)。
+func (s *Supervisor) StartTaskWithPolicy(cmdStr, cwd string, ports []string, restart string, env []string) (*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -169,6 +188,7 @@ func (s *Supervisor) StartTaskWithPorts(cmdStr, cwd string, ports []string, env 
 	}
 
 	task := newTaskWithPorts(id, cmdStr, cwd, ports, taskDir)
+	task.meta.Restart = NormalizeRestart(restart)
 	if err := s.launch(task, env); err != nil {
 		return nil, err
 	}
@@ -314,7 +334,6 @@ func (s *Supervisor) RestartTask(id string) (*Task, error) {
 
 	taskDir := filepath.Join(s.baseDir, id)
 	task := newTaskWithPorts(id, meta.Cmd, meta.Cwd, meta.Ports, taskDir)
-	task.meta.Restart = meta.Restart
 	task.meta.CreatedAt = meta.CreatedAt
 
 	s.mu.Lock()
@@ -324,6 +343,11 @@ func (s *Supervisor) RestartTask(id string) (*Task, error) {
 	if !ok || cur != prev {
 		return nil, fmt.Errorf("task %s was replaced by a concurrent restart", id)
 	}
+	// restart 策略在安装点现读,不认上面那份快照:停旧实例的等待最长可到 4.5s(1.5s 杀进程树 +
+	// 3s 有界等待),这期间落地的入站 relay stop 会在同一个 prev 上把策略清成 no
+	// (StopTaskAndClearPolicy),而快照里还是旧的 always —— 照抄快照就把操作员刚被告知停掉的
+	// 任务复活了,并且每次执行方启动都被重放。重启照常安装运行实例,只是必须带上最新策略。
+	task.meta.Restart = cur.Meta().Restart
 	if err := s.launch(task, nil); err != nil {
 		return nil, err
 	}
@@ -364,6 +388,76 @@ func (s *Supervisor) StopTask(id string) error {
 		return ErrTaskNotFound
 	}
 	return task.Stop()
+}
+
+// StopTaskAndClearPolicy 显式停止任务并清除其 restart 策略(R7/KD5):进程组被杀、记录与日志保留,
+// 但任务不会再被执行方启动时的重放带回。仅由入站的 relay stop 调用;执行方自身的优雅停机走
+// StopAll,它只写 stopped、绝不动策略。
+func (s *Supervisor) StopTaskAndClearPolicy(id string) error {
+	s.mu.RLock()
+	task, ok := s.tasks[id]
+	s.mu.RUnlock()
+
+	if !ok {
+		return ErrTaskNotFound
+	}
+	err := task.Stop()
+	// 即便进程已不在(Stop 空转)、或杀进程报错,策略也必须清除:停掉的对象不再自行复活。
+	task.setRestartPolicy(RestartNo)
+	return err
+}
+
+// RestartResult 描述一次启动重放的结果。
+type RestartResult struct {
+	ID  string
+	Err error
+}
+
+// ReplayAlways 按策略重放任务(KTD10):只看策略、不看进入时的状态 —— exited/failed/stopped
+// 都在执行方启动时重放,只有被显式 relay stop 清掉策略的才不重放。单条失败仅把原因追加进
+// 该任务自己的日志并让它保持停止,其余任务继续(R8);返回失败清单供调用方记录。
+func (s *Supervisor) ReplayAlways() []RestartResult {
+	s.mu.RLock()
+	var ids []string
+	for id, t := range s.tasks {
+		if NormalizeRestart(t.Meta().Restart) == RestartAlways {
+			ids = append(ids, id)
+		}
+	}
+	s.mu.RUnlock()
+
+	sort.Strings(ids)
+
+	var results []RestartResult
+	for _, id := range ids {
+		if _, err := s.RestartTask(id); err != nil {
+			s.appendTaskLog(id, fmt.Sprintf("[replay] failed to restore task: %v\n", err))
+			results = append(results, RestartResult{ID: id, Err: err})
+		}
+	}
+	return results
+}
+
+// appendTaskLog 把一行原因追加到任务自己的 run.log。用于重放失败留痕(R8):任务保持停止,
+// 但用户能从 `relay logs <task-id>` 看到为什么没起来。
+func (s *Supervisor) appendTaskLog(id, line string) {
+	s.mu.RLock()
+	task, ok := s.tasks[id]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+
+	path := task.Meta().LogPath
+	if path == "" {
+		path = filepath.Join(s.baseDir, id, "run.log")
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	_, _ = f.WriteString(line)
+	_ = f.Close()
 }
 
 // GetTask 获取指定任务

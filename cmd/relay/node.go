@@ -118,6 +118,9 @@ func runNode() error {
 			fmt.Printf("[Node] Starting Agent (node_id: %s)\n", cfg.Node.ID)
 			relaybackend.SetExecutorRole(true)
 
+			// 执行方进程启动路径:显式构造 supervisor 并重放策略为 always 的任务一次(KTD4)。
+			relaybackend.ReplayAlwaysTasks()
+
 			// 确保作为 Agent 启动时开启执行器角色
 			cfg.NormalizeNode()
 

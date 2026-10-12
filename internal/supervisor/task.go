@@ -77,6 +77,7 @@ func newTaskWithPorts(id, cmdStr, cwd string, ports []string, dir string) *Task 
 	}
 }
 
+// Meta 返回任务元数据的副本。
 func (t *Task) Meta() TaskMeta {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -89,6 +90,20 @@ func (t *Task) markSuperseded() {
 	t.mu.Lock()
 	t.superseded = true
 	t.mu.Unlock()
+}
+
+// setRestartPolicy 更新并持久化任务的 restart 策略。仅由显式的入站 relay stop 路径调用
+// (StopTaskAndClearPolicy);执行方优雅停机走 StopAll,绝不触碰策略(R7/KD5)。
+func (t *Task) setRestartPolicy(policy string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	// 记录里的旧值按同一规则读出来就是目标值时不必重写:空值与 no 语义相同,从没带过
+	// --restart 的任务被 stop 时不再产生第二次磁盘写。
+	if NormalizeRestart(t.meta.Restart) == NormalizeRestart(policy) {
+		return
+	}
+	t.meta.Restart = policy
+	_ = t.persist()
 }
 
 func (t *Task) broadcast(line string) {

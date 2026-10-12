@@ -58,7 +58,7 @@ type GitSyncPayload struct {
 type GitSyncExecBackend interface {
 	ExecStreamWithGitSync(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, onChunk func(ExecChunk)) (int, error)
 	ExecStreamWithOptions(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, detach bool, onChunk func(ExecChunk)) (int, error)
-	ExecStreamWithPorts(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, detach bool, ports []string, onChunk func(ExecChunk)) (int, error)
+	ExecStreamWithPorts(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, detach bool, ports []string, restart string, onChunk func(ExecChunk)) (int, error)
 }
 
 // TaskInfo 跨机任务简报
@@ -73,6 +73,8 @@ type TaskInfo struct {
 	ExitCode  int
 	StartTime int64
 	EndTime   int64
+	Restart   string // restart 策略(always|no)
+	CreatedAt int64  // 首次创建时间(unix 秒),重启不重置
 }
 
 // TaskSupervisorBackend 可选接口:支持类似 Docker 的后台服务生命周期管理
