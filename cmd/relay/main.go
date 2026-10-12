@@ -147,13 +147,12 @@ var (
 	tunnelNodeName = tunnelCmd.Flag("node", "Egress node ID (alias for --executor)").HintAction(getNodeHints).String()
 
 	// tunnel 子命令:隧道由本地 node 持有(类比 dockerd),CLI 仅作控制面经 unix socket 下发
-	// open/close/restart/list。故没有 run(常驻进程已并入 node),也没有独立的 logs/upgrade。
+	// open/close/restart/list。故没有 run(常驻进程已并入 node),也没有独立的 logs/upgrade/status
+	// —— 读取统一走 `relay ps`(TYPE tunnel 行)与 `relay logs <egress>`,tunnel 侧只留写动词。
 	tunnelStartCmd      = tunnelCmd.Command("start", "Start a SOCKS5 tunnel held by the local node")
 	tunnelRestartPolicy = tunnelStartCmd.Flag("restart", "Restart policy on node restart: always|no").Default("no").String()
 	tunnelNoRestart     = tunnelStartCmd.Flag("no-restart", "Shortcut for --restart=no").Bool()
 	_                   = tunnelCmd.Command("stop", "Stop a node-held tunnel")
-	tunnelStatusCmd     = tunnelCmd.Command("status", "Show status of node-held tunnels and egress readiness")
-	tunnelJSON          = tunnelStatusCmd.Flag("json", "Output as JSON").Bool()
 	_                   = tunnelCmd.Command("restart", "Restart a node-held tunnel (reopen without retyping flags)")
 
 	// Undo command - 一键恢复远端工作区影子快照 (防误操作与冲突覆盖)
@@ -286,11 +285,6 @@ func main() {
 			}
 		case "stop":
 			runTunnelStop()
-		case "status":
-			if err := runTunnelStatus(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
 		case "restart":
 			if err := runTunnelRestart(); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -1313,6 +1307,22 @@ type psRow struct {
 	Command string `json:"command"`           // task: cmd; tunnel: "egress <egress>"
 	Egress  string `json:"egress,omitempty"`  // tunnel only
 	Restart string `json:"restart,omitempty"` // tunnel only
+	// 隧道出口就绪(取自中转台账,与 `relay nodes` 同一事实来源)。出口是 SOCKS5 的三段链路末段,
+	// 本地 listener 活着不代表出口活着,故单独成列/字段。
+	EgressStatus string `json:"egress_status,omitempty"` // ready | offline | notready | unknown
+	EgressReady  *bool  `json:"egress_ready,omitempty"`  // nil = 未探测或未知
+
+	// statusDisplay 仅供表格:STATUS + 出口就绪。JSON 的 status 保持纯状态值(running/stopped),
+	// 免得机器消费者去解析人类文案。
+	statusDisplay string
+}
+
+// displayStatus 返回表格用的 STATUS 单元格:叠加了出口就绪时用叠加文案,否则用纯 status。
+func (r psRow) displayStatus() string {
+	if r.statusDisplay != "" {
+		return r.statusDisplay
+	}
+	return r.Status
 }
 
 // taskToPSRow 把一个远端 detach 任务投影为统一行。纯函数,便于单测。
@@ -1369,6 +1379,83 @@ func tunnelToPSRow(ts tunnelState) psRow {
 	}
 }
 
+// egressState 是一条隧道出口 executor 的在线就绪快照,取自中转全网台账的 ExecutorHealth。
+type egressState struct {
+	Ready   bool
+	Text    string // ready | offline | notready
+	Latency string // 仅 ready 时非空,如 "11ms"
+}
+
+// compactLatency 只取延迟数字:STATUS 列是一个窄单元格,不可复用 segmentText 的
+// "N/A (executor offline)" 这类长降级文案。
+func compactLatency(s protocol.StatusSegment) string {
+	if s.LatencyMS == nil {
+		return ""
+	}
+	return fmt.Sprintf("%dms", *s.LatencyMS)
+}
+
+// queryEgressStates 向中转查询全网节点台账,返回 executor_id -> 出口就绪快照。判定与 `relay nodes`
+// 完全一致(离线看 LastSeen;Seg2 不可用=NotReady)。1.5s 上限、任何错误静默降级为 nil——调用方
+// 据此把隧道行标成 unknown,而不是让 `relay ps` 因为探测失败而失败。
+func queryEgressStates(cfg *config.Config) map[string]egressState {
+	rb, err := getRelayBackend(cfg)
+	if err != nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	st, err := rb.StatusWithUsage(ctx, false)
+	if err != nil || !st.OK {
+		return nil
+	}
+	out := make(map[string]egressState, len(st.Executors))
+	for _, e := range st.Executors {
+		out[e.ExecutorID] = egressStateOf(e)
+	}
+	return out
+}
+
+// egressStateOf 把一条 ExecutorHealth 投影为出口就绪快照(纯函数,便于单测)。
+func egressStateOf(e protocol.ExecutorHealth) egressState {
+	switch {
+	case !e.Online && e.LastSeen != 0:
+		return egressState{Text: "offline"}
+	case e.Seg2.Unavailable != "":
+		return egressState{Text: "notready"}
+	default:
+		return egressState{Ready: true, Text: "ready", Latency: compactLatency(e.Total)}
+	}
+}
+
+// applyEgressStatus 把出口就绪落到隧道行上:表格 STATUS 追加出口健康,JSON 补 egress_status/egress_ready。
+// 只写 statusDisplay,不改 Status —— JSON 的 status 必须保持纯状态值(running/stopped)。
+// stopped 的隧道没有出口可探,保持原样;探测不可用(m 为 nil)或台账里没有该 egress 时记 unknown。
+// 纯函数,便于单测。
+func applyEgressStatus(r *psRow, m map[string]egressState) {
+	if r.Type != "tunnel" || r.Status != "running" {
+		return
+	}
+	st, ok := m[r.Egress]
+	if !ok {
+		r.EgressStatus = "unknown"
+		r.statusDisplay = r.Status + " (egress unknown)"
+		return
+	}
+	r.EgressStatus = st.Text
+	ready := st.Ready
+	r.EgressReady = &ready
+	if st.Ready {
+		if st.Latency != "" {
+			r.statusDisplay = fmt.Sprintf("%s (egress ready %s)", r.Status, st.Latency)
+		} else {
+			r.statusDisplay = fmt.Sprintf("%s (egress ready)", r.Status)
+		}
+		return
+	}
+	r.statusDisplay = fmt.Sprintf("%s (egress %s)", r.Status, st.Text)
+}
+
 func runPs() {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -1408,13 +1495,23 @@ func runPs() {
 		}
 	}
 
-	// 合并:任务行在前,隧道行在后。
+	// 合并:任务行在前,隧道行在后。出口探测只在确有运行中的隧道时才发(一次中转查询,1.5s 上限),
+	// 避免常态 `relay ps` 凭空多一次 RPC。
+	var egress map[string]egressState
+	for _, ts := range tunnels {
+		if ts.State == "running" {
+			egress = queryEgressStates(cfg)
+			break
+		}
+	}
 	rows := make([]psRow, 0, len(tasks)+len(tunnels))
 	for _, t := range tasks {
 		rows = append(rows, taskToPSRow(t))
 	}
 	for _, ts := range tunnels {
-		rows = append(rows, tunnelToPSRow(ts))
+		r := tunnelToPSRow(ts)
+		applyEgressStatus(&r, egress)
+		rows = append(rows, r)
 	}
 
 	if *psJSON {
@@ -1433,9 +1530,9 @@ func runPs() {
 		return
 	}
 
-	fmt.Printf("%-8s %-12s %-16s %-10s %-16s %-6s %-16s %s\n", "TYPE", "TASK ID", "NODE", "STATUS", "PORTS", "EXIT", "CREATED", "COMMAND")
+	fmt.Printf("%-8s %-12s %-16s %-30s %-16s %-6s %-16s %s\n", "TYPE", "TASK ID", "NODE", "STATUS", "PORTS", "EXIT", "CREATED", "COMMAND")
 	for _, r := range rows {
-		fmt.Printf("%-8s %-12s %-16s %-10s %-16s %-6s %-16s %s\n", r.Type, r.ID, r.Node, r.Status, r.Ports, r.Exit, r.Created, r.Command)
+		fmt.Printf("%-8s %-12s %-16s %-30s %-16s %-6s %-16s %s\n", r.Type, r.ID, r.Node, r.displayStatus(), r.Ports, r.Exit, r.Created, r.Command)
 	}
 }
 

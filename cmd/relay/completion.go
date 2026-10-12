@@ -143,8 +143,8 @@ var commandSpecs = map[string]cmdSpec{
 		flags:   []string{"-w", "--watch"},
 	},
 	"tunnel": {
-		subcmds: []string{"start", "stop", "status", "restart"},
-		flags:   []string{"--listen", "-w", "--executor", "--node", "--json", "--restart", "--no-restart"},
+		subcmds: []string{"start", "stop", "restart"},
+		flags:   []string{"--listen", "-w", "--executor", "--node", "--restart", "--no-restart"},
 	},
 	"server": {
 		subcmds: []string{"run", "start", "stop", "status", "restart", "upgrade"},

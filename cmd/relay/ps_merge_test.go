@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/user/relay/internal/backend"
+	"github.com/user/relay/internal/relay/protocol"
 )
 
 // TestTaskToPSRow 覆盖任务行投影的纯逻辑:运行中/已结束的 Exit、Cmd 截断、空 Node 兜底。
@@ -139,6 +140,152 @@ func TestTunnelLogLineMatches(t *testing.T) {
 		}
 	}
 }
+
+// TestEgressStateOf 覆盖出口就绪投影:离线看 LastSeen、Seg2 不可用=notready、其余 ready + 紧凑延迟。
+// 判定必须与 `relay nodes` 一致,否则同一台 executor 在两条命令里会给出相反结论。
+func TestEgressStateOf(t *testing.T) {
+	ms := func(v int64) *int64 { return &v }
+
+	cases := []struct {
+		name string
+		in   protocol.ExecutorHealth
+		want egressState
+	}{
+		{
+			name: "offline: 断线且带 LastSeen",
+			in:   protocol.ExecutorHealth{ExecutorID: "eg", Online: false, LastSeen: 1700000000},
+			want: egressState{Text: "offline"},
+		},
+		{
+			name: "ready: 在线(旧中转身不返回 Online/LastSeen)",
+			in:   protocol.ExecutorHealth{ExecutorID: "eg"},
+			want: egressState{Ready: true, Text: "ready"},
+		},
+		{
+			name: "notready: Seg2 不可用",
+			in: protocol.ExecutorHealth{
+				ExecutorID: "eg",
+				Seg2:       protocol.StatusSegment{Unavailable: "executor offline"},
+			},
+			want: egressState{Text: "notready"},
+		},
+		{
+			name: "ready: 带端到端延迟",
+			in: protocol.ExecutorHealth{
+				ExecutorID: "eg",
+				Total:      protocol.StatusSegment{LatencyMS: ms(11)},
+			},
+			want: egressState{Ready: true, Text: "ready", Latency: "11ms"},
+		},
+	}
+	for _, c := range cases {
+		if got := egressStateOf(c.in); got != c.want {
+			t.Errorf("%s: egressStateOf = %+v, want %+v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestApplyEgressStatus 覆盖出口就绪落到隧道行:表格 STATUS 文案(displayStatus)与 JSON 字段;
+// JSON 的 status 必须保持纯状态值,不能被人类文案污染。stopped 隧道与任务行不受影响。
+func TestApplyEgressStatus(t *testing.T) {
+	ready := map[string]egressState{"eg": {Ready: true, Text: "ready", Latency: "11ms"}}
+	cases := []struct {
+		name        string
+		row         psRow
+		m           map[string]egressState
+		wantDisplay string
+		wantText    string
+		wantReady   *bool
+	}{
+		{
+			name:        "ready",
+			row:         psRow{Type: "tunnel", Egress: "eg", Status: "running"},
+			m:           ready,
+			wantDisplay: "running (egress ready 11ms)",
+			wantText:    "ready",
+			wantReady:   boolPtr(true),
+		},
+		{
+			name:        "ready 无延迟",
+			row:         psRow{Type: "tunnel", Egress: "eg", Status: "running"},
+			m:           map[string]egressState{"eg": {Ready: true, Text: "ready"}},
+			wantDisplay: "running (egress ready)",
+			wantText:    "ready",
+			wantReady:   boolPtr(true),
+		},
+		{
+			name:        "offline",
+			row:         psRow{Type: "tunnel", Egress: "eg", Status: "running"},
+			m:           map[string]egressState{"eg": {Text: "offline"}},
+			wantDisplay: "running (egress offline)",
+			wantText:    "offline",
+			wantReady:   boolPtr(false),
+		},
+		{
+			name:        "notready",
+			row:         psRow{Type: "tunnel", Egress: "eg", Status: "running"},
+			m:           map[string]egressState{"eg": {Text: "notready"}},
+			wantDisplay: "running (egress notready)",
+			wantText:    "notready",
+			wantReady:   boolPtr(false),
+		},
+		{
+			name:        "探测不可用(m 为 nil) → unknown",
+			row:         psRow{Type: "tunnel", Egress: "eg", Status: "running"},
+			m:           nil,
+			wantDisplay: "running (egress unknown)",
+			wantText:    "unknown",
+		},
+		{
+			name:        "台账里没有该 egress → unknown",
+			row:         psRow{Type: "tunnel", Egress: "eg", Status: "running"},
+			m:           map[string]egressState{"other": {Ready: true, Text: "ready"}},
+			wantDisplay: "running (egress unknown)",
+			wantText:    "unknown",
+		},
+		{
+			name:        "stopped 隧道不动",
+			row:         psRow{Type: "tunnel", Egress: "eg", Status: "stopped"},
+			m:           ready,
+			wantDisplay: "stopped",
+		},
+		{
+			name:        "任务行不动",
+			row:         psRow{Type: "task", Egress: "eg", Status: "running"},
+			m:           ready,
+			wantDisplay: "running",
+		},
+	}
+	for _, c := range cases {
+		r := c.row
+		applyEgressStatus(&r, c.m)
+		// JSON 的 status 永不改变。
+		if r.Status != c.row.Status {
+			t.Errorf("%s: Status = %q, want unchanged %q", c.name, r.Status, c.row.Status)
+		}
+		if got := r.displayStatus(); got != c.wantDisplay {
+			t.Errorf("%s: displayStatus = %q, want %q", c.name, got, c.wantDisplay)
+		}
+		if r.EgressStatus != c.wantText {
+			t.Errorf("%s: EgressStatus = %q, want %q", c.name, r.EgressStatus, c.wantText)
+		}
+		switch {
+		case c.wantReady == nil && r.EgressReady != nil:
+			t.Errorf("%s: EgressReady = %v, want nil", c.name, *r.EgressReady)
+		case c.wantReady != nil && r.EgressReady == nil:
+			t.Errorf("%s: EgressReady = nil, want %v", c.name, *c.wantReady)
+		case c.wantReady != nil && r.EgressReady != nil && *r.EgressReady != *c.wantReady:
+			t.Errorf("%s: EgressReady = %v, want %v", c.name, *r.EgressReady, *c.wantReady)
+		}
+	}
+
+	// displayStatus 未叠加时空回落到 status(任务行/表格历史行为)。
+	if got := (psRow{Status: "exited"}).displayStatus(); got != "exited" {
+		t.Errorf("no-overlay displayStatus = %q, want exited", got)
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }
 
 // TestFilterTunnels 覆盖隧道过滤:未加 -a 只留 running;target 按 egress 精确过滤。
 func TestFilterTunnels(t *testing.T) {

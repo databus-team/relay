@@ -463,11 +463,15 @@ tunnel therefore survives the launching shell/SSH session, and its intent is per
 relay tunnel start -w site-a --listen 127.0.0.1:1080   # open; ensures the local node is running
 curl --socks5-hostname 127.0.0.1:1080 http://intra.a.internal/ping
 
-relay tunnel status              # table of node-held tunnels + egress readiness (--json for machines)
-relay tunnel status -w site-a    # one egress
+relay ps                         # list node-held tunnels (TYPE tunnel rows) + detach tasks
 relay tunnel restart -w site-a   # reopen the same egress without retyping --listen/--restart
 relay tunnel stop -w site-a      # close + forget the tunnel (docker rm semantics)
 ```
+
+`relay tunnel` has no read verbs: listing is `relay ps`, logs are `relay logs <egress>`. The tunnel row's
+STATUS carries egress reachability, because a live local listener says nothing about the far end of the
+three-hop chain (local → transit → egress): `running (egress ready 11ms)`, `running (egress offline)`,
+`running (egress notready)`, or `running (egress unknown)` when the transit can't be queried.
 
 **Restart policy (`--restart=always|no`, default `no`).** The recovery event is the node's next start
 (tunnels are goroutines inside the node process). `always` reopens the listener when the node starts; `no`
@@ -485,6 +489,11 @@ relay stop site-a        # stops a tunnel by its egress (also still stops a task
 relay logs site-a -f     # streams the tunnel's lines from ~/.relay/node.log (prefix `[tunnel site-a]`)
 ```
 
+A tunnel row's STATUS also reports egress reachability (`running (egress ready 11ms)` / `(egress offline)`
+/ `(egress notready)` / `(egress unknown)`), from the same cluster ledger `relay nodes` uses — one extra
+transit query, issued only when a tunnel is actually running, 1.5s-bounded and degrading to `unknown`
+rather than failing. `--json` exposes it as `egress_status` / `egress_ready`.
+
 `relay ps` still lists local tunnels when the transit is unreachable — only the remote task list degrades.
 
 - `--executor` (`-w` alias) selects the egress executor by its node identity **executor_id** (the
@@ -499,8 +508,8 @@ relay logs site-a -f     # streams the tunnel's lines from ~/.relay/node.log (pr
 daemon per egress. That is retired. Stop any leftover daemon first — `relay tunnel stop -w <egress>`, or
 `kill $(cat ~/.relay/tunnel-<egress>.pid)` — otherwise it still holds the local port and the new node-held
 `relay tunnel start` fails to bind (it detects the stale daemon and reports the exact cleanup command).
-`relay tunnel run` (foreground) and `relay tunnel upgrade` (use `relay node upgrade`) are removed; tunnel
-logs now go through `relay logs`.
+`relay tunnel run` (foreground), `relay tunnel status` (use `relay ps`) and `relay tunnel upgrade`
+(use `relay node upgrade`) are removed; tunnel logs now go through `relay logs`.
 
 **Dual-executor / concurrent tunnels (multi-executor):** one transit can host **two (or more)** remote
 executors at once, each on its own watch/workspace. Start two tunnels, each binding its own local port and

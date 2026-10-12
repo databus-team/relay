@@ -39,6 +39,14 @@ A tunnel is addressed by its **egress** — the target executor's `executor_id` 
 `relay logs <egress>` name it directly, and `relay ps` merges node-held tunnels (`TYPE tunnel`) with remote
 detach tasks (`TYPE task`).
 
+### Egress readiness
+The health of a tunnel's far end, taken from the same cluster ledger `relay nodes` reads: `ready` (with
+end-to-end RTT), `offline` (registered before, currently disconnected), `notready` (the transit→executor
+segment is unavailable), or `unknown` (the ledger could not be queried). It exists because the local listener
+is only the first hop of a three-hop chain (local → transit → egress) — it keeps reporting `running` while the
+egress is dead, so a proxy request just times out with nothing to look at. Shown in the `relay ps` STATUS
+cell and as `egress_status` / `egress_ready` under `--json`.
+
 ## RIsk note — marker vs bare ID
 
 The detach task-ID line the executor returns to the CLI is either a marker-prefixed line (new executor, unambiguous, suppressed from user stdout) or a bare ID line (legacy executor, captured via first-non-empty-line fallback). The CLI recognizes both; out-of-band transport of the ID was rejected as stronger CLI/executor version coupling.
