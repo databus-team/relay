@@ -233,6 +233,7 @@ Pass `-c <config>` (default `~/.relay/config.yaml`) to share one config across e
 - **Windows compat**: MSYS-style normalization (`/d/...` → `D:\...`) via `NormalizeWindowsPath`; `relay/backend` has `msysToWindowsPath` for exec dirs.
 - **Testing**: standard `testing`, table-driven, `_test.go` beside source; backend/integration tests in `internal/relay/backend/relay_test.go` spin up an in-process hub via `httptest`.
 - **Bilingual code**: ID-agnostic; comments frequently Chinese, wire types English.
+- **Comments are the exception (非必要不加注释).** 先靠命名与结构自解释,注释只留给代码本身说不出来的东西:协议/线上不变量、非显然的取舍与约束、踩过的坑(失败模式、平台差异、并发语义)。不写这几类:复述下一行在做什么;解释「这次为什么这么改」(那是 commit message 的活);给自明的分支/赋值/循环加标题;大段散文式背景。要写就一两行说清约束,改代码时顺手删掉因此失效或变冗余的旧注释。`//go:` 指令、导出符号的 doc comment、`_test.go` 里钉住用例意图的注释不在此列。
 
 ## ANTI-PATTERNS
 
