@@ -116,7 +116,7 @@ func (s *Supervisor) loadExistingTasks() {
 		t := &Task{
 			meta:      meta,
 			dir:       taskDir,
-			listeners: make(map[chan string]struct{}),
+			listeners: make(map[chan struct{}]struct{}),
 			done:      make(chan struct{}),
 		}
 		if meta.Status != StatusRunning {

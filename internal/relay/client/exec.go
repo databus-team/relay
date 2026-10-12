@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/user/relay/internal/portfwd"
@@ -620,6 +621,9 @@ func toFloat64(v interface{}) float64 {
 	return 0
 }
 
+// execStreamSendTimeout 是向在途响应流投递一帧时允许的等待上限(消费者可能已退出)。
+const execStreamSendTimeout = 5 * time.Second
+
 // routeExecStream 请求方流式 exec 帧投递。命中在途 exec 即投递并返回 true。
 func (c *Client) routeExecStream(msg *protocol.Message) bool {
 	if msg.RequestID == "" {
@@ -631,10 +635,18 @@ func (c *Client) routeExecStream(msg *protocol.Message) bool {
 	if !ok {
 		return false
 	}
-	// 非阻塞投递;若消费慢则丢弃(与 eventCh 策略一致)
 	select {
 	case ch <- msg:
 	default:
+		// 通道满:有界等待,不丢帧。
+		select {
+		case ch <- msg:
+		case <-time.After(execStreamSendTimeout):
+		}
+		// 等待期间没在读,续一次读 deadline,免得回到读循环时被判成读超时。
+		if conn := c.getConn(); conn != nil {
+			_ = conn.SetReadDeadline(time.Now().Add(readDeadline))
+		}
 	}
 	return true
 }

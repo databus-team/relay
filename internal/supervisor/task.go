@@ -1,7 +1,7 @@
 package supervisor
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -12,7 +12,11 @@ import (
 	"time"
 
 	"github.com/user/relay/internal/portfwd"
+	"github.com/user/relay/internal/streamutil"
 )
+
+// logPollInterval 是跟随日志的兜底轮询间隔:通知可丢,丢了也不会超过这个时延。
+const logPollInterval = 200 * time.Millisecond
 
 type TaskStatus string
 
@@ -50,7 +54,7 @@ type Task struct {
 	dir       string
 	cmd       *exec.Cmd
 	logFile   *os.File
-	listeners map[chan string]struct{}
+	listeners map[chan struct{}]struct{}
 	done      chan struct{}
 	// superseded 标记该任务对象已被同 id 的新实例取代:它的收尾不再写回记录。旧实例的收尾
 	// goroutine 在新实例落盘之后才 persist 时,会把 status/pid/end_time 覆盖回旧值,而两个
@@ -76,7 +80,7 @@ func newTaskWithPorts(id, cmdStr, cwd string, ports []portfwd.Spec, dir string) 
 			LogPath:   filepath.Join(dir, "run.log"),
 		},
 		dir:       dir,
-		listeners: make(map[chan string]struct{}),
+		listeners: make(map[chan struct{}]struct{}),
 		done:      make(chan struct{}),
 	}
 }
@@ -110,14 +114,14 @@ func (t *Task) setRestartPolicy(policy string) {
 	_ = t.persist()
 }
 
-func (t *Task) broadcast(line string) {
+// notify 叫醒跟随者。只送提示不带数据,日志内容由跟随者按偏移自己从 run.log 读。
+func (t *Task) notify() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for ch := range t.listeners {
 		select {
-		case ch <- line:
+		case ch <- struct{}{}:
 		default:
-			// 避免慢监听者阻塞主日志流
 		}
 	}
 }
@@ -155,103 +159,197 @@ func (t *Task) Stop() error {
 	return err
 }
 
-// StreamLogs 读取历史日志并支持可选的流式监听
+// StreamLogs 读取历史日志并可选跟随。数据来源是 run.log 本身,按偏移读取。
 func (t *Task) StreamLogs(ctx context.Context, follow bool, tailLines int, onChunk func(string)) error {
 	t.mu.RLock()
 	logPath := t.meta.LogPath
 	status := t.meta.Status
+	dir := t.dir
 	t.mu.RUnlock()
 
-	// 1. 读取已有历史日志行
-	if logPath != "" {
-		lines, err := readLastLines(logPath, tailLines)
-		if err == nil {
-			for _, line := range lines {
-				onChunk(line)
-			}
+	if logPath == "" {
+		logPath = filepath.Join(dir, "run.log")
+	}
+	if onChunk == nil {
+		onChunk = func(string) {}
+	}
+
+	f, err := os.Open(logPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+
+	var size int64
+	if st, err := f.Stat(); err == nil {
+		size = st.Size()
+	}
+
+	var pending []byte
+	emit := func(data []byte) {
+		if len(data) == 0 {
+			return
+		}
+		pending = append(pending, data...)
+		head, tail := streamutil.SplitIncompleteRune(pending)
+		if len(head) > 0 {
+			onChunk(string(head))
+		}
+		if len(tail) == 0 {
+			pending = pending[:0]
+		} else {
+			pending = append(pending[:0], tail...)
+		}
+	}
+	flush := func() {
+		if len(pending) > 0 {
+			onChunk(string(pending))
+			pending = pending[:0]
 		}
 	}
 
-	// 2. 如果不需要 follow 或进程已退出，直接返回
+	buf := make([]byte, streamutil.ChunkSize)
+	offset := tailStartOffset(f, size, tailLines)
+	for offset < size {
+		n, err := f.ReadAt(buf, offset)
+		if n > 0 {
+			offset += int64(n)
+			emit(buf[:n])
+		}
+		if err != nil {
+			if err != io.EOF {
+				return err
+			}
+			break
+		}
+		if n == 0 {
+			break
+		}
+	}
+
 	if !follow || status != StatusRunning {
+		flush()
 		return nil
 	}
 
-	// 3. 注册流式监听器
-	ch := make(chan string, 128)
+	// 先注册通知再读文件,避免漏掉注册前写入的提示。
+	notifyCh := make(chan struct{}, 1)
 	t.mu.Lock()
-	// 双重检查进程状态
 	if t.meta.Status != StatusRunning {
 		t.mu.Unlock()
+		flush()
 		return nil
 	}
-	t.listeners[ch] = struct{}{}
+	t.listeners[notifyCh] = struct{}{}
 	t.mu.Unlock()
 
 	defer func() {
 		t.mu.Lock()
-		delete(t.listeners, ch)
+		delete(t.listeners, notifyCh)
 		t.mu.Unlock()
 	}()
 
+	ticker := time.NewTicker(logPollInterval)
+	defer ticker.Stop()
+
+	drain := func() {
+		for {
+			n, err := f.ReadAt(buf, offset)
+			if n > 0 {
+				offset += int64(n)
+				emit(buf[:n])
+			}
+			if err != nil || n == 0 {
+				return
+			}
+		}
+	}
+
 	for {
+		drain()
 		select {
 		case <-ctx.Done():
+			flush()
 			return ctx.Err()
-		case line, ok := <-ch:
-			if !ok {
-				return nil
-			}
-			onChunk(line)
 		case <-t.done:
-			// 进程结束，把 channel 中残余日志排空
-			for {
-				select {
-				case line := <-ch:
-					onChunk(line)
-				default:
-					return nil
-				}
-			}
+			drain()
+			flush()
+			return nil
+		case <-notifyCh:
+		case <-ticker.C:
 		}
 	}
 }
 
-func readLastLines(path string, n int) ([]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
+// tailStartOffset 返回最后 tailLines 行的起始偏移;tailLines<=0 表示从头读。
+// 从文件末尾按块回溯数换行,不把整份日志读进内存;回溯超过上限时宁可多给不少给。
+func tailStartOffset(f *os.File, size int64, tailLines int) int64 {
+	const blockSize = 32 * 1024
+	const maxTailScanBytes = 32 * 1024 * 1024
 
-	var all []string
-	scanner := bufio.NewScanner(f)
-	// 允许单行最大 1MB
-	buf := make([]byte, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-	for scanner.Scan() {
-		all = append(all, scanner.Text()+"\n")
+	if tailLines <= 0 || size <= 0 {
+		return 0
 	}
 
-	if n <= 0 || len(all) <= n {
-		return all, scanner.Err()
+	pos := size
+	var buf []byte
+	newlines := 0
+	for pos > 0 && newlines <= tailLines {
+		readSize := int64(blockSize)
+		if readSize > pos {
+			readSize = pos
+		}
+		start := pos - readSize
+		chunk := make([]byte, readSize)
+		n, err := f.ReadAt(chunk, start)
+		if n > 0 {
+			buf = append(chunk[:n], buf...)
+			newlines += bytes.Count(chunk[:n], []byte{'\n'})
+		}
+		if err != nil && err != io.EOF {
+			return 0
+		}
+		pos = start
+		if len(buf) >= maxTailScanBytes {
+			return pos
+		}
 	}
-	return all[len(all)-n:], scanner.Err()
+
+	// 末尾的换行不算一行内容。
+	i := len(buf) - 1
+	if i >= 0 && buf[i] == '\n' {
+		i--
+	}
+	for left := tailLines; i >= 0; i-- {
+		if buf[i] != '\n' {
+			continue
+		}
+		left--
+		if left == 0 {
+			break
+		}
+	}
+	return pos + int64(i+1)
 }
 
-// pipeToLog 持续消费 reader 并写入文件与广播通道
+// pipeToLog 把 reader 里的原始字节按到达顺序写进日志文件,并叫醒跟随者。
 func (t *Task) pipeToLog(r io.Reader) {
-	scanner := bufio.NewScanner(r)
-	buf := make([]byte, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-
-	for scanner.Scan() {
-		text := scanner.Text() + "\n"
-		t.mu.Lock()
-		if t.logFile != nil {
-			_, _ = t.logFile.WriteString(text)
+	buf := make([]byte, streamutil.ChunkSize)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			t.mu.Lock()
+			if t.logFile != nil {
+				_, _ = t.logFile.Write(buf[:n])
+			}
+			t.mu.Unlock()
+			t.notify()
 		}
-		t.mu.Unlock()
-		t.broadcast(text)
+		if err != nil {
+			return
+		}
 	}
 }

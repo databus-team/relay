@@ -1,7 +1,6 @@
 package backend
 
 import (
-	"bufio"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -24,6 +23,7 @@ import (
 	"github.com/user/relay/internal/portfwd"
 	"github.com/user/relay/internal/relay/client"
 	"github.com/user/relay/internal/relay/protocol"
+	"github.com/user/relay/internal/streamutil"
 	"github.com/user/relay/internal/supervisor"
 	"github.com/user/relay/internal/sync/git"
 	"github.com/user/relay/internal/version"
@@ -1075,19 +1075,11 @@ func runStream(cmdStr, cwd string, timeout int, emit func(stdout bool, data stri
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		sc := bufio.NewScanner(stdoutPipe)
-		sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
-		for sc.Scan() {
-			emit(true, sc.Text()+"\n")
-		}
+		pumpOutput(stdoutPipe, true, emit)
 	}()
 	go func() {
 		defer wg.Done()
-		sc := bufio.NewScanner(stderrPipe)
-		sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
-		for sc.Scan() {
-			emit(false, sc.Text()+"\n")
-		}
+		pumpOutput(stderrPipe, false, emit)
 	}()
 
 	wg.Wait()
@@ -1097,6 +1089,33 @@ func runStream(cmdStr, cwd string, timeout int, emit func(stdout bool, data stri
 		return -1
 	}
 	return c.ProcessState.ExitCode()
+}
+
+// pumpOutput 把管道里的字节按到达的块送出;跨块截断的多字节字符留到下一块。
+func pumpOutput(r io.Reader, stdout bool, emit func(bool, string)) {
+	buf := make([]byte, streamutil.ChunkSize)
+	var pending []byte
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			pending = append(pending, buf[:n]...)
+			head, tail := streamutil.SplitIncompleteRune(pending)
+			if len(head) > 0 {
+				emit(stdout, string(head))
+			}
+			if len(tail) == 0 {
+				pending = pending[:0]
+			} else {
+				pending = append(pending[:0], tail...)
+			}
+		}
+		if err != nil {
+			if len(pending) > 0 {
+				emit(stdout, string(pending))
+			}
+			return
+		}
+	}
 }
 
 func (b *RelayBackend) Ping(ctx context.Context, commandDir, watchID string) error {
