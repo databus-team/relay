@@ -14,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/user/relay/internal/backend"
@@ -105,7 +106,7 @@ var (
 	psAll  = psCmd.Flag("all", "Show all tasks (default shows running only)").Short('a').Bool()
 	psExec = psCmd.Flag("executor", "Filter tasks by executor node").Short('e').HintAction(getNodeHints).String()
 	psNode = psCmd.Flag("node", "Filter tasks by node ID (alias for --executor)").HintAction(getNodeHints).String()
-	psJSON = psCmd.Flag("json", "Output as JSON").Bool()
+	psJSON = psCmd.Flag("json", "Output as JSON (full values, no column truncation)").Bool()
 
 	// logs command - 查看任务日志
 	logsCmd    = kingpin.Command("logs", "Tail or stream background task logs, or a node-held tunnel's log (similar to docker logs)")
@@ -1420,6 +1421,7 @@ func runExec() {
 }
 
 // psRow 是 relay ps 的统一行:本地 node 持有的隧道 + 远端 detach 任务合并呈现。
+// 行是 JSON 的来源,故一律存完整值;列宽裁剪只发生在 psLine 的表格渲染里(--json 必须无损)。
 type psRow struct {
 	Type    string `json:"type"` // "task" | "tunnel"
 	ID      string `json:"id"`
@@ -1428,7 +1430,7 @@ type psRow struct {
 	Ports   string `json:"ports,omitempty"`   // task: comma-joined; tunnel: the listen address
 	Exit    string `json:"exit,omitempty"`    // task: exit code or "-"
 	Created string `json:"created,omitempty"` // 相对时间("3m ago")
-	Command string `json:"command"`           // task: cmd; tunnel: "egress <egress>"
+	Command string `json:"command"`           // task: 完整命令行; tunnel: "egress <egress>"
 	Egress  string `json:"egress,omitempty"`  // tunnel only
 	Restart string `json:"restart,omitempty"` // 任务与隧道共用(R20:任务行显示 restart 策略;隧道行早就用它)
 	// 隧道出口就绪(取自中转台账,与 `relay nodes` 同一事实来源)。出口是 SOCKS5 的三段链路末段,
@@ -1442,8 +1444,12 @@ type psRow struct {
 }
 
 // psRowFormat 是 relay ps 表格的行格式。独立成常量以便表头与行共用同一列宽(R20 的 RESTART 列
-// 必须与每一行对齐;表头由 psHeader 渲染,行由 runPs 逐行套用)。
+// 必须与每一行对齐;表头由 psHeader 渲染,行由 psLine 渲染)。
 const psRowFormat = "%-8s %-12s %-16s %-30s %-16s %-8s %-6s %-16s %s\n"
+
+// PORTS 的定宽(与 psRowFormat 里那一段一致):它后面还有列,超宽会把整张表挤歪,只能裁。
+// COMMAND 是末列,裁它不影响对齐、只会丢信息,故不裁。
+const psPortWidth = 16
 
 // relay ps 的出口探测预算:探针预算必须明显短于本地等待上限,否则慢出口会让本地先超时,
 // 隧道行只能退化成语义模糊的 `unknown`,而不是「出口 notready」。
@@ -1455,6 +1461,20 @@ const (
 // psHeader 渲染 relay ps 的表头行。独立成函数以便单测钉住 R20 的 RESTART 列位置。
 func psHeader() string {
 	return fmt.Sprintf(psRowFormat, "TYPE", "TASK ID", "NODE", "STATUS", "PORTS", "RESTART", "EXIT", "CREATED", "COMMAND")
+}
+
+// psLine 渲染表格里的一行。列宽裁剪只在这里发生:psRow 是 --json 的来源,必须保持完整值。
+func psLine(r psRow) string {
+	return fmt.Sprintf(psRowFormat, r.Type, r.ID, r.Node, r.displayStatus(), fitCell(r.Ports, psPortWidth), r.Restart, r.Exit, r.Created, r.Command)
+}
+
+// fitCell 把单元格收到定宽列的宽度,超出部分以 "..." 结尾。按 rune 裁,避免切断多字节字符
+// (主机名可以是 Unicode,按字节裁会切出非法 UTF-8)。
+func fitCell(s string, width int) string {
+	if utf8.RuneCountInString(s) <= width {
+		return s
+	}
+	return string([]rune(s)[:width-3]) + "..."
 }
 
 // displayStatus 返回表格用的 STATUS 单元格:叠加了出口就绪时用叠加文案,否则用纯 status。
@@ -1474,8 +1494,8 @@ func portDisplay(s portfwd.Spec) string {
 	return s.BindHost + ":" + s.String()
 }
 
-// taskToPSRow 把一个远端 detach 任务投影为统一行。纯函数,便于单测。
-// 字段裁剪复刻旧 runPs 行为:Node 空 → (unknown),Cmd 超 35 字符 → 前 32 + "..."。
+// taskToPSRow 把一个远端 detach 任务投影为统一行(纯函数,便于单测)。只做兜底,不做裁剪:
+// Node 空 → (unknown),其余字段原样保留完整值。
 func taskToPSRow(t backend.TaskInfo) psRow {
 	nodeDisp := t.Node
 	if nodeDisp == "" {
@@ -1488,17 +1508,9 @@ func taskToPSRow(t backend.TaskInfo) psRow {
 	for i, p := range t.Ports {
 		parts[i] = portDisplay(p)
 	}
-	portsDisp := orDash(strings.Join(parts, ","))
-	if len(portsDisp) > 16 {
-		portsDisp = portsDisp[:13] + "..."
-	}
 	exitDisp := "-"
 	if t.Status != taskStatusRunning {
 		exitDisp = fmt.Sprintf("%d", t.ExitCode)
-	}
-	cmdDisp := t.Cmd
-	if len(cmdDisp) > 35 {
-		cmdDisp = cmdDisp[:32] + "..."
 	}
 	// CREATED 取首次创建时间而非最近一次启动(R12):重启不重置 CREATED。老执行方上行 CreatedAt=0
 	// 时回退到最近一次启动时间(与既有展示一致)。
@@ -1511,10 +1523,10 @@ func taskToPSRow(t backend.TaskInfo) psRow {
 		ID:      t.ID,
 		Node:    nodeDisp,
 		Status:  t.Status,
-		Ports:   portsDisp,
+		Ports:   orDash(strings.Join(parts, ",")),
 		Exit:    exitDisp,
 		Created: formatRelativeTime(time.Unix(createdAt, 0)),
-		Command: cmdDisp,
+		Command: t.Cmd,
 		Restart: t.Restart,
 	}
 }
@@ -1706,7 +1718,7 @@ func runPs() {
 
 	fmt.Print(psHeader())
 	for _, r := range rows {
-		fmt.Printf(psRowFormat, r.Type, r.ID, r.Node, r.displayStatus(), r.Ports, r.Restart, r.Exit, r.Created, r.Command)
+		fmt.Print(psLine(r))
 	}
 }
 

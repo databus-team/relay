@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/portfwd"
@@ -87,13 +88,13 @@ func TestTaskToPSRow(t *testing.T) {
 		t.Errorf("Created = %q, want relative time", running.Created)
 	}
 
-	// 端口串 >16 → 前 13 + "..."(复刻旧 runPs 的列宽裁剪)
+	// 端口串保留完整值:裁剪只发生在表格渲染(见 TestPSLineTruncatesPortsNotCommand)。
 	multi := taskToPSRow(backend.TaskInfo{ID: "t-4", Status: "running", StartTime: now, Ports: []portfwd.Spec{
 		{BindHost: "127.0.0.1", LocalPort: 8080, RemoteHost: "127.0.0.1", RemotePort: 9000},
 		{BindHost: "127.0.0.1", LocalPort: 9090, RemoteHost: "127.0.0.1", RemotePort: 10000},
 	}})
-	if multi.Ports != "8080:9000,909..." {
-		t.Errorf("multi-port Ports = %q, want truncated", multi.Ports)
+	if multi.Ports != "8080:9000,9090:10000" {
+		t.Errorf("multi-port Ports = %q, want full value", multi.Ports)
 	}
 
 	// 非回环绑定:展示形态额外带上绑定面,让 0.0.0.0 这类发布面在 ps 里可见(R21/KTD9)。
@@ -110,7 +111,7 @@ func TestTaskToPSRow(t *testing.T) {
 		t.Errorf("legacy Ports = %q, want %q", legacy.Ports, "8080:9000")
 	}
 
-	// Cmd 截断:>35 → 前 32 + "..."(复刻旧 runPs 行为)
+	// Cmd 保留完整命令行:长命令在表格里也照原样展示(COMMAND 是末列,裁剪只丢信息)。
 	longCmd := strings.Repeat("a", 32) + "bbbbbbbbbb"
 	finished := taskToPSRow(backend.TaskInfo{
 		ID:        "t-2",
@@ -125,12 +126,8 @@ func TestTaskToPSRow(t *testing.T) {
 	if finished.Node != "(unknown)" {
 		t.Errorf("empty Node = %q, want (unknown)", finished.Node)
 	}
-	wantCmd := longCmd[:32] + "..."
-	if finished.Command != wantCmd {
-		t.Errorf("truncated Command = %q, want %q", finished.Command, wantCmd)
-	}
-	if len(finished.Command) != 35 {
-		t.Errorf("truncated Command len = %d, want 35", len(finished.Command))
+	if finished.Command != longCmd {
+		t.Errorf("Command = %q, want the full command line", finished.Command)
 	}
 
 	// 无端口 → "-"
@@ -154,6 +151,64 @@ func TestTaskToPSRow(t *testing.T) {
 	createdReset := taskToPSRow(backend.TaskInfo{ID: "t-9", Status: "running", StartTime: now})
 	if !strings.Contains(createdReset.Created, "s ago") {
 		t.Errorf("CREATED fallback (CreatedAt=0) = %q, want ~now", createdReset.Created)
+	}
+}
+
+// TestPSRowKeepsFullCommand 覆盖“命令太长看不全”的回归:行模型(即 --json 的字段来源)保留完整
+// 命令行,表格也不裁 COMMAND —— 它是末列,收窄不影响对齐、只会丢信息。定宽 PORTS 列照旧收窄。
+func TestPSRowKeepsFullCommand(t *testing.T) {
+	longCmd := "python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4"
+	row := taskToPSRow(backend.TaskInfo{
+		ID:        "t-1",
+		Node:      "eg-node",
+		Status:    "running",
+		StartTime: time.Now().Unix(),
+		Cmd:       longCmd,
+		Ports: []portfwd.Spec{
+			{BindHost: "127.0.0.1", LocalPort: 8080, RemoteHost: "127.0.0.1", RemotePort: 9000},
+			{BindHost: "127.0.0.1", LocalPort: 9090, RemoteHost: "127.0.0.1", RemotePort: 10000},
+		},
+	})
+
+	line := psLine(row)
+	if !strings.HasSuffix(line, longCmd+"\n") {
+		t.Errorf("table line = %q, want it to end with the full command %q", line, longCmd)
+	}
+	if !strings.Contains(line, "8080:9000,909...") {
+		t.Errorf("table line = %q, want the PORTS cell narrowed to %d chars", line, psPortWidth)
+	}
+
+	raw, err := json.Marshal(row)
+	if err != nil {
+		t.Fatalf("marshal row: %v", err)
+	}
+	var got struct {
+		Command string `json:"command"`
+		Ports   string `json:"ports"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal row: %v", err)
+	}
+	if got.Command != longCmd {
+		t.Errorf("json command = %q, want %q", got.Command, longCmd)
+	}
+	if got.Ports != "8080:9000,9090:10000" {
+		t.Errorf("json ports = %q, want the full port list", got.Ports)
+	}
+}
+
+// TestFitCell 覆盖单元格收窄:够宽原样返回,超宽按 rune 裁剪(Windows 主机名可以是 Unicode,
+// 按字节裁会切出非法 UTF-8)。
+func TestFitCell(t *testing.T) {
+	if got := fitCell("8080:9000", psPortWidth); got != "8080:9000" {
+		t.Errorf("fitCell(short) = %q, want unchanged", got)
+	}
+	if got := fitCell("8080:9000,9090:10000", psPortWidth); got != "8080:9000,909..." {
+		t.Errorf("fitCell(long) = %q, want %q", got, "8080:9000,909...")
+	}
+	got := fitCell(strings.Repeat("中文主机", 5)+":8080", psPortWidth)
+	if !utf8.ValidString(got) || utf8.RuneCountInString(got) != psPortWidth {
+		t.Errorf("fitCell(unicode) = %q, want %d valid runes", got, psPortWidth)
 	}
 }
 
