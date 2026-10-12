@@ -144,6 +144,22 @@ func runNode() error {
 				}
 			}()
 
+			// 隧道持有者:本机 node 作为 dockerd,接收 CLI 的 open/close/restart/list 控制以维持
+			// 各条 SOCKS5 出网隧道的本地监听;意图持久化到 ~/.relay/tunnels.json,node 重启时按
+			// restart 策略回放(与 port-forward holder 并列)。
+			go func() {
+				rb, err := getRelayBackend(cfg)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "[Node] Tunnel holder disabled: %v\n", err)
+					return
+				}
+				defer rb.Close()
+				holder := newTunnelHolder(ctx, rb, tunnelSockPath())
+				if err := holder.Run(); err != nil && err != context.Canceled {
+					fmt.Fprintf(os.Stderr, "[Node] Tunnel holder error: %v\n", err)
+				}
+			}()
+
 			if err := w.Run(ctx); err != nil && err != context.Canceled {
 				fmt.Fprintf(os.Stderr, "[Node] Agent error: %v\n", err)
 				cancel()
