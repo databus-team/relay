@@ -673,15 +673,26 @@ func (c *Client) handleVersion(msg protocol.Message) {
 
 // handleStatus 处理 `relay nodes` 的连通性体检与资源发现。
 func (c *Client) handleStatus(msg protocol.Message) {
-	withUsage := false
-	if reqMap, ok := msg.Payload.(map[string]interface{}); ok {
-		if u, ok := reqMap["with_usage"].(bool); ok {
-			withUsage = u
+	var req protocol.StatusRequest
+	if data, err := json.Marshal(msg.Payload); err == nil {
+		_ = json.Unmarshal(data, &req)
+	}
+	probeTimeout := statusProbeTimeout
+	if req.ProbeTimeoutMS > 0 {
+		probeTimeout = time.Duration(req.ProbeTimeoutMS) * time.Millisecond
+	}
+
+	// 只要部分执行方时(如 `relay ps` 只关心隧道出口),就不为其余执行方各探一次,也不必等它们。
+	var want map[string]bool
+	if len(req.ExecutorIDs) > 0 {
+		want = make(map[string]bool, len(req.ExecutorIDs))
+		for _, id := range req.ExecutorIDs {
+			want[id] = true
 		}
 	}
 
 	// 采集中转 Hub 自身 (如 K8s Pod) 资源
-	hubRes := sysinfo.CollectResourceInfo(withUsage)
+	hubRes := sysinfo.CollectResourceInfo(req.WithUsage)
 	resp := protocol.StatusResponse{
 		OK:      true,
 		Transit: c.transitVersion(),
@@ -698,7 +709,7 @@ func (c *Client) handleStatus(msg protocol.Message) {
 	// 已知但当前离线的 executor(来自持久化台账):不做探针,直接以 offline 状态呈现。
 	var offline []protocol.ExecutorHealth
 	for _, ke := range c.server.ExecutorLedger() {
-		if ke.Online {
+		if ke.Online || (want != nil && !want[ke.ID]) {
 			continue
 		}
 		offline = append(offline, protocol.ExecutorHealth{
@@ -711,6 +722,12 @@ func (c *Client) handleStatus(msg protocol.Message) {
 			LastSeen:   ke.LastSeen.Unix(),
 			Seg2:       protocol.StatusSegment{Unavailable: "executor offline"},
 		})
+	}
+
+	for eid := range endpoints {
+		if want != nil && !want[eid] {
+			delete(endpoints, eid)
+		}
 	}
 
 	if len(endpoints) == 0 {
@@ -735,7 +752,7 @@ func (c *Client) handleStatus(msg protocol.Message) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				seg, dynRes := c.probeExecutor(ep.ClientID, withUsage)
+				seg, dynRes := c.probeExecutor(ep.ClientID, req.WithUsage, probeTimeout)
 				res := ep.Resource
 				if dynRes != nil {
 					res = *dynRes
@@ -781,8 +798,8 @@ func (c *Client) transitVersion() protocol.VersionInfo {
 // probeExecutor 对单个执行方连接发一条探针并等待回包,测「中转→执行方」段往返 RTT,并在 withUsage 为 true 时收集执行方最新动态资源。
 // 探针复用 MsgPing→MsgPong:执行方在自身连接上回 MsgPong(RequestID=probeID),由
 // maybeResolvePending 命中 pending 并投递。发送带写超时兜底,防止 half-open 连接把探针
-// 写卡死(与等待回包一同受 statusProbeTimeout 约束)。失败返回不可用段,不把错误上抛。
-func (c *Client) probeExecutor(clientID string, withUsage bool) (protocol.StatusSegment, *protocol.ResourceStats) {
+// 写卡死(与等待回包一同受 timeout 约束)。失败返回不可用段,不把错误上抛。
+func (c *Client) probeExecutor(clientID string, withUsage bool, timeout time.Duration) (protocol.StatusSegment, *protocol.ResourceStats) {
 	probeID := uuid.New().String()
 	probeCh := c.server.registerPending(probeID)
 	defer c.server.deletePending(probeID)
@@ -793,7 +810,7 @@ func (c *Client) probeExecutor(clientID string, withUsage bool) (protocol.Status
 	}
 
 	start := time.Now()
-	if err := c.server.sendProbe(clientID, protocol.Message{Type: protocol.MsgPing, ID: probeID, Payload: payload}, statusProbeTimeout); err != nil {
+	if err := c.server.sendProbe(clientID, protocol.Message{Type: protocol.MsgPing, ID: probeID, Payload: payload}, timeout); err != nil {
 		return protocol.StatusSegment{Unavailable: "executor unavailable"}, nil
 	}
 
@@ -810,7 +827,7 @@ func (c *Client) probeExecutor(clientID string, withUsage bool) (protocol.Status
 			}
 		}
 		return protocol.StatusSegment{LatencyMS: &latency}, res
-	case <-time.After(statusProbeTimeout):
+	case <-time.After(timeout):
 		return protocol.StatusSegment{Unavailable: "executor probe timeout"}, nil
 	case <-c.closeCh:
 		return protocol.StatusSegment{Unavailable: "disconnected"}, nil

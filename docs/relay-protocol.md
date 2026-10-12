@@ -405,6 +405,20 @@ type RequestOptions struct {
 中转节点信息组装进 `StatusResponse` 回给请求方。请求方再补 `seg1`(本地→中转)与各执行方的累计
 (seg1 + seg2)。
 
+应答要等**最慢**的那次探针,所以请求方可以收窄这次体检(两项都可省,省略即整座部署):
+
+```go
+type StatusRequest struct {
+    WithUsage      bool     `json:"with_usage,omitempty"`       // 是否请求实时用量与负载
+    ExecutorIDs    []string `json:"executor_ids,omitempty"`     // 只探这批执行方;空=全部
+    ProbeTimeoutMS int      `json:"probe_timeout_ms,omitempty"` // 单次探针等待上限(毫秒);0=中转默认 5s
+}
+```
+
+- `relay nodes/status` 两项都不传:它要的就是全网台账,容忍慢节点。
+- `relay ps` 传 `executor_ids`(只有运行中隧道的出口)与 `probe_timeout_ms`(800ms):无关的慢执行方
+  不再拖住它;出口自己慢时也能在本地等待上限内拿到 `notready`,而不是退化成 `unknown`。
+
 ```go
 type StatusSegment struct {
     LatencyMS   *int64 `json:"latency_ms,omitempty"` // nil = 该段不可用
@@ -430,6 +444,8 @@ type StatusResponse struct {
 - `relay status` **不携带 `-w`**:status 报告整个部署,而非单个 workspace/executor。
 - 执行方离线/超时时,其 `seg2.latency_ms` 为空、`seg2.unavailable` 注明断点原因;全部执行方离线时
   `executors` 为空列表,命令仍成功——语义是"中转在线、远端掉线",绝不因无执行方而报错。
+- 探针是应用层 `MsgPing`→`MsgPong`,走执行方自身的发送队列:执行方被隧道/流式输出打满时回包可能被丢,
+  于是它表现为「在线但探针超时」。想要快而诚实的答复,调用方应自己设 `probe_timeout_ms`。
 - 旧 `ping` 的"本机→中转"心跳职责并入 `status`;`version` 收窄为纯本地构建信息,跨机版本台账由 `status` 承接。
 
 ### 4.9 出网隧道 (本地 SOCKS5 → executor)

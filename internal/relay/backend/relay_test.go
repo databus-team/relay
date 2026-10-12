@@ -75,7 +75,7 @@ func TestNewSupervisor_OnePerBaseDir(t *testing.T) {
 	}
 }
 
-func newTestHub(t *testing.T, watchDir string) (*httptest.Server, string) {
+func newTestHub(t testing.TB, watchDir string) (*httptest.Server, string) {
 	t.Helper()
 	srv, err := server.New(server.Config{
 		Addr: ":0",
@@ -94,7 +94,7 @@ func newTestHub(t *testing.T, watchDir string) (*httptest.Server, string) {
 	return ts, "ws" + strings.TrimPrefix(ts.URL, "http") + "/relay"
 }
 
-func newTestHubWithTunnel(t *testing.T, watchDir string) (*httptest.Server, string) {
+func newTestHubWithTunnel(t testing.TB, watchDir string) (*httptest.Server, string) {
 	t.Helper()
 	srv, err := server.New(server.Config{
 		Addr: ":0",

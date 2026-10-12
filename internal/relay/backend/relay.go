@@ -1135,6 +1135,13 @@ func (b *RelayBackend) Status(ctx context.Context) (protocol.StatusResponse, err
 
 // StatusWithUsage 向中转查询整座部署的连通状态与资源 (支持可选 withUsage)
 func (b *RelayBackend) StatusWithUsage(ctx context.Context, withUsage bool) (protocol.StatusResponse, error) {
+	return b.StatusTargeted(ctx, withUsage, nil, 0)
+}
+
+// StatusTargeted 同 StatusWithUsage,但只体检 executorIDs 里的执行方(空=全部),并可用
+// probeTimeout 覆盖中转等待单次探针回包的上限。供只关心少数出口的调用方(如 `relay ps`)
+// 免于为无关的慢执行方买单。
+func (b *RelayBackend) StatusTargeted(ctx context.Context, withUsage bool, executorIDs []string, probeTimeout time.Duration) (protocol.StatusResponse, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return protocol.StatusResponse{}, err
 	}
@@ -1146,7 +1153,7 @@ func (b *RelayBackend) StatusWithUsage(ctx context.Context, withUsage bool) (pro
 	}
 	seg1 := time.Since(seg1Start).Milliseconds()
 
-	st, err := b.client.Status(ctx, withUsage)
+	st, err := b.client.StatusFor(ctx, withUsage, executorIDs, probeTimeout)
 	if err != nil {
 		return protocol.StatusResponse{}, err
 	}

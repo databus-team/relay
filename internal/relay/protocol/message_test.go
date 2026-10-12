@@ -307,6 +307,58 @@ func TestTunnelConnectRequestRoundTrip(t *testing.T) {
 	}
 }
 
+// StatusRequest 的可选收窄字段(只探部分出口 + 单次探针预算)必须原样过线,
+// 否则中转会退回全网体检,`relay ps` 又被无关的慢执行方拖住。
+func TestStatusRequestRoundTrip(t *testing.T) {
+	in := Message{
+		Type: MsgStatus,
+		ID:   "status-id",
+		Payload: StatusRequest{
+			WithUsage:      true,
+			ExecutorIDs:    []string{"eg-a", "eg-b"},
+			ProbeTimeoutMS: 800,
+		},
+	}
+
+	data, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got Message
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	raw, err := json.Marshal(got.Payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	var p StatusRequest
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+
+	if !p.WithUsage {
+		t.Error("with_usage: want true")
+	}
+	if len(p.ExecutorIDs) != 2 || p.ExecutorIDs[0] != "eg-a" || p.ExecutorIDs[1] != "eg-b" {
+		t.Errorf("executor_ids: got %v, want [eg-a eg-b]", p.ExecutorIDs)
+	}
+	if p.ProbeTimeoutMS != 800 {
+		t.Errorf("probe_timeout_ms: got %d, want 800", p.ProbeTimeoutMS)
+	}
+}
+
+// 省略收窄字段时不产生额外键:老请求方与新中转的线上形态保持不变。
+func TestStatusRequestOmitsNarrowingFields(t *testing.T) {
+	data, err := json.Marshal(StatusRequest{})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(data) != "{}" {
+		t.Errorf("empty StatusRequest = %s, want {}", data)
+	}
+}
+
 func TestStatusResponseRoundTrip(t *testing.T) {
 	lat := int64(42)
 	in := Message{

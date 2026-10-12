@@ -1445,6 +1445,13 @@ type psRow struct {
 // 必须与每一行对齐;表头由 psHeader 渲染,行由 runPs 逐行套用)。
 const psRowFormat = "%-8s %-12s %-16s %-30s %-16s %-8s %-6s %-16s %s\n"
 
+// relay ps 的出口探测预算:探针预算必须明显短于本地等待上限,否则慢出口会让本地先超时,
+// 隧道行只能退化成语义模糊的 `unknown`,而不是「出口 notready」。
+const (
+	psEgressProbeTimeout = 800 * time.Millisecond
+	psEgressQueryTimeout = 3 * time.Second
+)
+
 // psHeader 渲染 relay ps 的表头行。独立成函数以便单测钉住 R20 的 RESTART 列位置。
 func psHeader() string {
 	return fmt.Sprintf(psRowFormat, "TYPE", "TASK ID", "NODE", "STATUS", "PORTS", "RESTART", "EXIT", "CREATED", "COMMAND")
@@ -1548,17 +1555,18 @@ func compactLatency(s protocol.StatusSegment) string {
 	return fmt.Sprintf("%dms", *s.LatencyMS)
 }
 
-// queryEgressStates 向中转查询全网节点台账,返回 executor_id -> 出口就绪快照。判定与 `relay nodes`
-// 完全一致(离线看 LastSeen;Seg2 不可用=NotReady)。1.5s 上限、任何错误静默降级为 nil——调用方
-// 据此把隧道行标成 unknown,而不是让 `relay ps` 因为探测失败而失败。
-func queryEgressStates(cfg *config.Config) map[string]egressState {
+// queryEgressStates 向中转查询指定出口 executor 的在线就绪快照。判定与 `relay nodes` 完全一致
+// (离线看 LastSeen;Seg2 不可用=NotReady)。只探 egressIDs 里的出口,且探针预算短于本地等待上限,
+// 所以慢出口只会得到一个及时的 notready,不会把整条 `relay ps` 拖到超时;任何错误静默降级为
+// nil——调用方据此把隧道行标成 unknown,而不是让 `relay ps` 因为探测失败而失败。
+func queryEgressStates(cfg *config.Config, egressIDs []string) map[string]egressState {
 	rb, err := getRelayBackend(cfg)
 	if err != nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), psEgressQueryTimeout)
 	defer cancel()
-	st, err := rb.StatusWithUsage(ctx, false)
+	st, err := rb.StatusTargeted(ctx, false, egressIDs, psEgressProbeTimeout)
 	if err != nil || !st.OK {
 		return nil
 	}
@@ -1567,6 +1575,21 @@ func queryEgressStates(cfg *config.Config) map[string]egressState {
 		out[e.ExecutorID] = egressStateOf(e)
 	}
 	return out
+}
+
+// runningEgressIDs 收集确有运行中隧道的出口 executor_id(去重、保序)。没有运行中的隧道时返回空,
+// 调用方据此完全跳过中转探测。
+func runningEgressIDs(tunnels []tunnelState) []string {
+	var ids []string
+	seen := make(map[string]bool, len(tunnels))
+	for _, ts := range tunnels {
+		if ts.State != "running" || ts.Egress == "" || seen[ts.Egress] {
+			continue
+		}
+		seen[ts.Egress] = true
+		ids = append(ids, ts.Egress)
+	}
+	return ids
 }
 
 // egressStateOf 把一条 ExecutorHealth 投影为出口就绪快照(纯函数,便于单测)。
@@ -1649,14 +1672,11 @@ func runPs() {
 		tunnels = filterTunnels(tunnels, targetNode, *psAll)
 	}
 
-	// 合并:任务行在前,隧道行在后。出口探测只在确有运行中的隧道时才发(一次中转查询,1.5s 上限),
+	// 合并:任务行在前,隧道行在后。出口探测只针对确有运行中隧道的出口(一次中转查询),没有就不发,
 	// 避免常态 `relay ps` 凭空多一次 RPC。
 	var egress map[string]egressState
-	for _, ts := range tunnels {
-		if ts.State == "running" {
-			egress = queryEgressStates(cfg)
-			break
-		}
+	if ids := runningEgressIDs(tunnels); len(ids) > 0 {
+		egress = queryEgressStates(cfg, ids)
 	}
 	rows := make([]psRow, 0, len(tasks)+len(tunnels))
 	for _, t := range tasks {

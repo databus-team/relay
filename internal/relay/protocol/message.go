@@ -181,8 +181,12 @@ type StatusSegment struct {
 
 // StatusRequest 请求对整座中转做连通性体检。不携带 watch:中转对全部已注册执行方
 // 各做一次 中→执行方 探针,请求方再补 本地→中转 段。
+//   - ExecutorIDs:    非空时只探这批执行方,其余不进应答(应答要等最慢的一次探针)。
+//   - ProbeTimeoutMS: 非零时覆盖中转等待单次探针回包的上限。
 type StatusRequest struct {
-	WithUsage bool `json:"with_usage,omitempty"` // 是否请求实时用量与负载 (重载操作)
+	WithUsage      bool     `json:"with_usage,omitempty"`       // 是否请求实时用量与负载 (重载操作)
+	ExecutorIDs    []string `json:"executor_ids,omitempty"`     // 只体检这些执行方;空=全部
+	ProbeTimeoutMS int      `json:"probe_timeout_ms,omitempty"` // 单次探针等待上限(毫秒);0=中转默认
 }
 
 // ResourceStats 节点资源与负载详情

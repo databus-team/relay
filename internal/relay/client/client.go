@@ -573,8 +573,18 @@ func (c *Client) Version(ctx context.Context) (protocol.VersionResponse, error) 
 // Status 向中转查询整座部署的连通状态与节点资源:中转对每个执行方的探针结果(Executors)与中转节点
 // 信息(Transit/Resource)。
 func (c *Client) Status(ctx context.Context, withUsage bool) (protocol.StatusResponse, error) {
+	return c.StatusFor(ctx, withUsage, nil, 0)
+}
+
+// StatusFor 同 Status,但可收窄体检范围与探针预算:executorIDs 非空时中转只探这批执行方,
+// probeTimeout 非零时覆盖其等待单次探针回包的上限(两者都为 0/空即为整座部署的默认体检)。
+func (c *Client) StatusFor(ctx context.Context, withUsage bool, executorIDs []string, probeTimeout time.Duration) (protocol.StatusResponse, error) {
 	var st protocol.StatusResponse
-	resp, err := c.Request(ctx, protocol.MsgStatus, protocol.StatusRequest{WithUsage: withUsage})
+	resp, err := c.Request(ctx, protocol.MsgStatus, protocol.StatusRequest{
+		WithUsage:      withUsage,
+		ExecutorIDs:    executorIDs,
+		ProbeTimeoutMS: int(probeTimeout / time.Millisecond),
+	})
 	if err != nil {
 		return st, err
 	}
