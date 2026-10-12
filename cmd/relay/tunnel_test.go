@@ -2,8 +2,14 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"fmt"
+	"io"
 	"net"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // tunnelInstanceName 应把 executor 映射为 `<prefix>-<executor>` 实例名,并净化非法文件名字符。
@@ -165,5 +171,101 @@ func TestIsLoopbackAddr(t *testing.T) {
 		if got := isLoopbackAddr(tc.addr); got != tc.want {
 			t.Errorf("isLoopbackAddr(%q) = %v, want %v", tc.addr, got, tc.want)
 		}
+	}
+}
+
+// TestRunTunnelMode_CreatesTunnelAndPersistsIntent 验证新入口的创建动作落到既有 holder 上:
+// 按 relay run --type=tunnel 解析出的请求下发 open 后,监听真的起来、意图进 tunnels.json。
+// 用 in-process 测试 holder(非用户正在跑的 node),不依赖真机 node。
+func TestRunTunnelMode_CreatesTunnelAndPersistsIntent(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "tunnels.json")
+	_, _, sock := startTestHolder(t, statePath, io.Discard)
+
+	port := freeTCPPort(t)
+	listen := fmt.Sprintf("127.0.0.1:%d", port)
+	req, err := resolveTunnelMode(tunnelModeInput{
+		Publish:  []string{listen},
+		Executor: "site-a",
+		BindHost: "127.0.0.1",
+		Restart:  tunRestartAlways,
+	})
+	if err != nil {
+		t.Fatalf("resolveTunnelMode: %v", err)
+	}
+
+	var warn bytes.Buffer
+	if err := openTunnelViaHolder(sock, req.Egress, req.Listen.Addr(), req.Restart, &warn); err != nil {
+		t.Fatalf("openTunnelViaHolder: %v", err)
+	}
+	if warn.Len() != 0 {
+		t.Errorf("unexpected warning on loopback bind: %q", warn.String())
+	}
+
+	// 监听地址确实在监听。
+	conn, err := net.DialTimeout("tcp", req.Listen.Addr(), time.Second)
+	if err != nil {
+		t.Fatalf("dial tunnel listener %s: %v", req.Listen.Addr(), err)
+	}
+	_ = conn.Close()
+
+	// 意图已落盘,且 restart 策略随请求写入。
+	states, err := loadTunnels(statePath)
+	if err != nil {
+		t.Fatalf("loadTunnels: %v", err)
+	}
+	var got *tunnelState
+	for i := range states {
+		if states[i].Egress == "site-a" {
+			got = &states[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("tunnels.json has no entry for egress site-a: %+v", states)
+	}
+	if got.Listen != req.Listen.Addr() || got.Restart != tunRestartAlways || got.State != "running" {
+		t.Errorf("persisted state = %+v, want listen=%s restart=%s state=running", got, req.Listen.Addr(), tunRestartAlways)
+	}
+}
+
+// TestRunTunnelMode_NonLoopbackWarnsButCreates 验证非 loopback 绑定:告警打到调用方的
+// writer(生产即 stderr),隧道照旧建成(R17)。
+func TestRunTunnelMode_NonLoopbackWarnsButCreates(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "tunnels.json")
+	_, _, sock := startTestHolder(t, statePath, io.Discard)
+
+	port := freeTCPPort(t)
+	listen := fmt.Sprintf("0.0.0.0:%d", port)
+	req, err := resolveTunnelMode(tunnelModeInput{
+		Publish:  []string{listen},
+		Executor: "site-b",
+		BindHost: "127.0.0.1",
+	})
+	if err != nil {
+		t.Fatalf("resolveTunnelMode: %v", err)
+	}
+
+	var warn bytes.Buffer
+	if err := openTunnelViaHolder(sock, req.Egress, req.Listen.Addr(), req.Restart, &warn); err != nil {
+		t.Fatalf("openTunnelViaHolder: %v", err)
+	}
+	if !strings.Contains(warn.String(), "WARNING") || !strings.Contains(warn.String(), "non-loopback") {
+		t.Errorf("warning = %q, want a non-loopback WARNING", warn.String())
+	}
+	if !strings.Contains(warn.String(), listen) {
+		t.Errorf("warning = %q, want it to name %s", warn.String(), listen)
+	}
+
+	states, err := loadTunnels(statePath)
+	if err != nil {
+		t.Fatalf("loadTunnels: %v", err)
+	}
+	found := false
+	for _, st := range states {
+		if st.Egress == "site-b" && st.Listen == listen && st.State == "running" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("tunnel not created for %s: %+v", listen, states)
 	}
 }

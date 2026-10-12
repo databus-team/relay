@@ -85,9 +85,16 @@ var (
 	execDetach      = execCmd.Flag("detach", "Run command in background as daemon task (returns TaskID)").Short('d').Bool()
 	execPublish     = execCmd.Flag("publish", "Publish remote port to local (e.g. -p 8080 or -p 8080:8080, similar to docker run -p)").Short('p').Strings()
 	execBindHost    = execCmd.Flag("bind-host", "Local bind host for published ports (default: 127.0.0.1)").Default("127.0.0.1").String()
+	// -t/--type 选择创建的对象:缺省 task(在远端跑命令);tunnel 则在本机 node 上开一条 SOCKS5 隧道。
+	execType = execCmd.Flag("type", "Object type to create: task (default) or tunnel").Short('t').String()
+	// --restart/--no-restart 是任务与隧道共用的重启策略旗标对(隧道模式写入隧道意图 R14;
+	// 任务的写入/校验由任务模式实现负责)。校验抽成 restartPolicyValue 纯函数共用。
+	execRestartPolicy = execCmd.Flag("restart", "Restart policy on node restart: always|no").Default("no").String()
+	execNoRestart     = execCmd.Flag("no-restart", "Shortcut for --restart=no").Bool()
 	// 支持多词命令:relay run git status 会收成 ["git","status"] 再空格 join。
 	// 含以 - 开头参数的命令(如 git log --oneline)仍须整体加引号,避免被当 flag。
-	execCmdStr = execCmd.Arg("command", "Command to execute (multiple words are joined)").Required().Strings()
+	// 不设 Required:模式按 KTD7 由代码校验(任务模式必需,隧道模式必须为空)。
+	execCmdStr = execCmd.Arg("command", "Command to execute (multiple words are joined; required in task mode)").Strings()
 
 	// ps command - 查询后台任务
 	psCmd  = kingpin.Command("ps", "List managed background tasks and node-held tunnels (similar to docker ps)")
@@ -1056,10 +1063,119 @@ func disambiguateWorkspacesByPath(candidates []*config.WorkspaceConfig, absPath 
 	return nil
 }
 
+// tunnelModeInput 是 relay run 在隧道模式下用到的已解析旗标。显式传入(不读全局变量),
+// 使模式/旗标校验成为可逐条断言的纯决策(KTD7)。
+type tunnelModeInput struct {
+	Command   []string
+	Publish   []string
+	BindHost  string
+	Watch     string
+	Node      string
+	Executor  string
+	Detach    bool
+	NoSync    bool
+	Force     bool
+	NoRestart bool
+	Restart   string
+}
+
+// tunnelModeRequest 是隧道模式归一后的创建请求。
+type tunnelModeRequest struct {
+	Listen  *TunnelListenSpec
+	Egress  string
+	Restart string
+}
+
+// resolveTunnelMode 按模式矩阵校验并归一 relay run --type=tunnel 的旗标(R14/R16):
+// 恰好一个 -p([host:]port,无远端半段),没有位置命令,不接受任务语义旗标(-d/--no-sync/-f/-w),
+// 出口取 -e/--node,策略取 --restart/--no-restart。任一违规组合显式报错,不静默忽略。
+func resolveTunnelMode(in tunnelModeInput) (*tunnelModeRequest, error) {
+	if len(in.Command) > 0 {
+		return nil, fmt.Errorf("--type=tunnel takes no command (got %q); tunnels are created by the local node, not by running a command", strings.Join(in.Command, " "))
+	}
+	if in.Detach {
+		return nil, fmt.Errorf("-d/--detach is task-only and cannot be combined with --type=tunnel (tunnels are held by the local node)")
+	}
+	if in.NoSync {
+		return nil, fmt.Errorf("--no-sync is task-only and cannot be combined with --type=tunnel")
+	}
+	if in.Force {
+		return nil, fmt.Errorf("-f/--force-remote is task-only and cannot be combined with --type=tunnel")
+	}
+	if in.Watch != "" {
+		return nil, fmt.Errorf("-w/--watch is task-only and cannot be combined with --type=tunnel; pick the tunnel egress with -e/--executor")
+	}
+	switch len(in.Publish) {
+	case 0:
+		return nil, fmt.Errorf("--type=tunnel requires exactly one -p <[host:]port>")
+	case 1:
+	default:
+		return nil, fmt.Errorf("--type=tunnel accepts exactly one -p, got %d", len(in.Publish))
+	}
+	listen, err := parseTunnelListenSpec(in.Publish[0], in.BindHost)
+	if err != nil {
+		return nil, err
+	}
+	egress := resolveNodeTarget(in.Node, in.Executor)
+	if egress == "" {
+		return nil, fmt.Errorf("Specify --node or --executor with the egress node ID (see `relay status` -> `executors[].executor_id`)")
+	}
+	policy, err := restartPolicyValue(in.Restart, in.NoRestart)
+	if err != nil {
+		return nil, err
+	}
+	return &tunnelModeRequest{Listen: listen, Egress: egress, Restart: policy}, nil
+}
+
+// requireTaskCommand 校验任务模式必须有位置命令。kingpin 层不再声明 Required,
+// 改为按模式校验(KTD7:隧道模式必须没有命令,任务模式必须有)。
+func requireTaskCommand(command []string) error {
+	if len(command) == 0 {
+		return fmt.Errorf("a command is required (e.g. `relay run echo hi`); use --type=tunnel to create a tunnel instead")
+	}
+	return nil
+}
+
 func runExec() {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 模式分支(KTD7):置于工作区/执行方解析之前,隧道模式直接走创建流程,不解析工作区,
+	// 也不需要命令;任务模式(默认)保持既有行为。两种路径的旗标规则互不干扰。
+	switch mode := strings.ToLower(strings.TrimSpace(*execType)); mode {
+	case "", "task":
+		if err := requireTaskCommand(*execCmdStr); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	case "tunnel":
+		req, err := resolveTunnelMode(tunnelModeInput{
+			Command:   *execCmdStr,
+			Publish:   *execPublish,
+			BindHost:  *execBindHost,
+			Watch:     *execWatch,
+			Node:      *execNode,
+			Executor:  *execExec,
+			Detach:    *execDetach,
+			NoSync:    *execNoSync,
+			Force:     *execForceRemote,
+			NoRestart: *execNoRestart,
+			Restart:   *execRestartPolicy,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := startTunnel(cfg, req.Egress, req.Listen.Addr(), req.Restart, os.Stderr); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	default:
+		fmt.Fprintf(os.Stderr, "Error: invalid --type %q (want task|tunnel)\n", *execType)
 		os.Exit(1)
 	}
 

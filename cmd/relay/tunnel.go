@@ -29,20 +29,26 @@ const (
 	handshakeTimeout = 10 * time.Second
 )
 
-// tunnelRestartPolicyValue 把 --restart/--no-restart 解析为标准策略值(always|no)。
-// --no-restart 是 --restart=no 的快捷方式(且优先);缺省与空值都归一为 no。
-func tunnelRestartPolicyValue() (string, error) {
-	if *tunnelNoRestart {
+// restartPolicyValue 把一对重启策略旗标(策略字符串 + --no-restart 布尔)归一为标准策略值
+// (always|no)。纯函数,不读全局旗标:relay run 的任务/隧道两种模式与 relay tunnel start
+// 共用同一份校验,--no-restart 优先,缺省与空值都归一为 no。
+func restartPolicyValue(policy string, noRestart bool) (string, error) {
+	if noRestart {
 		return tunRestartNo, nil
 	}
-	switch policy := strings.ToLower(strings.TrimSpace(*tunnelRestartPolicy)); policy {
+	switch p := strings.ToLower(strings.TrimSpace(policy)); p {
 	case "", tunRestartNo:
 		return tunRestartNo, nil
 	case tunRestartAlways:
 		return tunRestartAlways, nil
 	default:
-		return "", fmt.Errorf("invalid --restart %q (want always|no)", policy)
+		return "", fmt.Errorf("invalid --restart %q (want always|no)", p)
 	}
+}
+
+// tunnelRestartPolicyValue 把 relay tunnel start 的 --restart/--no-restart 解析为标准策略值(always|no)。
+func tunnelRestartPolicyValue() (string, error) {
+	return restartPolicyValue(*tunnelRestartPolicy, *tunnelNoRestart)
 }
 
 // runTunnelStart 启动一条由本地 node 持有的 SOCKS5 隧道:先确保 node(agent 角色)在线,
@@ -52,9 +58,6 @@ func runTunnelStart() error {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
-	}
-	if cfg.Backend.Type != "relay" {
-		return fmt.Errorf("tunnel requires backend.type=relay, got %q", cfg.Backend.Type)
 	}
 
 	// 出口 node 选择:`-w` 是「执行方注册的节点身份 executor_id」(见 `relay status` 的
@@ -69,14 +72,28 @@ func runTunnelStart() error {
 		return err
 	}
 
+	return startTunnel(cfg, target, *tunnelListen, policy, os.Stderr)
+}
+
+// startTunnel 是隧道创建的共享动作:确保本机 node(holder)在线,再下发 open 控制消息。
+// 旧入口 `relay tunnel start` 与新入口 `relay run -t tunnel` 共用,避免控制消息代码分叉。
+func startTunnel(cfg *config.Config, target, listen, policy string, warnw io.Writer) error {
+	if cfg.Backend.Type != "relay" {
+		return fmt.Errorf("tunnel requires backend.type=relay, got %q", cfg.Backend.Type)
+	}
 	if err := ensureLocalRelayNode(cfg, tunnelSockPath()); err != nil {
 		return err
 	}
+	return openTunnelViaHolder(tunnelSockPath(), target, listen, policy, warnw)
+}
 
-	resp, err := sendTunnelControl(tunnelSockPath(), tunControlMsg{
+// openTunnelViaHolder 经本地 node 的控制 unix socket 下发 open 并处理应答/告警。
+// warnw 接收非 loopback 与持久化告警(生产即调用方 stderr;测试可注入缓冲以断言文案)。
+func openTunnelViaHolder(sockPath, target, listen, policy string, warnw io.Writer) error {
+	resp, err := sendTunnelControl(sockPath, tunControlMsg{
 		Op:      tunOpOpen,
 		Egress:  target,
-		Listen:  *tunnelListen,
+		Listen:  listen,
 		Restart: policy,
 	})
 	if err != nil {
@@ -89,13 +106,13 @@ func runTunnelStart() error {
 	}
 	// 非 loopback 绑定 = 一个无认证、网络上任意主机可用的 SOCKS5 入口。holder 侧也会记一条到
 	// node.log,但那是 node 的 stderr(daemon 已重定向),发起者本人看不到,故 CLI 同样打到 stderr。
-	if !isLoopbackAddr(*tunnelListen) {
-		fmt.Fprint(os.Stderr, tunnelNonLoopbackWarning(*tunnelListen))
+	if !isLoopbackAddr(listen) {
+		fmt.Fprint(warnw, tunnelNonLoopbackWarning(listen))
 	}
 	if resp.Warning != "" {
-		fmt.Fprintf(os.Stderr, "Warning: %s\n", resp.Warning)
+		fmt.Fprintf(warnw, "Warning: %s\n", resp.Warning)
 	}
-	fmt.Printf("tunnel %s started: SOCKS5 on %s -> egress %s (restart=%s)\n", target, *tunnelListen, target, policy)
+	fmt.Printf("tunnel %s started: SOCKS5 on %s -> egress %s (restart=%s)\n", target, listen, target, policy)
 	return nil
 }
 
