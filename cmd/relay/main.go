@@ -30,7 +30,6 @@ import (
 	"github.com/user/relay/internal/sync/git"
 	"github.com/user/relay/internal/sysinfo"
 	"github.com/user/relay/internal/version"
-	"github.com/user/relay/internal/watcher"
 )
 
 var (
@@ -40,18 +39,6 @@ var (
 
 	configPath = kingpin.Flag("config", "Path to config file").Short('c').Default("~/.relay/config.yaml").String()
 	debugFlag  = kingpin.Flag("debug", "Enable debug mode").Bool()
-
-	// Watch command - continuous monitoring (legacy)
-	watchCmd = kingpin.Command("watch", "Workspace watcher daemon (deprecated, use node instead)")
-
-	// 子命令定义
-	_                = watchCmd.Command("run", "Run watcher in foreground")
-	_                = watchCmd.Command("start", "Start watcher daemon in background")
-	_                = watchCmd.Command("stop", "Stop running watcher daemon")
-	_                = watchCmd.Command("status", "Show status of watcher daemon")
-	_                = watchCmd.Command("restart", "Restart watcher daemon")
-	watchUpgradeCmd  = watchCmd.Command("upgrade", "Upgrade watcher daemon binary")
-	watchUpgradePath = watchUpgradeCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 
 	// Pull command - download single file (requires filename)
 	pullCmd    = kingpin.Command("pull", "Pull file from remote workspace")
@@ -192,12 +179,20 @@ func main() {
 	kingpin.CommandLine.HelpFlag.Short('h')
 	setupUsageTemplate()
 
-	// 统一日志基座:timetamps + 可选 verbose。所有端点(server/watch/exec/...)
-	// 的 log/Info 级输出都带日期时间,便于审计;--debug 额外打开 verbose 详情。
+	// 统一日志基座:timetamps + 可选 verbose。所有端点(node/exec/...)的 log/Info 级
+	// 输出都带日期时间,便于审计;--debug 额外打开 verbose 详情。
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	if *debugFlag {
 		backend.SetDebug(true)
 		logx.SetDebug(true)
+	}
+
+	// 已退役的两个 daemon 命令在远端可能还留在 unit/shell 里,给一句迁移提示胜过
+	// kingpin 的 "expected command"。
+	if len(os.Args) > 1 && (os.Args[1] == "server" || os.Args[1] == "watch") {
+		fmt.Fprintf(os.Stderr, "Error: `relay %s` has been retired; use `relay node` instead "+
+			"(roles are selected by node.roles in the config).\n", os.Args[1])
+		os.Exit(1)
 	}
 
 	parseCtx, parseErr := kingpin.CommandLine.ParseContext(os.Args[1:])
@@ -210,33 +205,6 @@ func main() {
 
 	selectedCmd := kingpin.Parse()
 	switch {
-	case selectedCmd == "server" || strings.HasPrefix(selectedCmd, "server "):
-		sub := strings.TrimSpace(strings.TrimPrefix(selectedCmd, "server"))
-		switch sub {
-		case "start":
-			if err := daemonStart("server"); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		case "stop":
-			daemonStop("server")
-		case "status":
-			if err := daemonStatus("server"); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		case "restart":
-			daemonRestart("server")
-		case "upgrade":
-			daemonUpgrade("server", *serverUpgradePath)
-		case "run":
-			if err := runServer(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		default:
-			app.Usage(os.Args[1:])
-		}
 	case selectedCmd == "node" || strings.HasPrefix(selectedCmd, "node "):
 		sub := strings.TrimSpace(strings.TrimPrefix(selectedCmd, "node"))
 		switch sub {
@@ -261,30 +229,6 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
-		default:
-			app.Usage(os.Args[1:])
-		}
-	case selectedCmd == "watch" || strings.HasPrefix(selectedCmd, "watch "):
-		sub := strings.TrimSpace(strings.TrimPrefix(selectedCmd, "watch"))
-		switch sub {
-		case "start":
-			if err := daemonStart("watch"); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		case "stop":
-			daemonStop("watch")
-		case "status":
-			if err := daemonStatus("watch"); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		case "restart":
-			daemonRestart("watch")
-		case "upgrade":
-			daemonUpgrade("watch", *watchUpgradePath)
-		case "run":
-			runWatch()
 		default:
 			app.Usage(os.Args[1:])
 		}
@@ -449,59 +393,6 @@ func tunnelInstanceName(executor string) string {
 		}
 	}
 	return b.String()
-}
-
-func runWatch() {
-	// Resolve a leading ~ so the path stored on the watcher (used later for
-	// config backup during sync) is an absolute filesystem path, not a literal
-	// "~" that os.OpenFile can't read.
-	cfgPath, err := config.ExpandHome(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to expand config path: %v\n", err)
-		os.Exit(1)
-	}
-
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
-		os.Exit(1)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	defer relaybackend.Cleanup()
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		fmt.Println("\nShutting down...")
-		cancel()
-	}()
-
-	// 本进程是执行方(watch 端):显式置位 executor 角色。
-	// 这样配置里的 executor: true 只在 relay watch 生效;本地 CLI(exec/push/sync)
-	// 即便共用同一份包含 executor 的配置,也不会自注册为执行方、把命令转发回本机。
-	relaybackend.SetExecutorRole(true)
-
-	// 执行方进程启动路径:显式构造 supervisor 并重放策略为 always 的任务一次(KTD4)。
-	// 每进程只触发一次;单条失败不阻塞启动,原因写入该任务自己的日志。
-	relaybackend.ReplayAlwaysTasks()
-
-	w, err := watcher.New(cfg, cfgPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create watcher: %v\n", err)
-		os.Exit(1)
-	}
-
-	// 执行方(relay executor)要把「push 落地后本地跑 jobs」接到自身的 watch 配置与 job 执行逻辑。
-	w.SetPushJobHandler(runLocalJobsForPush)
-
-	if err := w.Run(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Watch error: %v\n", err)
-		os.Exit(1)
-	}
 }
 
 func runPull() {

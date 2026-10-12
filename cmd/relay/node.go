@@ -26,7 +26,6 @@ var (
 	_               = nodeCmd.Command("restart", "Restart node daemon")
 	nodeUpgradeCmd  = nodeCmd.Command("upgrade", "Upgrade node daemon binary")
 	nodeUpgradePath = nodeUpgradeCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
-	nodeConfigPath  = nodeCmd.Flag("server-config", "Path to server config file (YAML, for backward compatibility)").String()
 )
 
 // runNode 运行统一对等节点 (Node)
@@ -35,11 +34,7 @@ var (
 // - 若包含 agent: 启动 Watcher (Agent)
 // - 若同时包含 hub 与 agent: 通过 srv.Ready() 闩同步，等待 Hub 端口成功监听后再拨号 Agent
 func runNode() error {
-	path := *configPath
-	if nodeConfigPath != nil && *nodeConfigPath != "" {
-		path = *nodeConfigPath
-	}
-	cfgPath, err := config.ExpandHome(path)
+	cfgPath, err := config.ExpandHome(*configPath)
 	if err != nil {
 		return fmt.Errorf("expand config path: %w", err)
 	}

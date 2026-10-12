@@ -40,7 +40,7 @@ var categories = []CommandCategory{
 	},
 	{
 		Title: "Legacy / Archive:",
-		Names: []string{"server", "watch", "exec", "list", "cleanup"},
+		Names: []string{"exec", "list", "cleanup"},
 	},
 }
 

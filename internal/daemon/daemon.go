@@ -100,7 +100,7 @@ func Get(pidFile string) StatusInfo {
 	return StatusInfo{Running: alive(pid), Pid: pid}
 }
 
-// Start 以当前可执行文件、给定参数(args 含子命令,如 ["server","run"])启动一个
+// Start 以当前可执行文件、给定参数(args 含子命令,如 ["node","run"])启动一个
 // detached 子进程,stdout/sderr 重定向到 logFile,pid 写入 pidFile。返回子进程 pid。
 func Start(selfArgs []string, logFile, pidFile string) (int, error) {
 	exe, err := os.Executable()

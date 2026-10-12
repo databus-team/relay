@@ -71,9 +71,9 @@ fmt:
 vet:
 	$(GOCMD) vet ./...
 
-## run: Run in daemon mode (continuous watch)
+## run: Run the peer node daemon in the foreground
 run: build
-	./$(BINARY_NAME) watch
+	./$(BINARY_NAME) node run
 
 ## pull: Download single file from remote
 pull:
@@ -99,7 +99,7 @@ exec:
 deploy-remote:
 	./scripts/relay-deploy.sh remote
 
-## deploy-transit: One-click deploy the transit server via controlled self-upgrade
+## deploy-transit: One-click deploy the transit (hub) node via controlled self-upgrade
 deploy-transit:
 	./scripts/relay-deploy.sh transit
 
@@ -123,6 +123,6 @@ help:
 	@echo "  make vet            Run go vet"
 	@echo "  make run            Run in daemon mode"
 	@echo "  make deploy-remote    Deliver to all online executors (RESTART=1 to swap+restart; RELAY_EXECUTORS to narrow)"
-	@echo "  make deploy-transit   One-click deploy the transit server (controlled self-upgrade)"
+	@echo "  make deploy-transit   One-click deploy the transit hub node (controlled self-upgrade)"
 	@echo "  make deploy           Both above"
 	@echo "  make help           Show this help"

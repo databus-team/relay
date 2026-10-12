@@ -91,7 +91,7 @@ var topCommands = []string{
 	"nodes",
 	"push", "pull", "diff", "undo", "ws", "sync",
 	"node", "version", "server-remote", "completion", "job",
-	"server", "watch", "list", "cleanup",
+	"list", "cleanup",
 }
 
 var globalFlags = []string{
@@ -147,13 +147,6 @@ var commandSpecs = map[string]cmdSpec{
 	"job": {
 		subcmds: []string{"run"},
 		flags:   []string{"-w", "--watch"},
-	},
-	"server": {
-		subcmds: []string{"run", "start", "stop", "status", "restart", "upgrade"},
-		flags:   []string{"--server-config", "--addr"},
-	},
-	"watch": {
-		subcmds: []string{"run", "start", "stop", "status", "restart", "upgrade"},
 	},
 	"list": {
 		flags: []string{"-w", "--watch"},

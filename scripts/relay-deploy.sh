@@ -12,7 +12,8 @@
 #   中转(transit) —— 一键:经 `relay server-remote` 受控自升级通道把新构建的 relay-linux
 #                  流式交付中转(中转本地自检 → 回执 → 换装 .prev备份/重启),本地断连
 #                  重连轮询版本核验。仅放开「自我升级」一条窄径,中转不会自注册为执行器。
-#                  首跳依赖:在跑旧构建的中转需一次手工 seed(relay server upgrade)。
+#                  首跳依赖:跑着不认识升级消息的旧构建时,需一次手工换装——上传 relay-linux
+#                  后执行 `relay node upgrade <path> -c <config>`(或直接替换二进制再 node restart)。
 #
 # 用法:
 #   RESTART=1 make deploy-remote     # 部署全部在线执行器 + 自动替换重启
@@ -21,7 +22,7 @@
 #   make deploy-transit              # 一键部署中转(受控自升级 + 版本核验)
 #   make deploy                      # 先执行器后中转,全跑
 #
-# 依赖:`relay` CLI 在 PATH;配置为共享 relay 配置;执行器用同一 config 以 `relay watch` 跑。
+# 依赖:`relay` CLI 在 PATH;配置为共享 relay 配置;执行器用同一 config 以 `relay node` 跑。
 # 定位某台执行器时,CLI 直接按 `--executor <executor_id>` 节点寻址(节点身份,无需 workspace 绑定),故
 # 未绑定任何 workspace 的执行器(如 extranet)同样可被部署/操作。
 set -euo pipefail
@@ -84,7 +85,7 @@ detect_remote() {
   REMOTE_BIN_PATH="$(remote_cmd "$e" "command -v relay" | tail -1 | tr -d '\r')"
   # Windows:git-bash 的 `command -v relay` 常回显不带扩展名的 "…/relay",
   # 但真正能起 daemon 的必须是 relay.exe。缺 .exe 时补上,否则换装后
-  # `watch start` 起不来(executable file not found in $PATH)。
+  # `node start` 起不来(executable file not found in $PATH)。
   if [[ "$REMOTE_OS" == windows && -n "$REMOTE_BIN_PATH" && "${REMOTE_BIN_PATH##*.}" != "exe" ]]; then
     REMOTE_BIN_PATH="${REMOTE_BIN_PATH}.exe"
   fi
@@ -127,10 +128,10 @@ restart_binary() {
   st="${REMOTE_NEW:-${REMOTE_BIN_PATH}.new}"
   dest="${REMOTE_BIN_PATH:-}"
   log "换装 $st -> $dest (RESTART=1)..."
-  # 不用 `watch upgrade` 换装:它会对「运行中的 exe」做自覆盖,Windows 下失败,
-  # 会旧 daemon 已停、新的又没起来 -> watch 卡在 stopped。
+  # 不用 `node upgrade` 换装:它会对「运行中的 exe」做自覆盖,Windows 下失败,
+  # 会旧 daemon 已停、新的又没起来 -> node 卡在 stopped。
   # 改用外部 sh 一次完成「停旧 -> 挪走旧 -> 挪入新 -> 起新」,与自替换无关:
-  #   node stop / watch stop   停旧 daemon(释放仍映射旧 exe 的进程)
+  #   node stop                停旧 daemon(释放仍映射旧 exe 的进程)
   #   mv dest -> dest.prev / st -> dest(旧换出、新的就位)
   #   node start               以对等节点守护进程重启新 daemon(detach + 写 pid,无黑窗)
   # 注意:该 exec 由旧 daemon 服务,stop 停掉它后回包会断,链仍随 exec
@@ -138,7 +139,6 @@ restart_binary() {
   local swap
   # $dest/$st 在本地展开成路径值;$HOME 留给远端展开,故写成 \$HOME。
   swap="\"$dest\" node stop -c \"\$HOME/.relay/config.yaml\" 2>/dev/null || true ; "
-  swap+="\"$dest\" watch stop -c \"\$HOME/.relay/config.yaml\" 2>/dev/null || true ; "
   swap+="mv -f \"$dest\" \"$dest.prev\" ; "
   swap+="mv -f \"$st\" \"$dest\" ; "
   swap+="\"$dest\" node start -c \"\$HOME/.relay/config.yaml\""
@@ -169,7 +169,7 @@ transit() {
   # server-remote 内含:上传 → 中转自检/回执 → 换装重启 → 断线重连 → 轮询版本核验(按 expect)。
   if ! relay server-remote -c "$CONFIG" --binary relay-linux --expect "$expect"; then
     warn "中转一键部署失败(运行中实例不受影响、.prev 备件已保留)。请人工回退后重试:"
-    warn "  兜底:经 code-server 上传 relay-linux,再执行 relay server upgrade $HOME/.local/bin/relay -c $CONFIG"
+    warn "  兜底:经 code-server 上传 relay-linux,再执行 relay node upgrade $HOME/.local/bin/relay -c $CONFIG"
     return 1
   fi
   log "中转已运行新版本 ✔"

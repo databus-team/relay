@@ -7,7 +7,7 @@ import (
 )
 
 // 统一 config.yaml 单根模式:watch_root 设了 → 注册一个 watch 覆盖整个根。
-func TestUnifiedServerBaseSingleRoot(t *testing.T) {
+func TestParseServerConfigSingleRoot(t *testing.T) {
 	data := []byte(`
 server:
   addr: ":9443"
@@ -28,23 +28,30 @@ workspaces:
     watch_dir: app/patches
     ttl: 10m
 `)
-	base, err := unifiedServerBase(data)
+	cfg, err := parseServerConfig(data)
 	if err != nil {
-		t.Fatalf("unifiedServerBase: %v", err)
+		t.Fatalf("parseServerConfig: %v", err)
 	}
-	if base.addr != ":9443" {
-		t.Errorf("addr: %q", base.addr)
+	if cfg.Addr != ":9443" {
+		t.Errorf("addr: %q", cfg.Addr)
 	}
-	if !reflect.DeepEqual(base.tokens, []string{"tok-a"}) {
-		t.Errorf("tokens: %v", base.tokens)
+	if !reflect.DeepEqual(cfg.Auth.Tokens, []string{"tok-a"}) {
+		t.Errorf("tokens: %v", cfg.Auth.Tokens)
 	}
-	if !base.tls.Enabled || base.tls.CertFile != "/x/cert.pem" {
-		t.Errorf("tls: %+v", base.tls)
+	if cfg.Auth.Type != "token" {
+		t.Errorf("auth type: %q", cfg.Auth.Type)
 	}
-	if len(base.watchDirs) != 1 {
-		t.Fatalf("want 1 root watch, got %d", len(base.watchDirs))
+	if !cfg.TLS.Enabled || cfg.TLS.CertFile != "/x/cert.pem" {
+		t.Errorf("tls: %+v", cfg.TLS)
 	}
-	got := base.watchDirs[0]
+	// 台账持久化目录取 watch_root,否则重启后离线记录丢失。
+	if cfg.StateDir != "/data/relay" {
+		t.Errorf("state dir: %q", cfg.StateDir)
+	}
+	if len(cfg.WatchDirs) != 1 {
+		t.Fatalf("want 1 root watch, got %d", len(cfg.WatchDirs))
+	}
+	got := cfg.WatchDirs[0]
 	// 目录 id 统一跟随 workspace:首个 workspace id=rel(backend.executor_id 不再兼任目录)。
 	if got.ID != "rel" || got.Dir != "/data/relay" {
 		t.Errorf("root watch: id=%q dir=%q; want id=rel dir=/data/relay", got.ID, got.Dir)
@@ -52,7 +59,7 @@ workspaces:
 }
 
 // 未设 watch_root → 每个 watch 映射到各自服务器目录(兼容)。
-func TestUnifiedServerBasePerWatch(t *testing.T) {
+func TestParseServerConfigPerWatch(t *testing.T) {
 	data := []byte(`
 server:
   addr: ":9443"
@@ -66,32 +73,31 @@ workspaces:
   - id: abs
     watch_dir: /opt/abs
 `)
-	base, err := unifiedServerBase(data)
+	cfg, err := parseServerConfig(data)
 	if err != nil {
-		t.Fatalf("unifiedServerBase: %v", err)
+		t.Fatalf("parseServerConfig: %v", err)
 	}
 	want := []struct{ id, dir string }{
 		{"rel", "/data/relay/app/patches"},
 		{"abs", "/opt/abs"},
 	}
-	if len(base.watchDirs) != len(want) {
-		t.Fatalf("watchDirs: %d", len(base.watchDirs))
+	if len(cfg.WatchDirs) != len(want) {
+		t.Fatalf("watchDirs: %d", len(cfg.WatchDirs))
 	}
 	for i, w := range want {
-		got := base.watchDirs[i]
+		got := cfg.WatchDirs[i]
 		if got.ID != w.id || got.Dir != w.dir {
 			t.Errorf("watch[%d]: id=%q dir=%q; want id=%q dir=%q", i, got.ID, got.Dir, w.id, w.dir)
 		}
 	}
-	if base.watchDirs[0].TTL != 10*time.Minute {
-		t.Errorf("ttl: %v", base.watchDirs[0].TTL)
+	if cfg.WatchDirs[0].TTL != 10*time.Minute {
+		t.Errorf("ttl: %v", cfg.WatchDirs[0].TTL)
 	}
 }
 
-// max_tunnels 在统一与旧式两条解析路径都被接进来(默认 0;server 端再用 defaultMaxTunnels)。
-func TestServerBaseMaxTunnels(t *testing.T) {
-	// 统一 config.yaml:server.max_tunnels
-	uni := []byte(`
+// max_tunnels / tunnel_enabled 透传;未配置时为 0,交给 server.New 退到 defaultMaxTunnels。
+func TestParseServerConfigMaxTunnels(t *testing.T) {
+	enabled := []byte(`
 server:
   addr: ":9443"
   tunnel_enabled: true
@@ -100,103 +106,51 @@ workspaces:
   - id: rel
     watch_dir: /data/relay
 `)
-	base, err := unifiedServerBase(uni)
+	cfg, err := parseServerConfig(enabled)
 	if err != nil {
-		t.Fatalf("unifiedServerBase: %v", err)
+		t.Fatalf("parseServerConfig: %v", err)
 	}
-	if !base.tunnelEnabled {
+	if !cfg.TunnelEnabled {
 		t.Errorf("tunnel_enabled should be true")
 	}
-	if base.maxTunnels != 32 {
-		t.Errorf("maxTunnels: %d, want 32", base.maxTunnels)
+	if cfg.MaxTunnels != 32 {
+		t.Errorf("maxTunnels: %d, want 32", cfg.MaxTunnels)
 	}
 
-	// 旧式 server.yaml:顶层 max_tunnels。
-	leg := []byte(`
-addr: ":9000"
-watch:
-  - id: old
-    dir: /var/relay/old
-max_tunnels: 8
-`)
-	lb, err := legacyServerBase(leg)
+	def := []byte("workspaces:\n  - id: only\n    watch_dir: just/this\n")
+	dcfg, err := parseServerConfig(def)
 	if err != nil {
-		t.Fatalf("legacyServerBase: %v", err)
+		t.Fatalf("parseServerConfig(default): %v", err)
 	}
-	if lb.maxTunnels != 8 {
-		t.Errorf("legacy maxTunnels: %d, want 8", lb.maxTunnels)
+	if dcfg.MaxTunnels != 0 {
+		t.Errorf("default maxTunnels: %d, want 0", dcfg.MaxTunnels)
 	}
-
-	// 缺省(未配置)→ 0,交给 server.New 退到 defaultMaxTunnels。
-	def := []byte("watch:\n  - id: only\n    watch_dir: just/this\n")
-	db, err := unifiedServerBase(def)
-	if err != nil {
-		t.Fatalf("unifiedServerBase(default): %v", err)
-	}
-	if db.maxTunnels != 0 {
-		t.Errorf("default maxTunnels: %d, want 0", db.maxTunnels)
+	if dcfg.TunnelEnabled {
+		t.Errorf("tunnel_enabled should default to false")
 	}
 }
 
-// 无 server 段时旧式 server.yaml → legacy serverBaseConfig。
-func TestLegacyServerBase(t *testing.T) {
-	data := []byte(`
-addr: ":9000"
-watch:
-  - id: old
-    dir: /var/relay/old
-auth:
-  tokens: ["tok-o"]
-tls:
-  enabled: false
-`)
-	base, err := legacyServerBase(data)
-	if err != nil {
-		t.Fatalf("legacyServerBase: %v", err)
-	}
-	if base.addr != ":9000" {
-		t.Errorf("addr: %q", base.addr)
-	}
-	if len(base.watchDirs) != 1 || base.watchDirs[0].ID != "old" || base.watchDirs[0].Dir != "/var/relay/old" {
-		t.Errorf("watchDirs: %+v", base.watchDirs)
-	}
-	if !reflect.DeepEqual(base.tokens, []string{"tok-o"}) {
-		t.Errorf("tokens: %v", base.tokens)
-	}
-}
-
-// admin 无 server 段时 hasServerSection 返回 false,有则 true。
-func TestHasServerSection(t *testing.T) {
-	if !hasServerSection([]byte("server:\n  addr: ':1'\n")) {
-		t.Errorf("expected server section detected")
-	}
-	if hasServerSection([]byte("backend:\n  type: local\n")) {
-		t.Errorf("expected no server section")
-	}
-}
-
-// 未提供 server 段时 addr 默认 :8443,watch_root 为空则不拼接。
-func TestUnifiedServerBaseDefaults(t *testing.T) {
+// 未提供 server 段时 addr 默认 :8443,workspace 照常映射。
+func TestParseServerConfigDefaults(t *testing.T) {
 	data := []byte(`
 workspaces:
   - id: only
     watch_dir: just/this
 `)
-	base, err := unifiedServerBase(data)
+	cfg, err := parseServerConfig(data)
 	if err != nil {
-		t.Fatalf("unifiedServerBase: %v", err)
+		t.Fatalf("parseServerConfig: %v", err)
 	}
-	if base.addr != ":8443" {
-		t.Errorf("default addr: %q", base.addr)
+	if cfg.Addr != ":8443" {
+		t.Errorf("default addr: %q", cfg.Addr)
 	}
-	if len(base.watchDirs) != 1 || base.watchDirs[0].Dir != "just/this" {
-		t.Errorf("watchDirs: %+v", base.watchDirs)
+	if len(cfg.WatchDirs) != 1 || cfg.WatchDirs[0].Dir != "just/this" {
+		t.Errorf("watchDirs: %+v", cfg.WatchDirs)
 	}
 }
 
-// 单一存储根不再由 server 显式指定 watch_id —— 改为 executor 自注册,watch_root 段的
-// 存储 id 优先级为 backend.config.watch_id > 首个 workspace id > "relay"。
-func TestUnifiedServerSingleRootWatchID(t *testing.T) {
+// 单根模式的存储 id 优先级:首个 workspace id > "relay"。
+func TestParseServerConfigSingleRootWatchID(t *testing.T) {
 	data := []byte(`
 server:
   addr: ":8443"
@@ -204,25 +158,25 @@ server:
   auth:
     tokens: ["tok-a"]
 `)
-	base, err := unifiedServerBase(data)
+	cfg, err := parseServerConfig(data)
 	if err != nil {
-		t.Fatalf("unifiedServerBase: %v", err)
+		t.Fatalf("parseServerConfig: %v", err)
 	}
-	if len(base.watchDirs) != 1 {
-		t.Fatalf("want 1 root watch, got %d", len(base.watchDirs))
+	if len(cfg.WatchDirs) != 1 {
+		t.Fatalf("want 1 root watch, got %d", len(cfg.WatchDirs))
 	}
 	// 无 backend.config.watch_id、无 workspace → 回退到 "relay"。
-	if base.watchDirs[0].ID != "relay" || base.watchDirs[0].Dir != "/home/devpod/storage" {
-		t.Errorf("root watch: %+v", base.watchDirs[0])
+	if cfg.WatchDirs[0].ID != "relay" || cfg.WatchDirs[0].Dir != "/home/devpod/storage" {
+		t.Errorf("root watch: %+v", cfg.WatchDirs[0])
 	}
-	if !reflect.DeepEqual(base.tokens, []string{"tok-a"}) {
-		t.Errorf("tokens: %v", base.tokens)
+	if !reflect.DeepEqual(cfg.Auth.Tokens, []string{"tok-a"}) {
+		t.Errorf("tokens: %v", cfg.Auth.Tokens)
 	}
 }
 
 // 单根模式下 backend.executor_id 不再兼任目录 id:存储 id 只跟随 workspace,无 workspace 时
 // 回退 "relay"(executor 身份与目录分层解耦)。
-func TestUnifiedServerSingleRootBackendExecutorIDIgnored(t *testing.T) {
+func TestParseServerConfigSingleRootBackendExecutorIDIgnored(t *testing.T) {
 	data := []byte(`
 server:
   addr: ":8443"
@@ -232,11 +186,18 @@ backend:
   config:
     executor_id: storage
 `)
-	base, err := unifiedServerBase(data)
+	cfg, err := parseServerConfig(data)
 	if err != nil {
-		t.Fatalf("unifiedServerBase: %v", err)
+		t.Fatalf("parseServerConfig: %v", err)
 	}
-	if len(base.watchDirs) != 1 || base.watchDirs[0].ID != "relay" {
-		t.Errorf("root watch: %+v", base.watchDirs)
+	if len(cfg.WatchDirs) != 1 || cfg.WatchDirs[0].ID != "relay" {
+		t.Errorf("root watch: %+v", cfg.WatchDirs)
+	}
+}
+
+// 配置路径由调用方(-c)唯一决定:空路径不再回退到别的旗标,直接报错。
+func TestBuildServerInstanceRequiresPath(t *testing.T) {
+	if _, _, err := buildServerInstance(""); err == nil {
+		t.Fatal("expected an error for an empty config path")
 	}
 }
