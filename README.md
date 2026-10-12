@@ -166,6 +166,7 @@ relay run -w web-app-patches -d "npm run dev"
 
 Forwards a command to the remote side for execution. Requires a backend that supports `Exec` (local, fs_mcp, relay). The `-w` flag sets the working directory to the watch's `local_dir`. When omitted, `-w` is inferred from the cwd when it can be; otherwise `run/exec` falls back to its no-workspace behavior. Use `--node / -e <id>` to address a specific node by its ID directly.
 - **`-p, --publish [local:]remote`**: Forward local ports to the remote command (e.g. `-p 8080` or `-p 3000:8080`), automatically tearing down the forwarders when the command exits. Temporary development port forwards do not require `network_allow` whitelist rules.
+- **Detach + publish (`` `relay run -d -p `...` ``)** keeps the local ports alive after the CLI exits via the local `relay node` daemon. The node runs as `agent` (omitting `node.roles` defaults to `agent`; an explicit `roles: [hub]` is rejected with a clear error); `relay run -d -p` auto-starts it if needed. The local control socket `~/.relay/forward.sock` accepts register/unregister from any local process (unauthenticated) — keep the machine trusted; it is not exposed over the network.
 - **Git sync (ON by default — opt out with `--no-sync`):** Automatically detects uncommitted local Git modifications and untracked files, packs an incremental diff payload, and applies it to the remote workspace before executing the command. Includes base commit drift validation and automatic remote shadow snapshot backup (`refs/relay/backups/*`). Note: it carries **only the local working-tree diff, never unpushed commits**, and its source is the workspace's `local_dir` — which must be a valid Git repo **on the CLI machine** (otherwise sync is silently skipped).
 - `-f, --force-remote`: Force a sync even when the local tree is clean (creates a shadow snapshot on the remote first, then overwrites remote state).
 - `-d, --detach`: Runs the command in the background under the node's **TaskSupervisor**. Process trees are tracked cleanly (no orphaned child processes), stdout/stderr are persisted to `~/.relay/tasks/<task-id>/run.log`, and real-time output is broadcasted to subscribers.
@@ -225,6 +226,12 @@ CT-MBP.local (local)     agent          Ready      feae97f+feae97f  darwin/arm64
 hub (transit)            hub            Ready      feae97f+feae97f  linux/amd64      9 ms
 extranet                 agent          Ready      feae97f+feae97f  -                12 ms
 intranet                 agent          Ready      feae97f+feae97f  -                13 ms
+```
+
+Nodes that registered before but are currently disconnected show `STATUS Offline` and `LATENCY -`. The transit keeps a **known-executor ledger** so offline nodes stay visible (persisted to `server.watch_root/known_executors.json`; everything loads as offline until the node re-registers). To remove offline entries for good, prune them:
+
+```bash
+relay nodes --prune-offline   # remove all known-offline executors from the ledger, prints the count
 ```
 
 

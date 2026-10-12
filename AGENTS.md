@@ -177,7 +177,7 @@ relay watch [run|start|stop|status|restart|upgrade]   # executor (daemon actions
 relay server [run|start|stop|status|restart|upgrade]  # transit (daemon actions)
 relay run [-w <workspace> | --node <node-id>] [-p <port>] [--no-sync] [-f] [-d] <cmd...> # direct run / exec (Docker-style -p)
 relay exec [-w <workspace> | --node <node-id>] [-p <port>] [--no-sync] [-f] [-d] <cmd...>  # git diff sync default-on; -d = detached (30s foreground cap)
-relay nodes [-u|--usage] [--json]                      # cluster-wide peer nodes & topology state (alias: node ls, status)
+relay nodes [-u|--usage] [--json] [--prune-offline]   # cluster-wide peer nodes & topology state; shows known-offline nodes, --prune-offline drops them (alias: node ls, status)
 relay push [-w <workspace> | --node <node-id>] <file> [--no-jobs] [--dest <abs>]
 relay ps [--node <node-id>] [-a]                       # list tasks (TaskSupervisor)
 relay logs [--node <node-id>] <task-id> [-f] [--tail N] # tail / stream task logs
