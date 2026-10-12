@@ -20,6 +20,7 @@ import (
 	"github.com/user/relay/internal/exchange"
 	"github.com/user/relay/internal/jobrunner"
 	"github.com/user/relay/internal/logx"
+	"github.com/user/relay/internal/portfwd"
 	relaybackend "github.com/user/relay/internal/relay/backend"
 	"github.com/user/relay/internal/relay/protocol"
 	_ "github.com/user/relay/internal/relay/server"
@@ -1360,11 +1361,12 @@ func runExec() {
 
 	// 支持 Git 增量同步与后台托管的流式后端(relay)逐帧实时转发输出,并以 exit code 收尾
 	if eb, ok := b.(backend.GitSyncExecBackend); ok {
-		var portStrs []string
+		// 端口规格以解析后的结构上行(KTD9):记录必须无损带走绑定面,不能退化成 String() 的展示形态。
+		var execPorts []portfwd.Spec
 		for _, spec := range pfSpecs {
-			portStrs = append(portStrs, spec.String())
+			execPorts = append(execPorts, *spec)
 		}
-		exit, err := eb.ExecStreamWithPorts(ctx, targetExecutor, cmd, execCwd, 0, gitSyncPayload, *execDetach, portStrs, taskRestart, func(chunk backend.ExecChunk) {
+		exit, err := eb.ExecStreamWithPorts(ctx, targetExecutor, cmd, execCwd, 0, gitSyncPayload, *execDetach, execPorts, taskRestart, func(chunk backend.ExecChunk) {
 			if chunk.Stdout {
 				// detach 时从 stdout 捕获任务 ID(marker 前缀精确解析)。
 				if *execDetach && detachTaskID == "" {
@@ -1469,6 +1471,15 @@ func (r psRow) displayStatus() string {
 	return r.Status
 }
 
+// portDisplay 渲染一条端口转发规格用于 ps 的 PORTS 列。历史形态(回环绑定)保持字节一致,
+// 非回环时前缀绑定主机(如 "0.0.0.0:8080"),让发布面在展示上也可见(R21/KTD9)。
+func portDisplay(s portfwd.Spec) string {
+	if isLoopbackAddr(s.BindHost) {
+		return s.String()
+	}
+	return s.BindHost + ":" + s.String()
+}
+
 // taskToPSRow 把一个远端 detach 任务投影为统一行。纯函数,便于单测。
 // 字段裁剪复刻旧 runPs 行为:Node 空 → (unknown),Cmd 超 35 字符 → 前 32 + "..."。
 func taskToPSRow(t backend.TaskInfo) psRow {
@@ -1478,7 +1489,13 @@ func taskToPSRow(t backend.TaskInfo) psRow {
 	}
 	portsDisp := "-"
 	if len(t.Ports) > 0 {
-		portsDisp = strings.Join(t.Ports, ",")
+		// 从结构化记录渲染:回环绑定显示与历史一致的端口形态,非回环时补上绑定面,
+		// 使 0.0.0.0 这类发布面在 ps 里可见(R21/KTD9)。
+		parts := make([]string, 0, len(t.Ports))
+		for _, p := range t.Ports {
+			parts = append(parts, portDisplay(p))
+		}
+		portsDisp = strings.Join(parts, ",")
 		if len(portsDisp) > 16 {
 			portsDisp = portsDisp[:13] + "..."
 		}

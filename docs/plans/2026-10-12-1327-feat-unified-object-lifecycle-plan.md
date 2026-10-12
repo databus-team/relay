@@ -15,7 +15,7 @@ execution: code
 - **Means:** 按 docker CLI 的语义分层 —— `relay run` 负责创建，`start`/`restart`/`stop`/`logs` 只操作已经存在的对象（KD2），两类对象各自由自己的持久化意图驱动重开（KTD1–KTD10）。
 - **Authority:** 本计划的 Requirements（R1–R21）与 Key Decisions 决定行为；Planning Contract 的 KTD 决定实现机制；两者冲突时 R 在前。
 - **Stop conditions:** 若实现中发现"同 id 重启"无法在保存原目录与端口的前提下完成，或执行方启动重放会破坏既有任务数据，停下来报告，不要另起机制绕过。
-- **Execution profile:** 7 个单元按依赖顺序推进，U2→U1→U3 是执行方侧内核，U4→U6 是 CLI 面，U7 收尾。
+- **Execution profile:** 8 个单元按依赖顺序推进，U2→U1→U3 是执行方侧内核，U4→U6a→U6 是 CLI 面，U7 收尾。
 - **Who finishes:** 本计划交付到实现与本地验证为止；发布与推送不在范围内。
 
 ---
@@ -205,7 +205,7 @@ stateDiagram-v2
 
 ### Sequencing
 
-U2 → U1 → U3 建立执行方侧能力：先有 supervisor 的同 id 重启（U2），协议消息（U1）才有可调用的落点，两者一起构成启动重放（U3）的前提。U4 备好 `-p` 的两套解析，U5 用它们开出隧道的创建入口，U6 把根级动词与名字解析接上（依赖 U1 的协议与 U4 的解析），U7 在一切就位后退役旧命名空间并同步文档，避免中间态留下无人引用的命令。
+U2 → U1 → U3 建立执行方侧能力：先有 supervisor 的同 id 重启（U2），协议消息（U1）才有可调用的落点，两者一起构成启动重放（U3）的前提。U4 备好 `-p` 的两套解析，U5 用它们开出隧道的创建入口，U6a 把解析结果无损地送进任务记录与简报（U6 的端口恢复要按记录里的完整规格重登记），U6 把根级动词与名字解析接上（依赖 U1 的协议、U4 的解析与 U6a 的记录），U7 在一切就位后退役旧命名空间并同步文档，避免中间态留下无人引用的命令。
 
 ### Risks & Dependencies
 
@@ -356,11 +356,42 @@ U2 → U1 → U3 建立执行方侧能力：先有 supervisor 的同 id 重启�
   - 任务模式行为不变：命令仍必需，缺命令时报错。
 - **Verification:** 上述分支都有用例；手工在真机上建一条隧道并用 `relay ps` 看到它。
 
+### U6a. 端口记录无损：结构化规格贯穿请求、记录与简报
+
+- **Goal:** 任务被创建时用的端口规格（含绑定主机）原样存在于任务记录里，并能原样到达 CLI；`String()` 的展示形态不再参与存储。
+- **Requirements:** R13, R21
+- **Dependencies:** U2, U4
+- **Files:**
+  - `cmd/relay/main.go`
+  - `cmd/relay/portforward.go`
+  - `cmd/relay/portforward_test.go`
+  - `internal/relay/protocol/message.go`
+  - `internal/backend/backend.go`
+  - `internal/relay/client/exec.go`
+  - `internal/relay/backend/relay.go`
+  - `internal/supervisor/task.go`
+  - `internal/supervisor/supervisor.go`
+  - `internal/relay/backend/relay_test.go`
+  - `internal/portfwd/`（新增：若把类型与旧字符串解析收进一个共享叶子包，避免 `protocol`/`supervisor` 各自重复一份语法）
+- **Approach:**
+  1. 现状是缺口本身：`meta.Ports` 存的是 `PortForwardSpec.String()` 的产物，而它按设计从不输出绑定主机，于是 `-p 0.0.0.0:8080` 与 `-p 8080` 落成同一个 `"8080"`；`relay start` 无从知道该绑哪个面（KTD9、R21）。
+  2. 结构化规格贯穿整条路径：CLI 解析结果 → 执行请求（wire）→ 任务元数据 → 任务简报（wire）→ CLI。类型放置沿用本仓库既有的「每层一个 struct + 显式映射」惯例（`protocol.TaskInfo` ↔ `backend.TaskInfo` 就是先例）；不要为了省一个 struct 让 `supervisor` 或 `protocol` 互相导入。
+  3. **向后兼容必须是双向的**：老执行方（当前在线的那些）上行的 `ports` 仍是字符串数组，老 `meta.json` 里也是；反序列化两种形态都要能解，字符串按历史默认绑定（127.0.0.1）还原。跨版本兼容不是本计划的目标，但**本机正在运行的执行方**不该因为 CLI 升级就查不了 `ps`。
+  4. 展示形态保持不变：绑定主机是回环时 `relay ps` 的 PORTS 列照旧只显示端口（`"8080"`），非回环时补上绑定面（`"0.0.0.0:8080"`）——展示收窄不再是记录收窄。
+- **Patterns to follow:** `protocol.TaskInfo` 与 `backend.TaskInfo` 的逐字段映射；`loadExistingTasks` 里对旧记录的回退写法（`CreatedAt` 回退到 `StartTime`）。
+- **Test scenarios:**
+  - `-p 0.0.0.0:8080` 从任务简报里还原出绑定 `0.0.0.0` + 本地 8080，而不是回环。
+  - `-p 8080`、`-p 8080:9000`、`-p 0.0.0.0:8080:9000`、`-p 8080:db.local:5432` 四种形态往返后逐字段相等。
+  - 老形态 `"ports":["8080"]` 的元数据与简报都能解开，且按 127.0.0.1 还原。
+  - `relay ps` 的 PORTS 列在回环绑定下显示与今天一致。
+- **Verification:** 往返用例覆盖解析 → wire → 记录 → 简报 → CLI 全程；`relay ps` 对现在在线的老执行方仍能正常列出。
+- **Execution note:** 这条是 U6 第 5 步的前置（U6 要按记录里的完整规格重登记转发）；先落它，U6 才有可依赖的接口。
+
 ### U6. 根级 `start`/`restart` 与名字解析
 
 - **Goal:** `relay start|restart` 能按名字操作两类对象；名字不存在或执行方离线时说得如实；本机 node 未运行时如实汇报，而不是谎报不存在。
 - **Requirements:** R1, R2, R3, R4, R13, R18, R19, R20, R21
-- **Dependencies:** U1, U4, U5
+- **Dependencies:** U1, U4, U5, U6a
 - **Files:**
   - `cmd/relay/main.go`
   - `cmd/relay/tunnel.go`

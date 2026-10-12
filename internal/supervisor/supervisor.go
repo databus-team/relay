@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -14,6 +15,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/user/relay/internal/portfwd"
 )
 
 var (
@@ -87,17 +90,27 @@ func (s *Supervisor) loadExistingTasks() {
 		}
 
 		// 存活状态校准：若记录为 running 但实际系统进程不存在，标记为 exited。
+		changed := false
 		if meta.Status == StatusRunning {
 			if !isProcessAlive(meta.PID) {
 				meta.Status = StatusExited
 				now := time.Now()
 				meta.EndTime = &now
+				changed = true
 			}
 		}
 
 		// 旧的记录没有首次创建时间，回退到最近一次启动时间（KTD3，无需迁移脚本）。
 		if meta.CreatedAt.IsZero() {
 			meta.CreatedAt = meta.StartTime
+			changed = true
+		}
+
+		// 升级前的记录里 ports 是展示字符串数组，加载时已按默认绑定还原为结构化形态(R21/KTD9)；
+		// 回写一次，记录才带上绑定面，后续 start/restart 才能无损重登记。
+		legacyPorts := hasLegacyPorts(metaBytes)
+		if legacyPorts {
+			changed = true
 		}
 
 		t := &Task{
@@ -110,8 +123,36 @@ func (s *Supervisor) loadExistingTasks() {
 			close(t.done)
 		}
 		s.tasks[meta.ID] = t
-		_ = t.persist()
+		// 只在归一化真的改了记录时才回写:加载本身不该产生磁盘写。
+		if changed {
+			_ = t.persist()
+		}
+		// 旧形态的字符串里根本没有绑定主机,还原只能落在历史默认的 127.0.0.1,而回写让这次
+		// 猜测固化到磁盘:若该任务升级前发布在非本机地址上,重登记就只绑本机了,且再也找不回
+		// 原绑定面。这不是可自愈的情况,必须留一行痕,免得操作员只能从"连接被拒"反推。
+		// 只登记、不失败加载,也不改变加载结果。
+		if legacyPorts {
+			s.appendTaskLog(meta.ID, fmt.Sprintf("[legacy-ports] task %s: pre-upgrade record stored ports without the bind host; bind defaults to %s (the published bind face may have narrowed and cannot be recovered)\n", meta.ID, portfwd.DefaultBind))
+		}
 	}
+}
+
+// hasLegacyPorts 报告记录里的 ports 是否还是升级前的展示字符串形态([]string),那种形态
+// 丢掉了绑定面，加载后需要回写为结构化规格。
+func hasLegacyPorts(metaBytes []byte) bool {
+	var probe struct {
+		Ports []json.RawMessage `json:"ports"`
+	}
+	if err := json.Unmarshal(metaBytes, &probe); err != nil {
+		return false
+	}
+	for _, p := range probe.Ports {
+		trimmed := bytes.TrimSpace(p)
+		if len(trimmed) > 0 && trimmed[0] == '"' {
+			return true
+		}
+	}
+	return false
 }
 
 // StopAll 优雅终止所有正在运行的后台任务（并发执行，缩短停机等待时间）
@@ -171,13 +212,13 @@ func (s *Supervisor) StartTask(cmdStr, cwd string, env []string) (*Task, error) 
 	return s.StartTaskWithPorts(cmdStr, cwd, nil, env)
 }
 
-// StartTaskWithPorts 启动一个携带端口映射信息的后台守护任务
-func (s *Supervisor) StartTaskWithPorts(cmdStr, cwd string, ports []string, env []string) (*Task, error) {
+// StartTaskWithPorts 启动一个携带端口转发规格的后台守护任务
+func (s *Supervisor) StartTaskWithPorts(cmdStr, cwd string, ports []portfwd.Spec, env []string) (*Task, error) {
 	return s.StartTaskWithPolicy(cmdStr, cwd, ports, RestartNo, env)
 }
 
 // StartTaskWithPolicy 在 StartTaskWithPorts 的基础上记录 restart 策略(KTD3、R5)。
-func (s *Supervisor) StartTaskWithPolicy(cmdStr, cwd string, ports []string, restart string, env []string) (*Task, error) {
+func (s *Supervisor) StartTaskWithPolicy(cmdStr, cwd string, ports []portfwd.Spec, restart string, env []string) (*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

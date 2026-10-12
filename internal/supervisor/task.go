@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/user/relay/internal/portfwd"
 )
 
 type TaskStatus string
@@ -21,18 +23,20 @@ const (
 	StatusFailed  TaskStatus = "failed"
 )
 
-// TaskMeta 描述可序列化的任务元数据
+// TaskMeta 描述可序列化的任务元数据。
+// Ports 以结构化规格落盘(含绑定主机,R21);升级前记录的 ports 是展示字符串数组,
+// 由 portfwd.Spec 的反序列化按历史默认绑定 127.0.0.1 还原,旧记录无需迁移(KTD9)。
 type TaskMeta struct {
-	ID        string     `json:"id"`
-	Cmd       string     `json:"cmd"`
-	Cwd       string     `json:"cwd"`
-	PID       int        `json:"pid"`
-	Ports     []string   `json:"ports,omitempty"`
-	Status    TaskStatus `json:"status"`
-	ExitCode  int        `json:"exit_code"`
-	StartTime time.Time  `json:"start_time"`
-	EndTime   *time.Time `json:"end_time,omitempty"`
-	LogPath   string     `json:"log_path"`
+	ID        string         `json:"id"`
+	Cmd       string         `json:"cmd"`
+	Cwd       string         `json:"cwd"`
+	PID       int            `json:"pid"`
+	Ports     []portfwd.Spec `json:"ports,omitempty"`
+	Status    TaskStatus     `json:"status"`
+	ExitCode  int            `json:"exit_code"`
+	StartTime time.Time      `json:"start_time"`
+	EndTime   *time.Time     `json:"end_time,omitempty"`
+	LogPath   string         `json:"log_path"`
 	// Restart 是任务的 restart 策略（always|no）；空值按 no 读。首次运行或重启都保留记录。
 	Restart string `json:"restart,omitempty"`
 	// CreatedAt 是首次创建时间，重启时保持不变；StartTime 表示最近一次启动。
@@ -58,7 +62,7 @@ func newTask(id, cmdStr, cwd string, dir string) *Task {
 	return newTaskWithPorts(id, cmdStr, cwd, nil, dir)
 }
 
-func newTaskWithPorts(id, cmdStr, cwd string, ports []string, dir string) *Task {
+func newTaskWithPorts(id, cmdStr, cwd string, ports []portfwd.Spec, dir string) *Task {
 	now := time.Now()
 	return &Task{
 		meta: TaskMeta{

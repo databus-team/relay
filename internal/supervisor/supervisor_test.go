@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/user/relay/internal/portfwd"
 )
 
 func waitTaskStatus(t *testing.T, task *Task, want TaskStatus, timeout time.Duration) {
@@ -206,7 +208,7 @@ func TestSupervisor_RestartExitedTaskKeepsIdentity(t *testing.T) {
 	cwd := t.TempDir()
 	marker := filepath.Join(cwd, "marker")
 	cmdStr := fmt.Sprintf(`if [ -f %q ]; then sleep 5; else touch %q; fi`, marker, marker)
-	ports := []string{"127.0.0.1:18080"}
+	ports := []portfwd.Spec{{BindHost: "127.0.0.1", LocalPort: 18080, RemoteHost: "127.0.0.1", RemotePort: 18080}}
 
 	task, err := sup.StartTaskWithPorts(cmdStr, cwd, ports, nil)
 	if err != nil {
@@ -807,6 +809,81 @@ func TestSupervisor_ReplayAlwaysEmptyDirIsNoop(t *testing.T) {
 	}
 	if got := len(sup.ListTasks(true)); got != 0 {
 		t.Errorf("expected no tasks, got %d", got)
+	}
+}
+
+// TestSupervisor_LoadsLegacyDisplayPortsRecord 覆盖升级前落盘的 ports 形态(R21 的向后兼容要求):
+// 老 meta.json 里的 ports 是 String() 的产物(展示字符串数组),必须照常加载,
+// 并按历史默认绑定 127.0.0.1 还原,不能因为 CLI/执行方升级而让旧记录读不出来。
+func TestSupervisor_LoadsLegacyDisplayPortsRecord(t *testing.T) {
+	dir := t.TempDir()
+	taskDir := filepath.Join(dir, "t-legacy")
+	if err := os.MkdirAll(taskDir, 0o755); err != nil {
+		t.Fatalf("mkdir task dir: %v", err)
+	}
+
+	legacy := fmt.Sprintf(`{
+  "id": "t-legacy",
+  "cmd": "sleep 30",
+  "cwd": "",
+  "pid": 0,
+  "ports": ["8080", "8080:9000", "8080:db.local:5432"],
+  "status": "exited",
+  "exit_code": 0,
+  "start_time": "2026-10-12T10:00:00Z",
+  "log_path": %q,
+  "created_at": "2026-10-12T10:00:00Z"
+}`, filepath.Join(taskDir, "run.log"))
+	if err := os.WriteFile(filepath.Join(taskDir, "meta.json"), []byte(legacy), 0o644); err != nil {
+		t.Fatalf("write legacy meta: %v", err)
+	}
+
+	sup, err := New(dir)
+	if err != nil {
+		t.Fatalf("new supervisor: %v", err)
+	}
+	task, err := sup.GetTask("t-legacy")
+	if err != nil {
+		t.Fatalf("get legacy task: %v", err)
+	}
+
+	want := []portfwd.Spec{
+		{BindHost: "127.0.0.1", LocalPort: 8080, RemoteHost: "127.0.0.1", RemotePort: 8080},
+		{BindHost: "127.0.0.1", LocalPort: 8080, RemoteHost: "127.0.0.1", RemotePort: 9000},
+		{BindHost: "127.0.0.1", LocalPort: 8080, RemoteHost: "db.local", RemotePort: 5432},
+	}
+	if got := task.Meta().Ports; !reflect.DeepEqual(got, want) {
+		t.Errorf("legacy ports = %+v, want %+v", got, want)
+	}
+
+	// 加载即重写为结构化形态:记录从此带上绑定面,后续 start/restart 才可能无损重登记(KTD9)。
+	rewritten, err := os.ReadFile(filepath.Join(taskDir, "meta.json"))
+	if err != nil {
+		t.Fatalf("read rewritten meta: %v", err)
+	}
+	var raw struct {
+		Ports []map[string]json.RawMessage `json:"ports"`
+	}
+	if err := json.Unmarshal(rewritten, &raw); err != nil {
+		t.Fatalf("unmarshal rewritten meta: %v", err)
+	}
+	if len(raw.Ports) != 3 {
+		t.Fatalf("rewritten ports = %+v, want 3 entries", raw.Ports)
+	}
+	for i, p := range raw.Ports {
+		if _, ok := p["bind"]; !ok {
+			t.Errorf("rewritten ports[%d] has no bind field: %v", i, p)
+		}
+	}
+
+	// 绑定面丢了就找不回来:回写会把"默认 127.0.0.1"固化到磁盘,收窄必须留痕,
+	// 让操作员能从 `relay logs <task-id>` 看到,而不是从连接被拒反推。
+	warned, err := os.ReadFile(filepath.Join(taskDir, "run.log"))
+	if err != nil {
+		t.Fatalf("read task log: %v", err)
+	}
+	if !strings.Contains(string(warned), "t-legacy") || !strings.Contains(string(warned), "legacy-ports") {
+		t.Errorf("legacy bind-host defaulting was not surfaced in the task log: %q", warned)
 	}
 }
 

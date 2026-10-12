@@ -21,6 +21,7 @@ import (
 	"github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/config"
 	"github.com/user/relay/internal/logx"
+	"github.com/user/relay/internal/portfwd"
 	"github.com/user/relay/internal/relay/client"
 	"github.com/user/relay/internal/relay/protocol"
 	"github.com/user/relay/internal/supervisor"
@@ -358,8 +359,8 @@ func (b *RelayBackend) ExecStreamWithOptions(ctx context.Context, targetExecutor
 	return b.ExecStreamWithPorts(ctx, targetExecutor, cmd, cwd, timeout, syncPayload, detach, nil, "", onChunk)
 }
 
-// ExecStreamWithPorts 携带完整选项(包括 detach、ports 端口列表与后台任务的 restart 策略)的流式执行。
-func (b *RelayBackend) ExecStreamWithPorts(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, syncPayload *backend.GitSyncPayload, detach bool, ports []string, restart string, onChunk func(backend.ExecChunk)) (int, error) {
+// ExecStreamWithPorts 携带完整选项(包括 detach、ports 端口转发规格与后台任务的 restart 策略)的流式执行。
+func (b *RelayBackend) ExecStreamWithPorts(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, syncPayload *backend.GitSyncPayload, detach bool, ports []portfwd.Spec, restart string, onChunk func(backend.ExecChunk)) (int, error) {
 	if err := b.ensureConnected(ctx); err != nil {
 		return 0, err
 	}

@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 
 	"github.com/google/uuid"
+	"github.com/user/relay/internal/portfwd"
 	"github.com/user/relay/internal/relay/protocol"
 )
 
@@ -82,7 +83,7 @@ type ExecOptions struct {
 	Timeout        int
 	GitSync        *protocol.GitSyncPayload
 	Detach         bool
-	Ports          []string
+	Ports          []portfwd.Spec
 	Restart        string // 后台任务的 restart 策略(always|no),仅 Detach 时有意义
 }
 
@@ -525,8 +526,10 @@ func (e *ExecSession) Timeout() int                      { return e.req.Timeout 
 func (e *ExecSession) ExecutorID() string                { return e.req.ExecutorID }
 func (e *ExecSession) GitSync() *protocol.GitSyncPayload { return e.req.GitSync }
 func (e *ExecSession) Detach() bool                      { return e.req.Detach }
-func (e *ExecSession) Ports() []string                   { return e.req.Ports }
-func (e *ExecSession) Restart() string                   { return e.req.Restart }
+
+// Ports 返回本次入站请求携带的端口转发规格(含绑定主机),执行方据此落进任务记录(R21)。
+func (e *ExecSession) Ports() []portfwd.Spec { return e.req.Ports }
+func (e *ExecSession) Restart() string       { return e.req.Restart }
 
 // SetExecHandler 设置入站 exec 处理回调。设置后,该客户端成为可被中转转发 exec 的执行方。
 func (c *Client) SetExecHandler(fn func(*ExecSession)) {

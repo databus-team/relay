@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,17 +10,60 @@ import (
 	"time"
 
 	"github.com/user/relay/internal/backend"
+	"github.com/user/relay/internal/portfwd"
 	"github.com/user/relay/internal/relay/protocol"
 )
 
-// TestTaskToPSRow 覆盖任务行投影的纯逻辑:运行中/已结束的 Exit、Cmd 截断、空 Node 兜底。
+// TestPortDisplay 覆盖 PORTS 单元格的渲染:回环绑定与历史的展示形态字节一致(R21 要求展示不回归),
+// 非回环绑定额外前缀绑定面,让 0.0.0.0 这类发布面在 ps 里可见(KTD9)。规格一律经解析得到,
+// 与真实链路同源。
+func TestPortDisplay(t *testing.T) {
+	parse := func(raw string) portfwd.Spec {
+		t.Helper()
+		spec, err := portfwd.Parse(raw, portfwd.DefaultBind)
+		if err != nil {
+			t.Fatalf("parse %q: %v", raw, err)
+		}
+		return *spec
+	}
+	cases := []struct {
+		name string
+		spec portfwd.Spec
+		want string
+	}{
+		// 回环绑定:与今天 String() 的展示形态逐字节相同。
+		{"-p 8080", parse("8080"), "8080"},
+		{"-p 8080:9000", parse("8080:9000"), "8080:9000"},
+		{"-p 8080:db.local:5432", parse("8080:db.local:5432"), "8080:db.local:5432"},
+		{"-p 127.0.0.1:8080", parse("127.0.0.1:8080"), "8080"},
+		// 非回环绑定:绑定面现形,不再被展示悄悄收窄成回环。
+		{"-p 0.0.0.0:8080", parse("0.0.0.0:8080"), "0.0.0.0:8080"},
+		{"-p 0.0.0.0:8080:9000", parse("0.0.0.0:8080:9000"), "0.0.0.0:8080:9000"},
+		// 非回环绑定 + 远端主机只能由 --bind-host 组合出来(单条 -p 字符串表达不了四段语义)。
+		{
+			"--bind-host 192.0.2.7 -p 8080:db.local:5432",
+			portfwd.Spec{BindHost: "192.0.2.7", LocalPort: 8080, RemoteHost: "db.local", RemotePort: 5432},
+			"192.0.2.7:8080:db.local:5432",
+		},
+		// "8080:8080" 与 "8080" 解析后是同一个规格,展示随之合并(记录已无损,只剩展示这一处差异)。
+		{"-p 8080:8080", parse("8080:8080"), "8080"},
+	}
+	for _, c := range cases {
+		if got := portDisplay(c.spec); got != c.want {
+			t.Errorf("portDisplay(%s) = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestTaskToPSRow 覆盖任务行投影的纯逻辑:运行中/已结束的 Exit、Cmd 截断、空 Node 兜底,
+// 以及 PORTS 列的拼接与列宽裁剪。
 func TestTaskToPSRow(t *testing.T) {
 	now := time.Now().Unix()
 	running := taskToPSRow(backend.TaskInfo{
 		ID:        "t-1",
 		Node:      "eg-node",
 		Cmd:       "python -m http.server 8080",
-		Ports:     []string{"8080:8080"},
+		Ports:     []portfwd.Spec{{BindHost: "127.0.0.1", LocalPort: 8080, RemoteHost: "127.0.0.1", RemotePort: 9000}},
 		Status:    "running",
 		ExitCode:  0,
 		StartTime: now,
@@ -30,8 +74,8 @@ func TestTaskToPSRow(t *testing.T) {
 	if running.ID != "t-1" || running.Node != "eg-node" || running.Status != "running" {
 		t.Errorf("unexpected identity fields: %+v", running)
 	}
-	if running.Ports != "8080:8080" {
-		t.Errorf("Ports = %q", running.Ports)
+	if running.Ports != "8080:9000" {
+		t.Errorf("Ports = %q, want %q", running.Ports, "8080:9000")
 	}
 	if running.Exit != "-" {
 		t.Errorf("running Exit = %q, want -", running.Exit)
@@ -44,9 +88,26 @@ func TestTaskToPSRow(t *testing.T) {
 	}
 
 	// 端口串 >16 → 前 13 + "..."(复刻旧 runPs 的列宽裁剪)
-	multi := taskToPSRow(backend.TaskInfo{ID: "t-4", Status: "running", StartTime: now, Ports: []string{"8080:8080", "9090:9090"}})
-	if multi.Ports != "8080:8080,909..." {
+	multi := taskToPSRow(backend.TaskInfo{ID: "t-4", Status: "running", StartTime: now, Ports: []portfwd.Spec{
+		{BindHost: "127.0.0.1", LocalPort: 8080, RemoteHost: "127.0.0.1", RemotePort: 9000},
+		{BindHost: "127.0.0.1", LocalPort: 9090, RemoteHost: "127.0.0.1", RemotePort: 10000},
+	}})
+	if multi.Ports != "8080:9000,909..." {
 		t.Errorf("multi-port Ports = %q, want truncated", multi.Ports)
+	}
+
+	// 非回环绑定:展示形态额外带上绑定面,让 0.0.0.0 这类发布面在 ps 里可见(R21/KTD9)。
+	wildcard := taskToPSRow(backend.TaskInfo{ID: "t-5", Status: "running", StartTime: now, Ports: []portfwd.Spec{
+		{BindHost: "0.0.0.0", LocalPort: 8080, RemoteHost: "127.0.0.1", RemotePort: 8080},
+	}})
+	if wildcard.Ports != "0.0.0.0:8080" {
+		t.Errorf("non-loopback Ports = %q, want %q", wildcard.Ports, "0.0.0.0:8080")
+	}
+
+	// 旧记录的展示字符串形态解出来之后与结构化形态同源:回环绑定渲染与今天一致。
+	legacy := taskToPSRow(backend.TaskInfo{ID: "t-6", Status: "running", StartTime: now, Ports: legacyPorts(t, `["8080:9000"]`)})
+	if legacy.Ports != "8080:9000" {
+		t.Errorf("legacy Ports = %q, want %q", legacy.Ports, "8080:9000")
 	}
 
 	// Cmd 截断:>35 → 前 32 + "..."(复刻旧 runPs 行为)
@@ -77,6 +138,19 @@ func TestTaskToPSRow(t *testing.T) {
 	if noPorts.Ports != "-" {
 		t.Errorf("no ports = %q, want -", noPorts.Ports)
 	}
+}
+
+// legacyPorts 把升级前落盘的展示字符串形态(["8080", ...])按 wire 反序列化:
+// 老执行方上行的简报与老 meta.json 都是这个形态,CLI 必须解得开(R21 的兼容要求)。
+func legacyPorts(t *testing.T, raw string) []portfwd.Spec {
+	t.Helper()
+	var envelope struct {
+		Ports []portfwd.Spec `json:"ports"`
+	}
+	if err := json.Unmarshal([]byte(`{"ports":`+raw+`}`), &envelope); err != nil {
+		t.Fatalf("unmarshal legacy ports %s: %v", raw, err)
+	}
+	return envelope.Ports
 }
 
 // TestTunnelToPSRow 覆盖隧道行投影:running/stopped、零值 Started → Created "-"。

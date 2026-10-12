@@ -11,12 +11,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	bk "github.com/user/relay/internal/backend"
 	"github.com/user/relay/internal/config"
+	"github.com/user/relay/internal/portfwd"
 	"github.com/user/relay/internal/relay/client"
 	"github.com/user/relay/internal/relay/protocol"
 	"github.com/user/relay/internal/relay/server"
@@ -815,10 +817,12 @@ func TestEndToEnd_TaskSupervisor(t *testing.T) {
 		t.Fatalf("requester does not implement GitSyncExecBackend")
 	}
 
-	// 3. 后台脱机执行任务 (detach = true, 带 ports)
+	// 3. 后台脱机执行任务 (detach = true, 带 ports)。绑定面用非回环值,顺带钉住 R21:
+	// 记录必须原样带走 BindHost,不能退化成 String() 的展示形态。
+	taskPorts := []portfwd.Spec{{BindHost: "0.0.0.0", LocalPort: 8080, RemoteHost: "127.0.0.1", RemotePort: 8080}}
 	var taskIDOut strings.Builder
 	start := time.Now()
-	exit, err := gb.ExecStreamWithPorts(ctx, "node-1", "printf 'task_step_1\n'; sleep 0.3; printf 'task_step_2\n'; sleep 5", "", 10, nil, true, []string{"8080:8080"}, "", func(c bk.ExecChunk) {
+	exit, err := gb.ExecStreamWithPorts(ctx, "node-1", "printf 'task_step_1\n'; sleep 0.3; printf 'task_step_2\n'; sleep 5", "", 10, nil, true, taskPorts, "", func(c bk.ExecChunk) {
 		taskIDOut.WriteString(c.Data)
 	})
 	dur := time.Since(start)
@@ -852,8 +856,8 @@ func TestEndToEnd_TaskSupervisor(t *testing.T) {
 			if tk.Status != "running" {
 				t.Errorf("expected running status, got: %s", tk.Status)
 			}
-			if len(tk.Ports) != 1 || tk.Ports[0] != "8080:8080" {
-				t.Errorf("expected ports [8080:8080], got %v", tk.Ports)
+			if !reflect.DeepEqual(tk.Ports, taskPorts) {
+				t.Errorf("expected ports %+v, got %+v", taskPorts, tk.Ports)
 			}
 			break
 		}
@@ -1504,5 +1508,118 @@ func TestEndToEnd_ExplicitStopClearsRestartPolicy(t *testing.T) {
 	}
 	if reloaded.Meta().Status == supervisor.StatusRunning {
 		t.Errorf("explicitly stopped task must not be replayed on executor startup")
+	}
+}
+
+// TestEndToEnd_PortSpecRoundTripIsLossless 覆盖 U6a 的完整链路(R21/KTD9):
+// CLI 侧解析 → 执行请求(wire) → 执行方任务记录(meta.json) → 任务简报(wire) → CLI 侧表格。
+// 绑定主机必须全程无损 —— 旧形态只留 String() 的展示字符串,-p 0.0.0.0:8080 会与 -p 8080 落成
+// 同一个 "8080",此后重登记只能悄悄收窄回环。
+func TestEndToEnd_PortSpecRoundTripIsLossless(t *testing.T) {
+	SetExecutorRole(true)
+	defer SetExecutorRole(false)
+	defer client.CloseAll()
+
+	// 任务目录隔离到临时目录,不碰真实 ~/.relay。
+	baseDir := withSupervisorBaseDir(t)
+	defer Cleanup()
+
+	watchDir := t.TempDir()
+	ts, wsURL := newTestHub(t, watchDir)
+	defer ts.Close()
+
+	if _, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-exe", "executor_id": "node-1", "watch_dir": ".", "executor": true,
+	}); err != nil {
+		t.Fatalf("executor backend: %v", err)
+	}
+	reqBackend, err := NewRelayBackend(map[string]interface{}{
+		"url": wsURL, "token": "tok-req", "executor_id": "node-1", "watch_dir": ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+
+	// CLI 与执行方同源的解析:五种形态解析后上行,不只是把字符串转个手。
+	var specs []portfwd.Spec
+	for _, raw := range []string{"8080", "8080:9000", "0.0.0.0:8080", "0.0.0.0:8080:9000", "8080:db.local:5432"} {
+		spec, err := portfwd.Parse(raw, portfwd.DefaultBind)
+		if err != nil {
+			t.Fatalf("parse %q: %v", raw, err)
+		}
+		specs = append(specs, *spec)
+	}
+
+	ctx := context.Background()
+	gb, ok := reqBackend.(bk.GitSyncExecBackend)
+	if !ok {
+		t.Fatalf("requester does not implement GitSyncExecBackend")
+	}
+	var out strings.Builder
+	exit, err := gb.ExecStreamWithPorts(ctx, "node-1", "sleep 30", "", 10, nil, true, specs, "", func(c bk.ExecChunk) {
+		out.WriteString(c.Data)
+	})
+	if err != nil {
+		t.Fatalf("exec detach: %v", err)
+	}
+	if exit != 0 {
+		t.Fatalf("exec detach exit: %d", exit)
+	}
+	taskID := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(out.String()), protocol.ForwardTaskIDMarker))
+	if !strings.HasPrefix(taskID, "t-") {
+		t.Fatalf("invalid taskID: %q", out.String())
+	}
+
+	// 1) 记录侧:执行方磁盘上的 meta.json 逐字段无损,且确实带上了绑定面。
+	metaBytes, err := os.ReadFile(filepath.Join(baseDir, taskID, "meta.json"))
+	if err != nil {
+		t.Fatalf("read task meta: %v", err)
+	}
+	var onDisk struct {
+		Ports []portfwd.Spec `json:"ports"`
+	}
+	if err := json.Unmarshal(metaBytes, &onDisk); err != nil {
+		t.Fatalf("unmarshal task meta: %v", err)
+	}
+	if !reflect.DeepEqual(onDisk.Ports, specs) {
+		t.Errorf("recorded ports = %+v, want %+v", onDisk.Ports, specs)
+	}
+	var rawPorts struct {
+		Ports []map[string]json.RawMessage `json:"ports"`
+	}
+	if err := json.Unmarshal(metaBytes, &rawPorts); err != nil {
+		t.Fatalf("unmarshal raw meta: %v", err)
+	}
+	for i, p := range rawPorts.Ports {
+		if _, ok := p["bind"]; !ok {
+			t.Errorf("recorded ports[%d] has no bind field: %v (record degraded to display strings)", i, p)
+		}
+	}
+
+	// 2) 简报侧:经 wire 回到 CLI 的结果同样无损(relay ps 读到的是这一份)。
+	tb, ok := reqBackend.(bk.TaskSupervisorBackend)
+	if !ok {
+		t.Fatalf("requester does not implement TaskSupervisorBackend")
+	}
+	tasks, err := tb.TaskList(ctx, "node-1", true)
+	if err != nil {
+		t.Fatalf("task list: %v", err)
+	}
+	var briefed bk.TaskInfo
+	var found bool
+	for _, tk := range tasks {
+		if tk.ID == taskID {
+			briefed, found = tk, true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("task %s not found in task list", taskID)
+	}
+	if !reflect.DeepEqual(briefed.Ports, specs) {
+		t.Errorf("briefed ports = %+v, want %+v", briefed.Ports, specs)
+	}
+	if briefed.Ports[2].BindHost != "0.0.0.0" {
+		t.Errorf("briefed -p 0.0.0.0:8080 bind = %q, want 0.0.0.0 (not narrowed to loopback)", briefed.Ports[2].BindHost)
 	}
 }

@@ -3,6 +3,8 @@ package backend
 import (
 	"context"
 	"errors"
+
+	"github.com/user/relay/internal/portfwd"
 )
 
 var (
@@ -58,7 +60,7 @@ type GitSyncPayload struct {
 type GitSyncExecBackend interface {
 	ExecStreamWithGitSync(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, onChunk func(ExecChunk)) (int, error)
 	ExecStreamWithOptions(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, detach bool, onChunk func(ExecChunk)) (int, error)
-	ExecStreamWithPorts(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, detach bool, ports []string, restart string, onChunk func(ExecChunk)) (int, error)
+	ExecStreamWithPorts(ctx context.Context, targetExecutor, cmd string, cwd string, timeout int, sync *GitSyncPayload, detach bool, ports []portfwd.Spec, restart string, onChunk func(ExecChunk)) (int, error)
 }
 
 // TaskInfo 跨机任务简报
@@ -68,7 +70,7 @@ type TaskInfo struct {
 	Cmd       string
 	Cwd       string
 	PID       int
-	Ports     []string
+	Ports     []portfwd.Spec
 	Status    string
 	ExitCode  int
 	StartTime int64
