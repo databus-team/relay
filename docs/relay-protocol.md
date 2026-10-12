@@ -846,7 +846,7 @@ backend:
   config:
     url: "wss://server:8443/relay"
     token: "${RELAY_TOKEN}"
-    executor_id: "web-app"            # 执行方(relay watch)自注册的身份;exec/push/tunnel 按此路由
+    executor_id: "web-app"            # 执行方(relay node 的 agent 角色)自注册的身份;exec/push/tunnel 按此路由
     # 或 auto 模式: 订阅所有事件，客户端过滤
     auto_subscribe: false
 
@@ -921,19 +921,19 @@ relay_server:
 
 ### 8.3 Unified config:workspaces 与执行器绑定
 
-统一的 `config.yaml` 由三端共用(server / executor / 本地 CLI),每端只读自己相关段。顶层作业配置列表
+统一的 `config.yaml` 由三端共用(hub / executor / 本地 CLI),每端只读自己相关段。顶层作业配置列表
 原来是 `watch:`;为与执行方自注册的 `executor_id`(一台执行器的节点身份)区分,现改名为 **`workspaces:`**。每个
 条目是「一份作业配置」,可经 **`executor:`** 字段显式绑定到某台执行器(其值即执行器侧 `backend.config.executor_id`)。
 
 ```yaml
-# server 段:仅 relay server 读取(单根 vs 工作区见 8.2;列表模式这里不填 watch_root)
+# server 段:仅 hub 角色(relay node,中转)读取(单根 vs 工作区见 8.2;列表模式这里不填 watch_root)
 server:
   addr: ":8443"
   auth:
     tokens: ["${RELAY_TOKEN}"]
   tunnel_enabled: true   # 隧道路由通道
 
-# executor 侧(relay watch)身份:
+# executor 侧(relay node 的 agent 角色)身份:
 backend:
   type: relay
   config:

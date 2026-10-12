@@ -11,7 +11,7 @@ Go-based file exchange & remote command execution system, built around a **star 
 ```
 
 - The transit server is the only network intersection point; all traffic (push / exec / sync / tunnel / status) flows through it over WebSocket.
-- Executors are the `relay watch` processes that **self-register** on the transit and execute jobs / answer exec / host tunnels.
+- Executors are the `relay node` processes running the **agent** role; they **self-register** on the transit and execute jobs / answer exec / host tunnel egress. The transit is the same binary running the **hub** role.
 - A single shared `config.yaml` drives all three ends (transit reads `server:`, executor reads `backend:`+`workspaces:`, CLI reads `backend:`+`workspaces:`).
 - Event-driven for the relay backend (fsnotify upstream, WS push downstream); polling fallback for local/fs-mcp/jumpserver.
 
@@ -21,9 +21,10 @@ Stack: Go 1.25, kingpin (CLI), gorilla/websocket, yaml.v3, zstd (protocol compre
 
 ```
 relay/
-├── cmd/relay/                 # CLI entry: all subcommands (server/status/watch/push/...)
-│   ├── main.go               # kingpin wiring + most run*() handlers (server/sync/ws/version/job/status...)
-│   ├── server.go             # runServer + transit self-upgrade injection
+├── cmd/relay/                 # CLI entry: all subcommands (node/status/ps/push/...)
+│   ├── main.go               # kingpin wiring + most run*() handlers (sync/ws/version/job/status...)
+│   ├── node.go               # runNode: hub + agent roles in one process
+│   ├── server.go             # hub config parse (parseServerConfig) + transit self-upgrade injection
 │   ├── tunnel.go             # SOCKS5 tunnel plane: create/control plumbing + SOCKS5 handshake & conn pump
 │   └── tunnel_holder.go      # Node-resident tunnel holder (node role): listen + open/close/restart/list over ~/.relay/tunnel.sock
 ├── internal/
@@ -55,7 +56,7 @@ relay/
 | Task | Location | Notes |
 |------|----------|-------|
 | All subcommands & dispatch | `cmd/relay/main.go` | kingpin wiring; one `run*()` per command |
-| `server` (transit) | `cmd/relay/server.go` | `runServer()`, legacy vs unified config, `transitSelfUpgrade` |
+| `node` (hub + agent) | `cmd/relay/node.go` + `cmd/relay/server.go` | `runNode()` starts the hub role (`buildServerInstance`) and/or the agent role (watcher); `transitSelfUpgrade` is the injected swap closure |
 | `run` (alias `exec`) | `cmd/relay/main.go` → `runExec` | Creates both object kinds: a task (default) or, with `-t tunnel`, a node-held SOCKS5 tunnel |
 | Tunnels (SOCKS5) | `cmd/relay/tunnel.go` + `cmd/relay/tunnel_holder.go` | Created by `relay run -t tunnel`; CLI sends control (open/close/restart/list) over `~/.relay/tunnel.sock`; SOCKS5 handshake, egress executor via `-e`/`--executor` |
 | `status` | `cmd/relay/main.go` → `runStatus`/`printStatus` | Deployment-wide latency + version ledger |
@@ -109,7 +110,7 @@ relay/
 ### relay backend (executor side)
 
 | `RelayBackend` / `NewRelayBackend` | `internal/relay/backend/relay.go:29/89` | `backend.type=relay` file/exec interface |
-| `SetExecutorRole` | `relay.go:63` | `relay watch` sets executor role (CLI doesn't) |
+| `SetExecutorRole` | `relay.go:63` | `relay node` sets executor role (CLI doesn't) |
 | `registerExecutor` | `relay.go:553` | Self-register executor_id on connect |
 | `Exec` / `ExecStream` / `PushJob` / `PushNoJobs` / `Transport` | `relay.go:239-312` | Inbound exec/push on executor |
 | `ConfigSync` | `relay.go:336` | Stream config onto executor disk |
@@ -178,9 +179,7 @@ make help
 CLI usage (key forms):
 
 ```bash
-relay node [run|start|stop|status|restart]             # unified peer node daemon (hub + agent roles)
-relay watch [run|start|stop|status|restart|upgrade]   # executor (daemon actions)
-relay server [run|start|stop|status|restart|upgrade]  # transit (daemon actions)
+relay node [run|start|stop|status|restart|upgrade]  # unified peer node daemon (hub + agent roles)
 relay run [-w <workspace> | --node <node-id>] [-p <port>] [--no-sync] [-f] [-d [--restart=always|no]] <cmd...> # direct run / exec (Docker-style -p; --restart/--no-restart requires -d)
 relay run -t|--type=tunnel -p <[host:]port> -e <egress> [--restart=always|no]  # create a node-held SOCKS5 tunnel (no command, no -d/-w)
 relay exec [-w <workspace> | --node <node-id>] [-p <port>] [--no-sync] [-f] [-d] <cmd...>  # git diff sync default-on; -d = detached (30s foreground cap)
@@ -227,7 +226,7 @@ Pass `-c <config>` (default `~/.relay/config.yaml`) to share one config across e
 ## CONVENTIONS
 
 - **Standard Go layout**: `cmd/` for the binary, `internal/` for packages.
-- **Config is unified**: one shared `config.yaml` per `relay server`, `relay watch`, `relay node`, `relay push`; only the relevant section is read on each side.
+- **Config is unified**: one shared `config.yaml` for `relay node` (hub and/or agent) and the local CLI; only the relevant section is read on each side. The legacy standalone `server.yaml` and the `relay server` / `relay watch` daemons are retired — the config file is the only way to configure the hub.
 - **Peer / Node Architecture**: `node:` block configures node identity (`node_id`), roles (`roles: [hub, agent]`), and access control (`authorized_nodes`). `relay node` daemon manages both roles within one process without port conflict.
 - **Backend registry**: constructor `init()`-based `RegisterBackend("name", NewX)`; `NewBackend(type, cfg)` dispatch, no switch.
 - **Error handling**: `fmt.Fprintf(os.Stderr, ...)` + `os.Exit(1)` in `main`; internal returns errors.

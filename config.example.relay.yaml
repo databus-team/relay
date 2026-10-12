@@ -1,16 +1,17 @@
 name: relay
 version: 2
 
-# One config shared by all three ends: transit (relay server), remote executor
-# (relay watch), and local CLI (relay push/exec). Only the relevant section is
-# used on each side; run `relay sync` to push a copy to the remote watcher.
+# One config shared by all three ends: transit hub (relay node, hub role),
+# remote executor (relay node, agent role), and local CLI (relay push/exec).
+# Only the relevant section is used on each side; run `relay sync` to push a
+# copy to the remote executor.
 #
-#   relay server -c config.yaml   # transit reads the `server:` block
-#   relay watch  -c config.yaml   # remote executor reads backend+watch (+executor)
-#   relay push   -c config.yaml   # local CLI reads backend+watch
-#   relay sync   -c config.yaml   # ship this same file to the remote executor
+#   relay node -c config.yaml     # transit hub: reads the `server:` block + node.roles
+#   relay node -c config.yaml     # remote executor: reads backend+watch (+executor) + node.roles
+#   relay push -c config.yaml     # local CLI reads backend+watch
+#   relay sync -c config.yaml     # ship this same file to the remote executor
 
-# --- transit server block (only relay server reads this) ---
+# --- transit hub block (only the hub role reads this) ---
 server:
   addr: ":8443"
   watch_root: /data/relay          # each watch.watch_dir below is relative to this
@@ -41,7 +42,7 @@ backend:
     watch_dir: .                       # remote watch directory (relative to server's watch dir)
     command_dir: /tmp/relay-commands   # shared command directory for hot-reload
     # executor: true                    # 声明本配置对应的执行方角色:
-    #                                    # 仅在 relay watch(执行方进程)侧生效——注册为 executor_id 的执行方,
+    #                                    # 仅在 relay node 的 agent 角色(执行方进程)侧生效——注册为 executor_id 的执行方,
     #                                    # 接收经中转转发的 relay exec / relay push 并本地执行。
     #                                    # 本地 CLI(relay exec / relay push / relay sync)不读取此字段:
     #                                    # 即便同一份配置带 executor: true,本地 exec 仍透明转发到远端执行方,

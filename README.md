@@ -102,10 +102,15 @@ against the configured workspace IDs. If it matches exactly one workspace that
 one is used; if it matches none (or several) an error lists the available
 workspaces instead.
 
-### watch — Daemon Mode
+### node — Peer Node Daemon (hub + agent)
+
+One process holds both roles, selected by `node.roles` in the config: `hub` serves the transit
+(reading the `server:` block), `agent` self-registers as an executor and runs pushes/execs/tunnel
+egress. This one command replaces the retired `relay server` / `relay watch` daemons.
 
 ```bash
-relay watch -c ~/.relay/config.yaml
+relay node run   -c ~/.relay/config.yaml   # foreground
+relay node start -c ~/.relay/config.yaml   # daemon; also: stop | status | restart | upgrade
 ```
 
 ### push — Upload Files
@@ -350,7 +355,7 @@ relay sync -c ~/.relay/config.yaml -e site-b     # target a specific executor by
 ```
 
 - `--executor/-e <executor_id>`: target a specific executor's node identity (e.g. push the shared config to `site-b` when several executors share one transit). Empty / omitted = fall back to the requester's own `backend.executor_id` (single-root), same as `exec`/`push`.
-- The synced file is validated on the executor and written to its `config_path` (default `~/.relay/config.yaml`); `relay watch` picks it up on the next cycle.
+- The synced file is validated on the executor and written to its `config_path` (default `~/.relay/config.yaml`); the executor's `relay node` picks it up on the next cycle.
 
 **How it works:**
 1. CLI reads the local config file and writes it as a command file in the shared `command_dir`
@@ -362,25 +367,12 @@ relay sync -c ~/.relay/config.yaml -e site-b     # target a specific executor by
 - `command_dir` must be consistent between watcher and CLI (default: `/tmp/relay-commands`)
 - On validation failure, current config is preserved (no changes made)
 
-### server — Relay Server
+### hub — Transit Configuration
 
-Run the relay server on the transit machine.
+The transit (hub role of `relay node`) is configured entirely by the file; there are no per-flag
+overrides. Run it with `relay node start` / `relay node run` on the transit machine.
 
-```bash
-# Recommended: the unified config.yaml (three ends share one file)
-relay server -c ~/.relay/config.yaml
-
-# Legacy standalone server file
-relay server --server-config server.yaml
-
-# With CLI flags only
-relay server --addr :8080 --watch tcp:/data/web-app --token secret
-
-# CLI flags override config file values
-relay server -c config.yaml --addr :9000
-```
-
-**One config, three ends.** The unified `config.yaml` carries a `server:` block (addr / watch_root / auth.tokens / tls) plus the `workspaces` list (each entry is a job-config, able to bind to a specific executor via `executor:`). Each end keeps the whole file and reads only its relevant section. Note that the relay server applies config to how it listens/stores — a change there takes effect on **restart**.
+**One config, three ends.** The unified `config.yaml` carries a `server:` block (addr / watch_root / auth.tokens / tls) plus the `workspaces` list (each entry is a job-config, able to bind to a specific executor via `executor:`). Each end keeps the whole file and reads only its relevant section. Note that the hub applies config to how it listens/stores — a change there takes effect on **restart**.
 
 ```yaml
 server:
@@ -400,7 +392,7 @@ workspaces:
     # executor: site-a            # 绑定到这台 executor(值=其 backend.config.executor_id);留空=单根
 ```
 
-The legacy standalone `server.yaml` (top-level `addr`/`watch`/`auth`/`tls`) is still accepted via `--server-config` for backward compatibility. Environment variables (`$VAR`, `${VAR}`) are expanded in all string values.
+The legacy standalone `server.yaml` (top-level `addr`/`watch`/`auth`/`tls`) is **no longer supported** — put the `server:` block into the shared `config.yaml`. Environment variables (`$VAR`, `${VAR}`) are expanded in all string values.
 
 ### deploy — Push New Binaries to Executors & Transit
 
@@ -461,8 +453,8 @@ channel directly against a binary whose build identity differs from the local re
 
 **Manual fallback (first-seed / SSH-unreachable):** to receive this message the transit must
 already run a build that recognizes it, so the very first transit seed is manual — upload the
-new `relay-linux` via code-server and run `relay server upgrade <path> -c $HOME/.relay/config.yaml`
-(or `relay server restart` to just reboot). On a failed upgrade, restore via `.prev` through the
+new `relay-linux` via code-server and run `relay node upgrade <path> -c $HOME/.relay/config.yaml`
+(or `relay node restart` to just reboot). On a failed upgrade, restore via `.prev` through the
 same manual path.
 
 ### ws — List Workspaces
@@ -655,7 +647,7 @@ network_allow:
 
 ## Relay Backend Configuration
 
-When using the `relay` backend, configure the WebSocket connection to the relay server:
+When using the `relay` backend, configure the WebSocket connection to the transit hub:
 
 ```yaml
 backend:
@@ -675,12 +667,12 @@ backend:
 | `executor_id` | 此执行方的节点身份(executor_id);`relay exec/push/sync/tunnel` 按它路由到该节点 |
 | `watch_dir` | Remote directory path (relative to server's watch dir) |
 | `command_dir` | Shared directory for config sync commands |
-| `executor` | 仅在 `relay watch`(执行方进程)生效:注册为 `executor_id` 的执行方以接收经中转转发的 `relay execute` / `relay push`。本地 CLI(exec/push/sync)不读取此字段,故同一份配置可与远端共用 |
+| `executor` | 仅在 `relay node` 的 agent 角色(执行方进程)生效:注册为 `executor_id` 的执行方以接收经中转转发的 `relay execute` / `relay push`。本地 CLI(exec/push/sync)不读取此字段,故同一份配置可与远端共用 |
 | `executor_dir` | push 时执行方把文件落到该目录(默认进程当前目录),作为远端项目根;`relay exec` 在本地执行(| Exec 时的工作目录用请求的 cwd) |
 
-**Transparent forwarding (transit server only):** The relay server is a pure transparent forwarder — it **never** executes commands itself. When
-`relay exec` is issued locally, the server forwards it over the existing WebSocket connection to the registered executor (the remote
-`relay watch` with `executor: true`), and relays the command's stdout/stderr back **incrementally** in real time. If no executor is
+**Transparent forwarding (transit hub only):** The transit is a pure transparent forwarder — it **never** executes commands itself. When
+`relay exec` is issued locally, the hub forwards it over the existing WebSocket connection to the registered executor (a remote
+`relay node` running the agent role with `executor: true`), and relays the command's stdout/stderr back **incrementally** in real time. If no executor is
 registered for the watch, `relay exec` fails with `no executor registered for watch '<id>'`.
 
 **Transfer features** (automatic, no config needed):
@@ -695,12 +687,12 @@ registered for the watch, `relay exec` fails with `no executor registered for wa
 
 | File | Description |
 |------|-------------|
-| `config.example.relay.yaml` | Unified config (`server:` + relay backend + workspaces) shared by transit server, remote executor and local CLI |
+| `config.example.relay.yaml` | Unified config (`server:` + relay backend + workspaces) shared by the transit hub, remote executor and local CLI |
 | `config.example.fs-mcp.relay.yaml` | Client config with MCP backend |
 | `config.example.jumpserver.relay.yaml` | Client config with JumpServer backend |
 
-The relay server configuration (addr / watch_root / auth / tls) lives in the `server:` section of
-`config.example.relay.yaml` — one file drives all three ends. No separate `server.yaml` is needed.
+The transit (hub) configuration (addr / watch_root / auth / tls) lives in the `server:` section of
+`config.example.relay.yaml` — one file drives all three ends, and there is no separate `server.yaml`.
 
 ## Config Structure
 
@@ -742,11 +734,12 @@ watch:
 When `ttl` is set on a watch directory, the server automatically deletes files older than the specified duration. Runs every minute.
 
 ```yaml
-# server.yaml
-watch:
+server:
+  watch_root: /data/relay        # each workspace's watch_dir is relative to this
+workspaces:
   - id: web-app-patches
-    dir: /data/relay/web-app/patches
-    ttl: 30m     # delete files older than 30 minutes
+    watch_dir: web-app/patches
+    ttl: 30m                     # delete files older than 30 minutes
 ```
 
 Supported duration formats: `30s`, `5m`, `1h`, `24h`.
@@ -799,7 +792,7 @@ Two cleanup paths to be aware of:
 
 When a file matches, the watcher first downloads it into `local_dir` (the
 backend is a pure file-transfer layer and never executes commands), then runs
-the `jobs`/`exec` actions locally on the machine running `relay watch`. Set
+the `jobs`/`exec` actions locally on the machine running the executor node. Set
 `auto_cleanup: true` to have the watcher remove the remote (`{file_remote_path}`)
 copy after all jobs succeed; delete the locally-synced copy with an
 `exec` job such as `rm -f {file_path}`.
