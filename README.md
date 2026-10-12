@@ -568,10 +568,15 @@ relay logs site-a -f     # streams the tunnel's lines from ~/.relay/node.log (pr
 
 A tunnel row's STATUS also reports egress reachability (`running (egress ready 11ms)` / `(egress offline)`
 / `(egress notready)` / `(egress unknown)`), from the same cluster ledger `relay nodes` uses — one extra
-transit query, issued only when a tunnel is actually running, 1.5s-bounded and degrading to `unknown`
-rather than failing. `--json` exposes it as `egress_status` / `egress_ready`.
+transit query, issued only when a tunnel is actually running, bounded by an 800ms per-egress probe budget
+and degrading to `unknown` rather than failing. `--json` exposes it as `egress_status` / `egress_ready`.
 
-`relay ps` still lists local tunnels when the transit is unreachable — only the remote task list degrades.
+`relay ps` still lists tunnels when the transit is unreachable — only the remote task list degrades.
+
+The table narrows the fixed-width `PORTS` cell (a long port list shows as `8080:9000,909...`) because the
+columns after it must stay aligned; `COMMAND` is the last column and is never truncated. `--json` is
+lossless either way: it always carries the complete command line and the full port list, so it is the
+surface to parse when a command is too long to read in the table.
 
 **Two behaviours that are easy to misread:**
 
