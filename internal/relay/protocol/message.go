@@ -39,6 +39,7 @@ const (
 	MsgTaskLogs         MessageType = "task_logs"
 	MsgGitStatus        MessageType = "git_status"
 	MsgGitUndo          MessageType = "git_undo"
+	MsgPruneExecutors   MessageType = "prune_executors"
 )
 
 // Message 是所有消息的通用包装
@@ -205,6 +206,9 @@ type ExecutorHealth struct {
 	Resource   ResourceStats `json:"resource,omitempty"`
 	Seg2       StatusSegment `json:"seg2"`
 	Total      StatusSegment `json:"total,omitempty"`
+	// Online 标记执行方是否在线:false 表示它此前注册过但当前断线(见于中转持久化的已知 executor 台账)。
+	Online   bool  `json:"online"`
+	LastSeen int64 `json:"last_seen,omitempty"` // 最近一次见到的 unix 秒(离线时最后一次心跳/注册时间)
 }
 
 // StatusResponse 中转对 MsgStatus 的应答,承接 `relay status/nodes` 的一站式连通性+版本台账。

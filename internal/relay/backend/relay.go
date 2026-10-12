@@ -893,6 +893,14 @@ func (b *RelayBackend) TaskStop(ctx context.Context, targetExecutor, taskID stri
 	return b.client.TaskStop(ctx, targetExecutor, taskID)
 }
 
+// PruneOfflineExecutors 向中转请求清理「已知但离线」的 executor 台账条目,返回清理数。
+func (b *RelayBackend) PruneOfflineExecutors(ctx context.Context) (int, error) {
+	if err := b.ensureConnected(ctx); err != nil {
+		return 0, err
+	}
+	return b.client.PruneExecutors(ctx)
+}
+
 // TaskLogs 请求目标任务的日志流
 func (b *RelayBackend) TaskLogs(ctx context.Context, targetExecutor, taskID string, follow bool, tailLines int, onChunk func(backend.ExecChunk)) error {
 	if err := b.ensureConnected(ctx); err != nil {

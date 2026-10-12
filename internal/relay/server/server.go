@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -39,6 +40,13 @@ type Server struct {
 	executors         map[string]string
 	executorEndpoints map[string]ExecutorEndpoint
 	executorMu        sync.RWMutex
+
+	// knownExecutors 记录「曾经注册过」的所有 executor 台账(含离线),用于 `relay nodes` 展示
+	// 离线节点与 `--prune-offline` 清理。与上面在线路由表相互独立:路由/隧道/target 仍只看
+	// s.executors(在线),台账只服务于「可见性」。stateDir 非空时持久化到 known_executors.json。
+	knownExecutors map[string]*KnownExecutor
+	knownMu        sync.Mutex
+	stateDir       string
 	// reqOwner 记录被转发的 exec 请求(reqID)归属的请求方客户端,用于把执行方回流帧转回去。
 	reqOwner map[string]string
 	reqMu    sync.RWMutex
@@ -95,6 +103,22 @@ type Config struct {
 	WatchDirs     []WatchDirConfig
 	TunnelEnabled bool // KTD4:隧道通道默认关闭,显式开启才放行 MsgTunnel*
 	MaxTunnels    int  // 并发隧道上限(<=0 时用 defaultMaxTunnels)
+
+	// StateDir 是中转持久化已知 executor 台账的目录(通常取 server.watch_root)。
+	// 为空时禁用台账持久化(仅内存,重启后离线记录丢失)。
+	StateDir string
+}
+
+// KnownExecutor 是中转记录的一条「已知执行方」台账条目:无论当前在线还是离线都保留,
+// 供 `relay nodes` 展示离线节点与 `--prune-offline` 清理。Online 表示当前是否在线。
+type KnownExecutor struct {
+	ID       string                 `json:"id"`
+	Online   bool                   `json:"online"`
+	LastSeen time.Time              `json:"last_seen"`
+	Version  string                 `json:"version,omitempty"`
+	OS       string                 `json:"os,omitempty"`
+	Arch     string                 `json:"arch,omitempty"`
+	Resource protocol.ResourceStats `json:"resource,omitempty"`
 }
 
 type TLSConfig struct {
@@ -120,23 +144,25 @@ func New(cfg Config) (*Server, error) {
 		maxTunnels = defaultMaxTunnels
 	}
 	s := &Server{
-		addr:          cfg.Addr,
-		watchDirs:     make(map[string]string),
-		watchCfgs:     cfg.WatchDirs,
-		clients:       make(map[string]*Client),
-		serverID:      "relay-" + uuid.New().String()[:8],
-		auth:          cfg.Auth,
-		tls:           cfg.TLS,
+		addr:              cfg.Addr,
+		watchDirs:         make(map[string]string),
+		watchCfgs:         cfg.WatchDirs,
+		clients:           make(map[string]*Client),
+		serverID:          "relay-" + uuid.New().String()[:8],
+		auth:              cfg.Auth,
+		tls:               cfg.TLS,
 		subs:              make(map[string]map[string]bool),
 		executors:         make(map[string]string),
 		executorEndpoints: make(map[string]ExecutorEndpoint),
+		knownExecutors:    make(map[string]*KnownExecutor),
 		reqOwner:          make(map[string]string),
-		pending:       make(map[string]chan protocol.Message),
-		pushRelay:     make(map[string]pushRelayInfo),
-		tunnels:       make(map[string]*tunnelEntry),
-		tunnelEnabled: cfg.TunnelEnabled,
-		maxTunnels:    maxTunnels,
-		readyCh:       make(chan struct{}),
+		pending:           make(map[string]chan protocol.Message),
+		pushRelay:         make(map[string]pushRelayInfo),
+		tunnels:           make(map[string]*tunnelEntry),
+		tunnelEnabled:     cfg.TunnelEnabled,
+		maxTunnels:        maxTunnels,
+		stateDir:          cfg.StateDir,
+		readyCh:           make(chan struct{}),
 	}
 
 	for _, wd := range cfg.WatchDirs {
@@ -149,6 +175,10 @@ func New(cfg Config) (*Server, error) {
 
 	log.Printf("[server] up: id=%s addrs=%d dirs=%v tunnel_enabled=%t max_tunnels=%d",
 		s.serverID, len(s.watchDirs), watchIDs(s.watchDirs), cfg.TunnelEnabled, maxTunnels)
+
+	if cfg.StateDir != "" {
+		s.loadKnownExecutors()
+	}
 
 	return s, nil
 }
@@ -436,6 +466,24 @@ func (s *Server) RegisterExecutor(executorID, clientID, version, goos, goarch st
 	} else {
 		delete(s.executorEndpoints, executorID)
 	}
+
+	// 同步已知 executor 台账:标记在线、更新 LastSeen 与 exec 信息(供离线节点展示/清理)。
+	s.knownMu.Lock()
+	ke := s.knownExecutors[executorID]
+	now := time.Now()
+	if ke == nil {
+		ke = &KnownExecutor{ID: executorID}
+		s.knownExecutors[executorID] = ke
+	}
+	ke.Online = true
+	ke.LastSeen = now
+	ke.Version = version
+	ke.OS = goos
+	ke.Arch = goarch
+	ke.Resource = res
+	s.knownMu.Unlock()
+	s.saveKnownExecutors()
+
 	return prev, replaced
 }
 
@@ -446,6 +494,102 @@ func (s *Server) UnregisterExecutor(executorID, clientID string) {
 	if s.executors[executorID] == clientID {
 		delete(s.executors, executorID)
 		delete(s.executorEndpoints, executorID)
+	}
+}
+
+// ExecutorLedger 返回已知 executor 台账的快照(在线+离线),按 ID 排序。供 `relay nodes` 展示
+// 离线节点;副本返回保证调用方并发安全。
+func (s *Server) ExecutorLedger() []KnownExecutor {
+	s.knownMu.Lock()
+	defer s.knownMu.Unlock()
+	out := make([]KnownExecutor, 0, len(s.knownExecutors))
+	for _, ke := range s.knownExecutors {
+		out = append(out, *ke)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// PruneOfflineExecutors 移除全部当前离线的已知 executor 条目并落盘,返回清理数量。
+func (s *Server) PruneOfflineExecutors() int {
+	s.knownMu.Lock()
+	pruned := 0
+	for id, ke := range s.knownExecutors {
+		if !ke.Online {
+			delete(s.knownExecutors, id)
+			pruned++
+		}
+	}
+	s.knownMu.Unlock()
+	if pruned > 0 {
+		s.saveKnownExecutors()
+	}
+	return pruned
+}
+
+// knownExecutorsPath 返回已知 executor 台账的持久化文件路径。
+func (s *Server) knownExecutorsPath() string {
+	if s.stateDir == "" {
+		return ""
+	}
+	return filepath.Join(s.stateDir, "known_executors.json")
+}
+
+// saveKnownExecutors 把已知 executor 台账原子写盘(若无 stateDir 则跳过)。写失败仅记日志,不中断。
+func (s *Server) saveKnownExecutors() {
+	p := s.knownExecutorsPath()
+	if p == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		log.Printf("[server] known-executors mkdir %s: %v", p, err)
+		return
+	}
+	s.knownMu.Lock()
+	data, err := json.MarshalIndent(s.knownExecutors, "", "  ")
+	s.knownMu.Unlock()
+	if err != nil {
+		log.Printf("[server] known-executors marshal: %v", err)
+		return
+	}
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		log.Printf("[server] known-executors write tmp %s: %v", tmp, err)
+		return
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		log.Printf("[server] known-executors rename %s: %v", tmp, err)
+	}
+}
+
+// loadKnownExecutors 启动时从磁盘加载已知 executor 台账。加载后所有条目先记为离线
+// (此刻尚无任何连接),待各 executor 重连后经 RegisterExecutor 翻回在线。文件不存在视为空。
+func (s *Server) loadKnownExecutors() {
+	p := s.knownExecutorsPath()
+	data, err := os.ReadFile(p)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[server] known-executors load %s: %v", p, err)
+		}
+		return
+	}
+	var m map[string]*KnownExecutor
+	if err := json.Unmarshal(data, &m); err != nil {
+		log.Printf("[server] known-executors parse %s: %v", p, err)
+		return
+	}
+	s.knownMu.Lock()
+	for id, ke := range m {
+		if ke == nil {
+			continue
+		}
+		ke.ID = id
+		ke.Online = false // 启动时无任何连接,全部标记离线
+		s.knownExecutors[id] = ke
+	}
+	s.knownMu.Unlock()
+	if n := len(s.knownExecutors); n > 0 {
+		log.Printf("[server] loaded %d known executor(s) from %s", n, p)
 	}
 }
 
@@ -668,14 +812,30 @@ func (s *Server) SendToRawBinary(clientID string, raw []byte) error {
 
 // cleanupClientState 断连时清理该 client 注册的执行方、待转发请求归属与流式 push 路由。
 func (s *Server) cleanupClientState(clientID string) {
+	var offline []string
 	s.executorMu.Lock()
 	for eid, e := range s.executors {
 		if e == clientID {
 			delete(s.executors, eid)
 			delete(s.executorEndpoints, eid)
+			offline = append(offline, eid)
 		}
 	}
 	s.executorMu.Unlock()
+
+	// 把这些 executor 标记为离线(保留在已知台账,供 offline 展示),而不是彻底删除。
+	if len(offline) > 0 {
+		now := time.Now()
+		s.knownMu.Lock()
+		for _, eid := range offline {
+			if ke := s.knownExecutors[eid]; ke != nil {
+				ke.Online = false
+				ke.LastSeen = now
+			}
+		}
+		s.knownMu.Unlock()
+		s.saveKnownExecutors()
+	}
 
 	s.reqMu.Lock()
 	for reqID, owner := range s.reqOwner {
@@ -721,4 +881,3 @@ func toString(v interface{}) string {
 	}
 	return ""
 }
-

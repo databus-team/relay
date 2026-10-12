@@ -114,6 +114,7 @@ var (
 	nodesCmd      = kingpin.Command("nodes", "List cluster peer nodes and topology (alias: status)").Alias("status")
 	nodesJSONOut  = nodesCmd.Flag("json", "Output as JSON").Bool()
 	nodesUsageOut = nodesCmd.Flag("usage", "Query dynamic CPU load & memory usage of nodes (heavier probe)").Short('u').Bool()
+	nodesPrune    = nodesCmd.Flag("prune-offline", "Remove known-offline executors from the transit ledger").Bool()
 
 	// Cleanup command - remove stale command files
 	cleanupCmd   = kingpin.Command("cleanup", "Clean up stale remote commands and results")
@@ -1577,6 +1578,16 @@ func runNodes() {
 		os.Exit(1)
 	}
 
+	// 清理离线节点:把中转台账里「已知但离线」的 executor 移除,并报告清理数。
+	if *nodesPrune {
+		n, perr := rb.PruneOfflineExecutors(ctx)
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "Prune offline executors error: %v\n", perr)
+			os.Exit(1)
+		}
+		fmt.Printf("Pruned %d offline executor(s)\n", n)
+	}
+
 	var nodes []PeerNodeItem
 
 	// 1. 本机节点
@@ -1643,15 +1654,31 @@ func runNodes() {
 		Args:     st.Transit.Args,
 	})
 
-	// 3. 远端 Agent / Executor 节点
+	// 3. 远端 Agent / Executor 节点。本机 node 若以 agent 运行会作为 executor 注册进台账,
+	// 而它已在「1. 本机节点」以 (local) 行呈现,这里按本机 backend.config.executor_id 去重合并。
+	localExecID, _ := cfg.Backend.Config["executor_id"].(string)
 	for _, e := range st.Executors {
 		if e.ExecutorID == "hub" {
 			// hub 自身作为 agent 已合并在 hub (transit) 呈现，避免重复行
 			continue
 		}
+		if localExecID != "" && e.ExecutorID == localExecID {
+			// 本机 node 已作为 (local) 行呈现,避免同一台本机出现两行
+			continue
+		}
+		// 离线判定以响应中的 LastSeen 为准:旧版中转不返回 Online/LastSeen(Online 缺省为 false),
+		// 仅靠 !Online 会把旧中转的所有在线节点误标为 Offline。故仅在显式携带 LastSeen(>0)时视为离线。
+		offline := !e.Online && e.LastSeen != 0
 		stText := "Ready"
-		if e.Seg2.Unavailable != "" {
+		switch {
+		case offline:
+			stText = "Offline"
+		case e.Seg2.Unavailable != "":
 			stText = "NotReady"
+		}
+		latency := segmentText(e.Total)
+		if offline {
+			latency = "-"
 		}
 		platform := "-"
 		if e.OS != "" {
@@ -1675,7 +1702,7 @@ func runNodes() {
 			CPU:      execCPU,
 			Memory:   execMem,
 			Version:  identStr(e.Version),
-			Latency:  segmentText(e.Total),
+			Latency:  latency,
 		})
 	}
 

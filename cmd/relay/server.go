@@ -22,11 +22,11 @@ var (
 	serverCmd = kingpin.Command("server", "Transit server daemon (deprecated, use node instead)")
 
 	// 子命令定义
-	_ = serverCmd.Command("run", "Run server in foreground")
-	_ = serverCmd.Command("start", "Start server daemon in background")
-	_ = serverCmd.Command("stop", "Stop running server daemon")
-	_ = serverCmd.Command("status", "Show status of server daemon")
-	_ = serverCmd.Command("restart", "Restart server daemon")
+	_               = serverCmd.Command("run", "Run server in foreground")
+	_               = serverCmd.Command("start", "Start server daemon in background")
+	_               = serverCmd.Command("stop", "Stop running server daemon")
+	_               = serverCmd.Command("status", "Show status of server daemon")
+	_               = serverCmd.Command("restart", "Restart server daemon")
 	serverUpgradeCmd = serverCmd.Command("upgrade", "Upgrade server daemon binary")
 	serverUpgradePath = serverUpgradeCmd.Arg("upgrade-path", "Path to new relay binary (with action=upgrade)").String()
 
@@ -66,6 +66,7 @@ type serverBaseConfig struct {
 	tls           server.TLSConfig
 	tunnelEnabled bool
 	maxTunnels    int
+	stateDir      string // 已知 executor 台账的持久化目录(取 server.watch_root;空=不持久化)
 }
 
 // hasServerSection 判断文件是否含顶层 `server:` 段(统一 config.yaml)。
@@ -120,14 +121,16 @@ func unifiedServerBase(data []byte) (serverBaseConfig, error) {
 	tls := server.TLSConfig{}
 	tunnelEnabled := false
 	maxTunnels := 0
+	stateDir := ""
 	if sc != nil {
 		tokens = sc.Auth.Tokens
 		tls = server.TLSConfig{Enabled: sc.TLS.Enabled, CertFile: sc.TLS.CertFile, KeyFile: sc.TLS.KeyFile}
 		tunnelEnabled = sc.TunnelEnabled
 		maxTunnels = sc.MaxTunnels
+		stateDir = sc.WatchRoot
 	}
 
-	return serverBaseConfig{addr: addr, watchDirs: watchDirs, tokens: tokens, tls: tls, tunnelEnabled: tunnelEnabled, maxTunnels: maxTunnels}, nil
+	return serverBaseConfig{addr: addr, watchDirs: watchDirs, tokens: tokens, tls: tls, tunnelEnabled: tunnelEnabled, maxTunnels: maxTunnels, stateDir: stateDir}, nil
 }
 
 // legacyServerBase 从旧式 server.yaml(顶层 addr/watch/auth/tls)构建 server 配置。
@@ -238,6 +241,7 @@ func buildServerInstance(path string) (*server.Server, *server.Config, error) {
 		TLS:           server.TLSConfig{Enabled: tlsEnabled, CertFile: tlsCert, KeyFile: tlsKey},
 		TunnelEnabled: base.tunnelEnabled,
 		MaxTunnels:    maxTunnels,
+		StateDir:      base.stateDir,
 	}
 
 	srv, err := server.New(cfg)

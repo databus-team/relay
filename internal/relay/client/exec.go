@@ -849,3 +849,23 @@ func (c *Client) TaskLogs(ctx context.Context, targetExecutor, taskID string, fo
 	_, err := c.execRoundTrip(ctx, ch, onChunk)
 	return err
 }
+
+// PruneExecutors 向中转请求清理「已知但离线」的 executor 台账条目,返回清理数。
+// 对应 `relay nodes --prune-offline`。
+func (c *Client) PruneExecutors(ctx context.Context) (int, error) {
+	resp, err := c.Request(ctx, protocol.MsgPruneExecutors, nil)
+	if err != nil {
+		return 0, err
+	}
+	if !resp.OK {
+		return 0, fmt.Errorf("prune executors failed: %s", resp.Error)
+	}
+	data, _ := json.Marshal(resp.Payload)
+	var out struct {
+		Pruned int `json:"pruned"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return 0, err
+	}
+	return out.Pruned, nil
+}

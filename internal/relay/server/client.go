@@ -194,6 +194,9 @@ func (c *Client) handleMessage(msg protocol.Message) {
 
 	case protocol.MsgGitUndo:
 		c.handleGitUndo(msg)
+
+	case protocol.MsgPruneExecutors:
+		c.handlePruneExecutors(msg)
 	}
 }
 
@@ -683,7 +686,27 @@ func (c *Client) handleStatus(msg protocol.Message) {
 		},
 	}
 	endpoints := c.server.ExecutorEndpoints()
+
+	// 已知但当前离线的 executor(来自持久化台账):不做探针,直接以 offline 状态呈现。
+	var offline []protocol.ExecutorHealth
+	for _, ke := range c.server.ExecutorLedger() {
+		if ke.Online {
+			continue
+		}
+		offline = append(offline, protocol.ExecutorHealth{
+			ExecutorID: ke.ID,
+			Version:    ke.Version,
+			OS:         ke.OS,
+			Arch:       ke.Arch,
+			Resource:   ke.Resource,
+			Online:     false,
+			LastSeen:   ke.LastSeen.Unix(),
+			Seg2:       protocol.StatusSegment{Unavailable: "executor offline"},
+		})
+	}
+
 	if len(endpoints) == 0 {
+		resp.Executors = offline
 		c.SendResponse(msg.ID, resp)
 		return
 	}
@@ -694,7 +717,8 @@ func (c *Client) handleStatus(msg protocol.Message) {
 	}
 	sort.Strings(executorIDs)
 
-	results := make([]protocol.ExecutorHealth, len(executorIDs))
+	results := make([]protocol.ExecutorHealth, len(executorIDs)+len(offline))
+	copy(results, offline)
 	go func() {
 		var wg sync.WaitGroup
 		for i, eid := range executorIDs {
@@ -708,12 +732,13 @@ func (c *Client) handleStatus(msg protocol.Message) {
 				if dynRes != nil {
 					res = *dynRes
 				}
-				results[i] = protocol.ExecutorHealth{
+				results[len(offline)+i] = protocol.ExecutorHealth{
 					ExecutorID: eid,
 					Version:    ep.Version,
 					OS:         ep.OS,
 					Arch:       ep.Arch,
 					Resource:   res,
+					Online:     true,
 					Seg2:       seg,
 				}
 			}()
@@ -722,6 +747,13 @@ func (c *Client) handleStatus(msg protocol.Message) {
 		resp.Executors = results
 		_ = c.SendResponse(msg.ID, resp)
 	}()
+}
+
+// handlePruneExecutors 处理 `relay nodes --prune-offline` 清理请求:移除全部离线已知 executor
+// 并回传清理数。
+func (c *Client) handlePruneExecutors(msg protocol.Message) {
+	pruned := c.server.PruneOfflineExecutors()
+	c.SendResponse(msg.ID, map[string]interface{}{"ok": true, "pruned": pruned})
 }
 
 // transitVersion 返回中转节点的构建信息(role=transit)。
