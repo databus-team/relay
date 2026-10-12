@@ -65,7 +65,7 @@ type forwardHolder struct {
 	sockPath string
 
 	mu     sync.Mutex
-	byAddr map[string]struct{} // "bind:port" -> 占位,用于端口占用冲突检测
+	byAddr map[string]*fwdForwarder // "bind:port" -> 转发者,用于端口占用冲突检测 + 同任务复用判定(KTD5)
 	byTask map[string][]*fwdForwarder
 }
 
@@ -78,7 +78,7 @@ func newForwardHolder(ctx context.Context, rb *relaybackend.RelayBackend, sockPa
 		rb:       rb,
 		ctx:      ctx,
 		sockPath: sockPath,
-		byAddr:   make(map[string]struct{}),
+		byAddr:   make(map[string]*fwdForwarder),
 		byTask:   make(map[string][]*fwdForwarder),
 	}
 }
@@ -137,6 +137,8 @@ func (h *forwardHolder) dispatch(msg fwdControlMsg) fwdControlResp {
 
 // opRegister 注册一组端口转发。逐条处理:某规格端口已被占用(或绑定失败)时仅拒绝该条并记录,
 // 不影响其它规格,也不覆盖已有转发。非 loopback 绑定发出与前台转发一致的告警。
+// 幂等(KTD5):同一 task id 命中同一地址视为复用而不是冲突 —— `relay stop` 之后再 `relay start`,
+// 或本机 node 重启后重登记,规则本就该在;真正的跨任务占用仍按冲突拒绝。
 func (h *forwardHolder) opRegister(msg fwdControlMsg) fwdControlResp {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -147,7 +149,12 @@ func (h *forwardHolder) opRegister(msg fwdControlMsg) fwdControlResp {
 			spec.BindHost = "127.0.0.1"
 		}
 		addr := fmt.Sprintf("%s:%d", spec.BindHost, spec.LocalPort)
-		if _, exists := h.byAddr[addr]; exists {
+		if fw, exists := h.byAddr[addr]; exists {
+			if fw.taskID == msg.TaskID {
+				// 同任务复用:保留现有监听(不断在途连接),不视为冲突(R2/R13)。
+				resp.Registered = append(resp.Registered, addr)
+				continue
+			}
 			resp.Rejected = append(resp.Rejected, fmt.Sprintf("%s already held by another forwarder", addr))
 			continue
 		}
@@ -160,7 +167,7 @@ func (h *forwardHolder) opRegister(msg fwdControlMsg) fwdControlResp {
 			continue
 		}
 		fw := &fwdForwarder{taskID: msg.TaskID, executor: msg.Executor, addr: addr, spec: spec, listener: ln}
-		h.byAddr[addr] = struct{}{}
+		h.byAddr[addr] = fw
 		h.byTask[msg.TaskID] = append(h.byTask[msg.TaskID], fw)
 		resp.Registered = append(resp.Registered, addr)
 		go h.serveForwarder(fw) // accept 循环不触碰 h.mu,可在锁内安全启动

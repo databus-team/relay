@@ -20,7 +20,7 @@ type CommandCategory struct {
 var categories = []CommandCategory{
 	{
 		Title: "Core Commands:",
-		Names: []string{"run", "ps", "logs", "stop"},
+		Names: []string{"run", "start", "restart", "ps", "logs", "stop"},
 	},
 	{
 		Title: "Cluster & Network:",

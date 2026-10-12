@@ -138,6 +138,38 @@ func TestTaskToPSRow(t *testing.T) {
 	if noPorts.Ports != "-" {
 		t.Errorf("no ports = %q, want -", noPorts.Ports)
 	}
+
+	// R20:任务行显示 restart 策略(复用 psRow.Restart 字段)。
+	polRow := taskToPSRow(backend.TaskInfo{ID: "t-7", Node: "eg-node", Status: "running", StartTime: now, Restart: "always"})
+	if polRow.Restart != "always" {
+		t.Errorf("task Restart = %q, want always", polRow.Restart)
+	}
+
+	// R12:CREATED 取首次创建时间,不因重启而重置;老执行方 CreatedAt=0 时回退到最近一次启动时间。
+	createdAt := now - 3600 // 1 小时前创建,最近一次启动在 1 分钟前
+	freshStart := taskToPSRow(backend.TaskInfo{ID: "t-8", Status: "running", StartTime: now, CreatedAt: createdAt})
+	if !strings.Contains(freshStart.Created, "h ago") {
+		t.Errorf("CREATED with CreatedAt = %q, want ~1h ago", freshStart.Created)
+	}
+	createdReset := taskToPSRow(backend.TaskInfo{ID: "t-9", Status: "running", StartTime: now})
+	if !strings.Contains(createdReset.Created, "s ago") {
+		t.Errorf("CREATED fallback (CreatedAt=0) = %q, want ~now", createdReset.Created)
+	}
+}
+
+// TestPSHeaderContainsRestart 钉住 R20 的 RESTART 列:表头与行共用 psRowFormat,列必须出现在 PORTS
+// 与 EXIT 之间,否则对齐会错位。
+func TestPSHeaderContainsRestart(t *testing.T) {
+	h := psHeader()
+	if !strings.Contains(h, "RESTART") {
+		t.Fatalf("ps header %q missing RESTART column", h)
+	}
+	if !strings.Contains(h, "PORTS") || !strings.Contains(h, "EXIT") {
+		t.Fatalf("ps header %q missing PORTS or EXIT", h)
+	}
+	if strings.Index(h, "PORTS") > strings.Index(h, "RESTART") || strings.Index(h, "RESTART") > strings.Index(h, "EXIT") {
+		t.Fatalf("ps header %q: RESTART must sit between PORTS and EXIT", h)
+	}
 }
 
 // legacyPorts 把升级前落盘的展示字符串形态(["8080", ...])按 wire 反序列化:

@@ -101,7 +101,13 @@ func openTunnelViaHolder(sockPath, target, listen, policy string, warnw io.Write
 	}
 	if !resp.OK {
 		// 最常见的失败是 holder 绑不上监听地址——多半是残留的旧 `tunnel-<egress>` 独立 daemon
-		// 还占着同一端口,附上可操作的清理提示。
+		// 还占着同一端口。此处就地清掉它(与 stop 的收尾同一动作,见 stopLegacyTunnelDaemon):
+		// create 刚失败,该 egress 既没有任务也没有持久化意图,提示里的 `relay stop <egress>`
+		// 解析不出对象、走不到 stopLocalTunnel,是条死路。清掉后如实报「已停掉,可重试」;
+		// 只有清不掉时才回落到原提示(仍保留 kill 兜底)。
+		if stopLegacyTunnelDaemon(target) {
+			return fmt.Errorf("start tunnel %s: %s; a legacy tunnel daemon %s was holding the listen address and has been stopped — retry the command", target, resp.Error, tunnelInstanceName(target))
+		}
 		return fmt.Errorf("start tunnel %s: %s%s", target, resp.Error, tunnelLegacyDaemonHint(target))
 	}
 	// 非 loopback 绑定 = 一个无认证、网络上任意主机可用的 SOCKS5 入口。holder 侧也会记一条到
@@ -133,45 +139,100 @@ func tunnelLegacyDaemonHint(egress string) string {
 	return fmt.Sprintf("; a legacy tunnel daemon %s is still running (pid %d) and may hold the listen address — remove it with `relay tunnel stop -w %s` or `kill %d`", inst, st.Pid, egress, st.Pid)
 }
 
-// runTunnelStop 停止一条由本地 node 持有的隧道。node 未运行时视为「已经没有该隧道可停」,
-// 幂等成功;最后总是顺带清理可能残留的旧独立 tunnel daemon。
+// runTunnelStop 停止一条由本地 node 持有的隧道(旧入口,`relay tunnel stop`)。与根级
+// `relay stop <egress>` 共用 stopLocalTunnel 这一份实现(R18):node 未运行时的意图移除不再
+// 各自实现,杜绝再次分叉。旧动词对「没有这条隧道」不判失败(结果由 stopLocalTunnel 如实汇报)。
 func runTunnelStop() {
 	target, err := tunnelRequireExecutor()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return
 	}
+	stopLocalTunnel(tunnelStatePath(), tunnelSockPath(), target, nodeDaemonRunning())
+}
 
-	if !daemon.Get(daemon.PidFile("node")).Running {
-		// node 未运行:没有 holder 可下发 close,但持久化意图仍须移除。否则 `--restart=always`
-		// 的条目会在下次 node 启动时被 restore 重放,与「关闭并遗忘」(docker rm)语义相悖。
-		removed, rerr := removePersistedTunnel(tunnelStatePath(), target)
+// stopLegacyTunnelDaemon 尽力停掉某 egress 对应的旧式独立 `tunnel-<egress>` daemon(已废弃的每出口
+// daemon 形态),返回是否确有进程被停。它是隧道 stop 的收尾与「创建失败时排除占位者」共用的同一份
+// 清理:egress 是执行方身份,可能含非法文件名字符,实例名由 tunnelInstanceName 净化。
+func stopLegacyTunnelDaemon(egress string) bool {
+	inst := tunnelInstanceName(egress)
+	if !daemon.Get(daemon.PidFile(inst)).Running {
+		return false
+	}
+	daemonStop(inst)
+	return true
+}
+
+// tunnelStopOutcome 是一次隧道停止请求的结果。区分「不认识这个名字」与「确实停掉了」,因为
+// R1(名字不存在要报错)与 R2(已停止的对象再停一次不算失败)对这两种情形要求不同的答复。
+type tunnelStopOutcome int
+
+const (
+	// tunnelStopUnknown:node 在运行但 holder 拒绝(没有该 egress / 传输失败)—— 名字不在。
+	// 拒绝/传输的底层原因不再被吞掉,随 err 一起交回调用方(见 stopLocalTunnel),便于区分报告。
+	tunnelStopUnknown tunnelStopOutcome = iota
+	// tunnelStopClosed:经 holder 关闭成功(关闭监听、在途连接并移除意图)。
+	tunnelStopClosed
+	// tunnelStopRemoved:node 未运行,仅从意图文件移除(R18)。
+	tunnelStopRemoved
+	// tunnelStopAbsent:node 未运行且意图文件里也没有 —— 已忘掉的对象。
+	tunnelStopAbsent
+)
+
+// stopSucceeded 报告一次隧道 stop 是否真的把对象停/忘掉了(R2 的幂等语义:Closed 与 Removed
+// 都算成功;Unknown/Absent 是「名字不在」,由调用方决定是否报错)。
+func stopSucceeded(out tunnelStopOutcome, err error) bool {
+	return err == nil && (out == tunnelStopClosed || out == tunnelStopRemoved)
+}
+
+// stopLocalTunnel 是本机隧道「停」的唯一实现(R18):node 在运行时经 holder 下发 close(关闭监听与
+// 在途连接、移除意图);node 未运行时降级为直接移除意图文件里的条目(否则 `--restart=always` 会在
+// 下次 node 启动时被 restore 重放,与「关闭并遗忘」(docker rm)语义相悖)。两条路径最后都清理可能
+// 残留的旧式独立 tunnel daemon。停不掉时(tunnelStopUnknown)第二个返回值带上底层原因——传输失败
+// 与 holder 拒绝都如实透出,不再塌缩成「名字不在」;成功/已停止/已忘掉三类结果的文案保持不变。
+// statePath/sockPath/nodeRunning 由调用方注入,便于在不碰真实
+// ~/.relay 的前提下覆盖 node 未运行这一分支(见 lifecycle_test.go)。
+func stopLocalTunnel(statePath, sockPath, egress string, nodeRunning bool) (tunnelStopOutcome, error) {
+	if egress == "" {
+		return tunnelStopUnknown, nil
+	}
+	// 旧部署形态的独立隧道 daemon(已废弃):若还在跑,一并清理,避免它继续占用监听地址
+	// (与旧每出口 daemon 时代的 stop 收尾一致)。egress 是执行方身份,可能含非法文件名字符,
+	// 实例名由 tunnelInstanceName 净化。
+	defer stopLegacyTunnelDaemon(egress)
+
+	if !nodeRunning {
+		// node 未运行:没有 holder 可下发 close,但持久化意图仍须移除。
+		removed, rerr := removePersistedTunnel(statePath, egress)
 		switch {
 		case rerr != nil:
-			fmt.Fprintf(os.Stderr, "Warning: remove persisted tunnel %s: %v\n", target, rerr)
+			fmt.Fprintf(os.Stderr, "Warning: remove persisted tunnel %s: %v\n", egress, rerr)
+			return tunnelStopUnknown, rerr
 		case removed:
-			fmt.Printf("node not running; removed persisted tunnel %s\n", target)
+			fmt.Printf("node not running; removed persisted tunnel %s\n", egress)
+			return tunnelStopRemoved, nil
 		default:
-			fmt.Printf("node not running; no tunnel for %s to stop\n", target)
-		}
-	} else {
-		resp, err := sendTunnelControl(tunnelSockPath(), tunControlMsg{Op: tunOpClose, Egress: target})
-		switch {
-		case err != nil:
-			fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
-		case !resp.OK:
-			fmt.Fprintf(os.Stderr, "Warning: stop tunnel %s: %s\n", target, resp.Error)
-		default:
-			if resp.Warning != "" {
-				fmt.Fprintf(os.Stderr, "Warning: %s\n", resp.Warning)
-			}
-			fmt.Printf("tunnel %s stopped\n", target)
+			fmt.Printf("node not running; no tunnel for %s to stop\n", egress)
+			return tunnelStopAbsent, nil
 		}
 	}
-
-	// 旧部署形态的独立隧道 daemon(已废弃):若还在跑,一并清理,避免它继续占用监听地址。
-	if legacy := daemon.Get(daemon.PidFile(tunnelInstanceName(target))); legacy.Running {
-		daemonStop(tunnelInstanceName(target))
+	resp, err := sendTunnelControl(sockPath, tunControlMsg{Op: tunOpClose, Egress: egress})
+	switch {
+	case err != nil:
+		// 传输层失败(控制 socket 不可达等):Warning 照打,但底层原因也随 err 交回调用方 ——
+		// 否则「停不掉」会与「名字不在」混为一谈(调用方只会报 no task or tunnel named X)。
+		fmt.Fprintf(os.Stderr, "Warning: stop tunnel %s: %v\n", egress, err)
+		return tunnelStopUnknown, err
+	case !resp.OK:
+		// holder 明确拒绝(如没有该 egress):同样保留它的原话,不静默降级。
+		fmt.Fprintf(os.Stderr, "Warning: stop tunnel %s: %s\n", egress, resp.Error)
+		return tunnelStopUnknown, errors.New(resp.Error)
+	default:
+		if resp.Warning != "" {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", resp.Warning)
+		}
+		fmt.Printf("tunnel %s stopped\n", egress)
+		return tunnelStopClosed, nil
 	}
 }
 

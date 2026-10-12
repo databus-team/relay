@@ -70,7 +70,7 @@ type tunnelState struct {
 }
 
 // filterTunnels 按 target 精确过滤 egress(空 target = 不过滤);all=false 时仅保留 running。
-// relay ps 与 relay tunnel status 共用同一语义。
+// 只有 relay ps 使用它:relay logs <egress> 走 resolveLifecycle/tunnelStatesForRead,不经这里。
 func filterTunnels(states []tunnelState, target string, all bool) []tunnelState {
 	out := make([]tunnelState, 0, len(states))
 	for _, st := range states {
