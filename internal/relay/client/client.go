@@ -383,10 +383,17 @@ func (c *Client) SendMessageForTest(msg *protocol.Message) error {
 	return c.sendMessage(msg)
 }
 
-// sendRawBinary 发送一个纯二进制帧(无前置 JSON)。
+// sendRawBinary 发送一个纯二进制帧(无前置 JSON)。带阻塞等待形成天然背压(Backpressure),
+// 避免本地 TCP 读协程无节制地吞食并挤爆发送队列或导致对端/网络失联。
 func (c *Client) sendRawBinary(raw []byte) error {
-	c.sendCh <- sendMsg{Raw: raw}
-	return nil
+	select {
+	case c.sendCh <- sendMsg{Raw: raw}:
+		return nil
+	case <-c.closeCh:
+		return fmt.Errorf("client closed")
+	case <-time.After(15 * time.Second):
+		return fmt.Errorf("send raw binary timeout: send queue saturated")
+	}
 }
 
 func (c *Client) handleMessage(msg protocol.Message) {
