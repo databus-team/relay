@@ -36,9 +36,11 @@ type Client struct {
 	pendingMu sync.RWMutex
 
 	closeCh      chan struct{}
+	closeOnce    sync.Once
 	reconnectCfg ReconnectConfig
 	lastPong     atomic.Int64
 	heartbeatGen atomic.Int64 // 每次重连成功后递增,使旧心跳 goroutine 失效(superseded)后自行退出
+	reconnecting atomic.Bool  // 互斥标记:保证同一时刻仅有一个 reconnectLoop 活跃
 
 	streamMu   sync.RWMutex
 	streams    map[string]*receiveStream
@@ -205,11 +207,34 @@ func (c *Client) getConn() *websocket.Conn {
 	return c.conn
 }
 
+func (c *Client) markClosed() {
+	c.closeOnce.Do(func() {
+		close(c.closeCh)
+	})
+}
+
+// Close 彻底关闭客户端,断开连接并销毁,不触发重连。
+func (c *Client) Close() error {
+	c.markClosed()
+	if conn := c.getConn(); conn != nil {
+		conn.Close()
+	}
+	c.connected.Store(false)
+	c.closeAllTunnels("client closed")
+	return nil
+}
+
 func (c *Client) Disconnect() error {
 	if conn := c.getConn(); conn != nil {
 		conn.Close()
 	}
 	c.connected.Store(false)
+	c.closeAllTunnels("disconnect")
+	if c.reconnectCfg.Enabled {
+		go c.reconnectLoop(context.Background())
+	} else {
+		c.markClosed()
+	}
 	return nil
 }
 
@@ -236,8 +261,9 @@ func (c *Client) readLoop() {
 			return
 		}
 
-		// 收到任一帧(含心跳 pong)说明连接还活着,续期读 deadline,把超时窗口前移。
+		// 收到任一帧(含心跳 pong 与隧道二进制帧)说明网络传输畅通活跃,续期读 deadline 并刷新活性时间
 		_ = conn.SetReadDeadline(time.Now().Add(readDeadline))
+		c.lastPong.Store(timeNow())
 
 		if msgType == websocket.BinaryMessage {
 			if streamID, payload, ok := protocol.DecodeTunnelBinary(data); ok {
@@ -286,11 +312,13 @@ func (c *Client) writeLoop() {
 			if err := conn.WriteJSON(sm.Message); err != nil {
 				continue
 			}
+			c.lastPong.Store(timeNow())
 		}
 		if len(sm.Raw) > 0 {
 			if err := conn.WriteMessage(websocket.BinaryMessage, sm.Raw); err != nil {
 				continue
 			}
+			c.lastPong.Store(timeNow())
 		}
 	}
 }

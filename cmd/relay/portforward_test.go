@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -430,5 +432,166 @@ func TestEndToEnd_RunPortForwardForeground(t *testing.T) {
 	_, dialErr := net.DialTimeout("tcp", localAddr, 200*time.Millisecond)
 	if dialErr == nil {
 		t.Fatalf("expected dial to fail after stopPF, but succeeded")
+	}
+}
+
+// TestEndToEnd_RunPortForwardLargeStream 验证端口转发流式传输较大尺寸数据时(如 20MB)节点稳定,不会误报心跳超时或连接异常中断
+func TestEndToEnd_RunPortForwardLargeStream(t *testing.T) {
+	relaybackend.SetExecutorRole(true)
+	defer relaybackend.SetExecutorRole(false)
+	defer client.CloseAll()
+
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen remote echo: %v", err)
+	}
+	defer echoLn.Close()
+	remotePort := echoLn.Addr().(*net.TCPAddr).Port
+
+	go func() {
+		for {
+			c, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	watchDir := t.TempDir()
+	srv, err := server.New(server.Config{
+		Addr: ":0",
+		WatchDirs: []server.WatchDirConfig{
+			{ID: "test", Dir: watchDir},
+		},
+		Auth: server.AuthConfig{
+			Type:   "token",
+			Tokens: []string{"tok-exe", "tok-req"},
+		},
+		TunnelEnabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/relay"
+
+	if _, err := relaybackend.NewRelayBackend(map[string]interface{}{
+		"url":         wsURL,
+		"token":       "tok-exe",
+		"executor_id": "node-agent",
+		"watch_dir":   ".",
+		"executor":    true,
+	}); err != nil {
+		t.Fatalf("executor backend: %v", err)
+	}
+
+	reqRaw, err := relaybackend.NewRelayBackend(map[string]interface{}{
+		"url":         wsURL,
+		"token":       "tok-req",
+		"executor_id": "cli-client",
+		"watch_dir":   ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+	rb := reqRaw.(*relaybackend.RelayBackend)
+
+	testLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("find free port: %v", err)
+	}
+	localPort := testLn.Addr().(*net.TCPAddr).Port
+	testLn.Close()
+
+	spec, err := parsePortForwardSpec(fmt.Sprintf("%d:%d", localPort, remotePort), "127.0.0.1")
+	if err != nil {
+		t.Fatalf("parse spec: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stopPF, err := StartPortForwardsForeground(ctx, rb, "node-agent", []*PortForwardSpec{spec})
+	if err != nil {
+		t.Fatalf("start port forwards foreground: %v", err)
+	}
+	defer stopPF()
+
+	localAddr := fmt.Sprintf("127.0.0.1:%d", localPort)
+	conn, err := net.DialTimeout("tcp", localAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial local port forward: %v", err)
+	}
+	defer conn.Close()
+
+	// 传输 16MB 的数据流并校验哈希
+	const totalBytes = 16 * 1024 * 1024
+	sendHash := sha256.New()
+	recvHash := sha256.New()
+
+	errCh := make(chan error, 2)
+
+	// 写协程
+	go func() {
+		buf := make([]byte, 64*1024)
+		for i := range buf {
+			buf[i] = byte(i % 251)
+		}
+		var written int64
+		for written < totalBytes {
+			toWrite := int64(len(buf))
+			if totalBytes-written < toWrite {
+				toWrite = totalBytes - written
+			}
+			n, werr := conn.Write(buf[:toWrite])
+			if n > 0 {
+				sendHash.Write(buf[:n])
+				written += int64(n)
+			}
+			if werr != nil {
+				errCh <- fmt.Errorf("write error: %w", werr)
+				return
+			}
+		}
+		errCh <- nil
+	}()
+
+	// 读协程
+	go func() {
+		buf := make([]byte, 64*1024)
+		var readBytes int64
+		for readBytes < totalBytes {
+			_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			n, rerr := conn.Read(buf)
+			if n > 0 {
+				recvHash.Write(buf[:n])
+				readBytes += int64(n)
+			}
+			if rerr != nil {
+				if readBytes < totalBytes {
+					errCh <- fmt.Errorf("read error: %w (read %d/%d bytes)", rerr, readBytes, totalBytes)
+					return
+				}
+				break
+			}
+		}
+		errCh <- nil
+	}()
+
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("stream transfer error: %v", err)
+		}
+	}
+
+	sendSum := sendHash.Sum(nil)
+	recvSum := recvHash.Sum(nil)
+	if !bytes.Equal(sendSum, recvSum) {
+		t.Fatalf("checksum mismatch: send %x != recv %x", sendSum, recvSum)
 	}
 }

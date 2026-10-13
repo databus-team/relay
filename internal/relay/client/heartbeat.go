@@ -47,13 +47,17 @@ func (c *Client) startHeartbeat(ctx context.Context) {
 				return
 			}
 
-			c.sendCh <- sendMsg{Message: &Message{
+			select {
+			case c.sendCh <- sendMsg{Message: &Message{
 				Type: protocol.MsgPing,
 				ID:   uuid.New().String(),
 				Payload: protocol.Heartbeat{
 					Timestamp: now,
 				},
-			}}
+			}}:
+			default:
+				// sendCh 暂时饱和,写循环正在高密输出数据帧,无需阻塞等待
+			}
 		}
 	}
 }
