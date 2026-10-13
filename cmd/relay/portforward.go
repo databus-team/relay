@@ -146,7 +146,7 @@ func handlePortForwardConn(ctx context.Context, rb *relaybackend.RelayBackend, t
 	go func() {
 		defer wg.Done()
 		defer stream.Close()
-		buf := make([]byte, 32*1024)
+		buf := make([]byte, 16*1024)
 		for {
 			n, rerr := conn.Read(buf)
 			if n > 0 {
@@ -155,10 +155,10 @@ func handlePortForwardConn(ctx context.Context, rb *relaybackend.RelayBackend, t
 				if werr := stream.Send(piece); werr != nil {
 					return
 				}
-				// 平滑突发流量峰值:每投递一块(32KB)出让调度 2ms,
-				// 避免本地持续以几百 MB/s 的速度灌入数据打爆中转 HTTP 反向代理的入站缓冲区,
-				// 从而给中转写出到远端 executor 及接收心跳保留稳定的传输时间。
-				time.Sleep(2 * time.Millisecond)
+				// 平滑突发流量峰值: 每投递一块(16KB)出让调度 10ms (约 1.6MB/s 稳定速率),
+				// 保证中转及底层 PaaS/Nginx 反向代理有充足时间将数据排空至远端,
+				// 杜绝代理因缓冲区溢出强杀 WebSocket 连接,同时确保心跳帧零延迟穿透。
+				time.Sleep(10 * time.Millisecond)
 			}
 			if rerr != nil {
 				return
