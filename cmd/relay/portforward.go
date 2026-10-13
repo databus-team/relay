@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/user/relay/internal/portfwd"
 	relaybackend "github.com/user/relay/internal/relay/backend"
@@ -154,6 +155,10 @@ func handlePortForwardConn(ctx context.Context, rb *relaybackend.RelayBackend, t
 				if werr := stream.Send(piece); werr != nil {
 					return
 				}
+				// 平滑突发流量峰值:每投递一块(32KB)出让调度 2ms,
+				// 避免本地持续以几百 MB/s 的速度灌入数据打爆中转 HTTP 反向代理的入站缓冲区,
+				// 从而给中转写出到远端 executor 及接收心跳保留稳定的传输时间。
+				time.Sleep(2 * time.Millisecond)
 			}
 			if rerr != nil {
 				return
