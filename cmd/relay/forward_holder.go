@@ -18,9 +18,17 @@ import (
 	"github.com/user/relay/internal/relay/protocol"
 )
 
-// forwardSockPath 返回本地 node 端口转发控制 socket 的绝对路径 `~/.relay/forward.sock`。
-// 复用 daemon.SockFile 与 node.pid/node.log 共用同一 baseDir,避免路径分叉。
 func forwardSockPath() string { return daemon.SockFile("forward") }
+
+func forwardStatePath() string {
+	return filepath.Join(filepath.Dir(daemon.SockFile("forward")), "forwards.json")
+}
+
+type fwdIntent struct {
+	TaskID   string            `json:"task_id"`
+	Executor string            `json:"executor"`
+	Specs    []PortForwardSpec `json:"specs"`
+}
 
 // 控制 socket 的操作码常量:避免 register/unregister 以裸字符串在多处出现。
 const (
@@ -56,34 +64,31 @@ type fwdForwarder struct {
 	listener net.Listener
 }
 
-// forwardHolder 是常驻于本地 node(agent 角色)进程内的端口转发持有者,类比 dockerd。
-// 它通过 unix socket 接受 CLI 的 register/unregister 控制,并负责维持
-// 各转发的本地监听;即使发起 `relay run -d` 的 CLI 已退出,转发依然存活。
 type forwardHolder struct {
-	rb       *relaybackend.RelayBackend
-	ctx      context.Context
-	sockPath string
+	rb        *relaybackend.RelayBackend
+	ctx       context.Context
+	sockPath  string
+	statePath string
 
 	mu     sync.Mutex
-	byAddr map[string]*fwdForwarder // "bind:port" -> 转发者,用于端口占用冲突检测 + 同任务复用判定(KTD5)
+	byAddr map[string]*fwdForwarder
 	byTask map[string][]*fwdForwarder
 }
 
-// newForwardHolder 构造一个端口转发持有者。sockPath 为空时使用默认 `~/.relay/forward.sock`。
 func newForwardHolder(ctx context.Context, rb *relaybackend.RelayBackend, sockPath string) *forwardHolder {
 	if sockPath == "" {
 		sockPath = forwardSockPath()
 	}
 	return &forwardHolder{
-		rb:       rb,
-		ctx:      ctx,
-		sockPath: sockPath,
-		byAddr:   make(map[string]*fwdForwarder),
-		byTask:   make(map[string][]*fwdForwarder),
+		rb:        rb,
+		ctx:       ctx,
+		sockPath:  sockPath,
+		statePath: forwardStatePath(),
+		byAddr:    make(map[string]*fwdForwarder),
+		byTask:    make(map[string][]*fwdForwarder),
 	}
 }
 
-// Run 监听 unix socket 并处理控制消息,直到构造时的 ctx 取消或 Accept 出错。返回时 socket 已清理。
 func (h *forwardHolder) Run() error {
 	_ = os.Remove(h.sockPath)
 	if dir := filepath.Dir(h.sockPath); dir != "." {
@@ -96,6 +101,8 @@ func (h *forwardHolder) Run() error {
 	defer os.Remove(h.sockPath)
 
 	fmt.Printf("[Node] Port-forward holder listening on unix socket %s\n", h.sockPath)
+
+	h.restore()
 
 	for {
 		conn, err := ln.Accept()
@@ -135,10 +142,6 @@ func (h *forwardHolder) dispatch(msg fwdControlMsg) fwdControlResp {
 	}
 }
 
-// opRegister 注册一组端口转发。逐条处理:某规格端口已被占用(或绑定失败)时仅拒绝该条并记录,
-// 不影响其它规格,也不覆盖已有转发。非 loopback 绑定发出与前台转发一致的告警。
-// 幂等(KTD5):同一 task id 命中同一地址视为复用而不是冲突 —— `relay stop` 之后再 `relay start`,
-// 或本机 node 重启后重登记,规则本就该在;真正的跨任务占用仍按冲突拒绝。
 func (h *forwardHolder) opRegister(msg fwdControlMsg) fwdControlResp {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -170,12 +173,16 @@ func (h *forwardHolder) opRegister(msg fwdControlMsg) fwdControlResp {
 		h.byAddr[addr] = fw
 		h.byTask[msg.TaskID] = append(h.byTask[msg.TaskID], fw)
 		resp.Registered = append(resp.Registered, addr)
-		go h.serveForwarder(fw) // accept 循环不触碰 h.mu,可在锁内安全启动
+		go h.serveForwarder(fw)
+	}
+	if len(resp.Registered) > 0 {
+		if err := h.persistLocked(); err != nil {
+			fmt.Fprintf(os.Stderr, "[port-forward] persist state: %v\n", err)
+		}
 	}
 	return resp
 }
 
-// opUnregister 关闭并移除指定 task_id 下的全部转发。
 func (h *forwardHolder) opUnregister(msg fwdControlMsg) fwdControlResp {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -186,6 +193,9 @@ func (h *forwardHolder) opUnregister(msg fwdControlMsg) fwdControlResp {
 		_ = fw.listener.Close()
 	}
 	delete(h.byTask, msg.TaskID)
+	if err := h.persistLocked(); err != nil {
+		fmt.Fprintf(os.Stderr, "[port-forward] persist state: %v\n", err)
+	}
 	return resp
 }
 
@@ -310,4 +320,82 @@ func sendForwardUnregister(sockPath, taskID string) error {
 		return fmt.Errorf("unregister rejected: %s", resp.Error)
 	}
 	return nil
+}
+
+// snapshotLocked 把当前全部 byTask 记录投影为 fwdIntent 列表。调用方须已持有 h.mu。
+// 每个 task 取其第一条 forwarder 的 executor(同任务的 forwarder executor 必然相同),
+// 收集该任务下全部活跃规格。
+func (h *forwardHolder) snapshotLocked() []fwdIntent {
+	intents := make([]fwdIntent, 0, len(h.byTask))
+	for taskID, fws := range h.byTask {
+		if len(fws) == 0 {
+			continue
+		}
+		specs := make([]PortForwardSpec, 0, len(fws))
+		for _, fw := range fws {
+			specs = append(specs, fw.spec)
+		}
+		intents = append(intents, fwdIntent{
+			TaskID:   taskID,
+			Executor: fws[0].executor,
+			Specs:    specs,
+		})
+	}
+	return intents
+}
+
+func (h *forwardHolder) persistLocked() error {
+	intents := h.snapshotLocked()
+	data, err := json.MarshalIndent(intents, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal forward intents: %w", err)
+	}
+	dir := filepath.Dir(h.statePath)
+	if dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("mkdir state dir: %w", err)
+		}
+	}
+	tmpPath := h.statePath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return fmt.Errorf("write temp state: %w", err)
+	}
+	if err := os.Rename(tmpPath, h.statePath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("atomic replace state: %w", err)
+	}
+	return nil
+}
+
+func (h *forwardHolder) restore() {
+	data, err := os.ReadFile(h.statePath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "[Node] load forward state: %v\n", err)
+		}
+		return
+	}
+	var intents []fwdIntent
+	if err := json.Unmarshal(data, &intents); err != nil {
+		fmt.Fprintf(os.Stderr, "[Node] parse forward state: %v\n", err)
+		return
+	}
+
+	for _, intent := range intents {
+		if intent.TaskID == "" || len(intent.Specs) == 0 {
+			continue
+		}
+		resp := h.opRegister(fwdControlMsg{
+			Op:       opRegister,
+			TaskID:   intent.TaskID,
+			Executor: intent.Executor,
+			Specs:    intent.Specs,
+		})
+		for _, addr := range resp.Registered {
+			fmt.Fprintf(os.Stderr, "[port-forward] restored %s (task %s)\n", addr, intent.TaskID)
+		}
+		for _, r := range resp.Rejected {
+			fmt.Fprintf(os.Stderr, "[port-forward] restore failed: %s (task %s)\n", r, intent.TaskID)
+		}
+	}
 }

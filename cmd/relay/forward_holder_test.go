@@ -236,3 +236,164 @@ func TestCaptureDetachTaskID(t *testing.T) {
 		})
 	}
 }
+
+// TestEndToEnd_ForwardHolder_RestoreOnRestart 验证 node restart 后 forwardHolder.restore()
+// 自动恢复持久化的端口监听，并恢复透传。
+func TestEndToEnd_ForwardHolder_RestoreOnRestart(t *testing.T) {
+	relaybackend.SetExecutorRole(true)
+	defer relaybackend.SetExecutorRole(false)
+	defer client.CloseAll()
+
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen remote echo: %v", err)
+	}
+	defer echoLn.Close()
+	remotePort := echoLn.Addr().(*net.TCPAddr).Port
+	go func() {
+		for {
+			c, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	watchDir := t.TempDir()
+	srv, err := server.New(server.Config{
+		Addr: ":0",
+		WatchDirs: []server.WatchDirConfig{
+			{ID: "test", Dir: watchDir},
+		},
+		Auth: server.AuthConfig{
+			Type:   "token",
+			Tokens: []string{"tok-exe", "tok-req"},
+		},
+		TunnelEnabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/relay"
+
+	if _, err := relaybackend.NewRelayBackend(map[string]interface{}{
+		"url":         wsURL,
+		"token":       "tok-exe",
+		"executor_id": "node-agent",
+		"watch_dir":   ".",
+		"executor":    true,
+	}); err != nil {
+		t.Fatalf("executor backend: %v", err)
+	}
+
+	reqRaw, err := relaybackend.NewRelayBackend(map[string]interface{}{
+		"url":         wsURL,
+		"token":       "tok-req",
+		"executor_id": "cli-client",
+		"watch_dir":   ".",
+	})
+	if err != nil {
+		t.Fatalf("requester backend: %v", err)
+	}
+	rb := reqRaw.(*relaybackend.RelayBackend)
+
+	testLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("find free port: %v", err)
+	}
+	localPort := testLn.Addr().(*net.TCPAddr).Port
+	testLn.Close()
+	localAddr := fmt.Sprintf("127.0.0.1:%d", localPort)
+
+	sockDir, err := os.MkdirTemp("/tmp", "relay-fwd-")
+	if err != nil {
+		t.Fatalf("create socket dir: %v", err)
+	}
+	defer os.RemoveAll(sockDir)
+	sockPath := filepath.Join(sockDir, "forward.sock")
+	statePath := filepath.Join(sockDir, "forwards.json")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	holder := newForwardHolder(ctx, rb, sockPath)
+	holder.statePath = statePath
+	go func() { _ = holder.Run() }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(sockPath); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	resp := sendControl(t, sockPath, fwdControlMsg{
+		Op:       opRegister,
+		TaskID:   "task-restart-test",
+		Executor: "node-agent",
+		Specs: []PortForwardSpec{
+			{BindHost: "127.0.0.1", LocalPort: localPort, RemoteHost: "127.0.0.1", RemotePort: remotePort},
+		},
+	})
+	if !resp.OK || len(resp.Registered) != 1 {
+		t.Fatalf("initial register failed: %+v", resp)
+	}
+
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("state file not written: %v", err)
+	}
+	if !strings.Contains(string(data), "task-restart-test") {
+		t.Fatalf("state file does not contain task id: %s", string(data))
+	}
+
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+
+	holder.mu.Lock()
+	for _, fw := range holder.byAddr {
+		_ = fw.listener.Close()
+	}
+	holder.mu.Unlock()
+
+	sockPath2 := filepath.Join(sockDir, "forward2.sock")
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+
+	holder2 := newForwardHolder(ctx2, rb, sockPath2)
+	holder2.statePath = statePath
+	go func() { _ = holder2.Run() }()
+
+	deadline2 := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline2) {
+		if _, err := os.Stat(sockPath2); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	conn, err := net.DialTimeout("tcp", localAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial restored forward %s failed: %v", localAddr, err)
+	}
+	testMsg := "hello-restored-forward\n"
+	if _, err := conn.Write([]byte(testMsg)); err != nil {
+		t.Fatalf("write to restored port: %v", err)
+	}
+	buf := make([]byte, len(testMsg))
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read from restored port: %v", err)
+	}
+	conn.Close()
+	if string(buf) != testMsg {
+		t.Fatalf("echo mismatch: got %q, want %q", string(buf), testMsg)
+	}
+}
