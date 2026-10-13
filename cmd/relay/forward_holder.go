@@ -76,14 +76,17 @@ type forwardHolder struct {
 }
 
 func newForwardHolder(ctx context.Context, rb *relaybackend.RelayBackend, sockPath string) *forwardHolder {
-	if sockPath == "" {
+	statePath := forwardStatePath()
+	if sockPath != "" {
+		statePath = filepath.Join(filepath.Dir(sockPath), "forwards.json")
+	} else {
 		sockPath = forwardSockPath()
 	}
 	return &forwardHolder{
 		rb:        rb,
 		ctx:       ctx,
 		sockPath:  sockPath,
-		statePath: forwardStatePath(),
+		statePath: statePath,
 		byAddr:    make(map[string]*fwdForwarder),
 		byTask:    make(map[string][]*fwdForwarder),
 	}
