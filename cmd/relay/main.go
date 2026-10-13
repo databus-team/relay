@@ -1786,12 +1786,18 @@ var nodeDaemonRunning = func() bool {
 	if daemon.Get(daemon.PidFile("node")).Running {
 		return true
 	}
-	conn, err := net.DialTimeout("unix", tunnelSockPath(), time.Second)
-	if err != nil {
-		return false
+	// pid 文件不存在时(如前台 relay node run),回退到探活两个控制 socket:
+	// tunnelHolder 与 forwardHolder 是并行独立的 goroutine,任一可达即表明 node 在运行。
+	// 只探 tunnel.sock 会在 tunnelHolder 绑定失败(或未启用隧道)而 forwardHolder 仍活着时
+	// 误判为「node 未运行」,导致 relay stop 跳过 sendForwardUnregister,端口不释放。
+	for _, sockPath := range []string{tunnelSockPath(), forwardSockPath()} {
+		conn, err := net.DialTimeout("unix", sockPath, time.Second)
+		if err == nil {
+			_ = conn.Close()
+			return true
+		}
 	}
-	_ = conn.Close()
-	return true
+	return false
 }
 
 // taskSupervisorBackend 尽力而为地构造任务后端(TaskSupervisorBackend):建不出来(中转不可达)
