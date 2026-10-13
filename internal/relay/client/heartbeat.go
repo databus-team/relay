@@ -48,7 +48,7 @@ func (c *Client) startHeartbeat(ctx context.Context) {
 			}
 
 			select {
-			case c.sendCh <- sendMsg{Message: &Message{
+			case c.controlCh <- sendMsg{Message: &Message{
 				Type: protocol.MsgPing,
 				ID:   uuid.New().String(),
 				Payload: protocol.Heartbeat{
@@ -56,7 +56,7 @@ func (c *Client) startHeartbeat(ctx context.Context) {
 				},
 			}}:
 			default:
-				// sendCh 暂时饱和,写循环正在高密输出数据帧,无需阻塞等待
+				// controlCh 暂时饱和(极罕见),无需阻塞等待
 			}
 		}
 	}

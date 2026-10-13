@@ -29,7 +29,8 @@ type Client struct {
 	writeOnce sync.Once    // 保证 writeLoop 终身仅一条:重复 Connect/重连不复启,杜绝并发写同一 conn
 	connected atomic.Bool
 
-	sendCh    chan sendMsg
+	controlCh chan sendMsg // 独立控制信令队列(心跳 Ping/Pong、状态、注册、RPC 响应),享有绝对发送优先权
+	sendCh    chan sendMsg // 普通数据队列(流式传输、大块二进制、隧道帧)
 	recvCh    chan *protocol.Message
 	eventCh   chan protocol.FileEvent
 	pending   map[string]chan *protocol.Response
@@ -92,7 +93,8 @@ func New(url, token, id string, opts ...Option) (*Client, error) {
 		url:           url,
 		token:         token,
 		id:            id,
-		sendCh:        make(chan sendMsg, 100),
+		controlCh:     make(chan sendMsg, 256),
+		sendCh:        make(chan sendMsg, 512),
 		recvCh:        make(chan *protocol.Message, 100),
 		eventCh:       make(chan protocol.FileEvent, 100),
 		pending:       make(map[string]chan *protocol.Response),
@@ -300,25 +302,45 @@ func (c *Client) attachBinaryToStreamData(msg *protocol.Message, raw []byte) {
 	payload["data"] = raw
 }
 
+func (c *Client) writeSingle(sm sendMsg) {
+	conn := c.getConn()
+	if conn == nil {
+		return
+	}
+	if sm.Message != nil {
+		if err := conn.WriteJSON(sm.Message); err != nil {
+			return
+		}
+		c.lastPong.Store(timeNow())
+	}
+	if len(sm.Raw) > 0 {
+		if err := conn.WriteMessage(websocket.BinaryMessage, sm.Raw); err != nil {
+			return
+		}
+		c.lastPong.Store(timeNow())
+	}
+}
+
 func (c *Client) writeLoop() {
-	// writeLoop 是单例(仅 Connect 启动一次),随 sendCh 常驻;每次写都取当前 conn,
+	// writeLoop 是单例(仅 Connect 启动一次),随 controlCh/sendCh 常驻;每次写都取当前 conn,
 	// 重连后自动写新连接。绝不重复启动,否则两个 goroutine 并发写同一 conn 会 panic。
-	for sm := range c.sendCh {
-		conn := c.getConn()
-		if conn == nil {
-			continue
-		}
-		if sm.Message != nil {
-			if err := conn.WriteJSON(sm.Message); err != nil {
-				continue
+	// 双通道调度: controlCh 享有绝对优先写出权(嵌套非阻塞 select 优先排水),
+	// 确保心跳、RPC 回包、注册等控制信令绝不被高密数据流/隧道帧挤占饿死。
+	for {
+		select {
+		case <-c.closeCh:
+			return
+		case sm := <-c.controlCh:
+			c.writeSingle(sm)
+		default:
+			select {
+			case <-c.closeCh:
+				return
+			case sm := <-c.controlCh:
+				c.writeSingle(sm)
+			case sm := <-c.sendCh:
+				c.writeSingle(sm)
 			}
-			c.lastPong.Store(timeNow())
-		}
-		if len(sm.Raw) > 0 {
-			if err := conn.WriteMessage(websocket.BinaryMessage, sm.Raw); err != nil {
-				continue
-			}
-			c.lastPong.Store(timeNow())
 		}
 	}
 }
@@ -337,6 +359,16 @@ func (c *Client) fireOnReconnect() {
 	c.onReconnectMu.Unlock()
 	if fn != nil {
 		go fn()
+	}
+}
+
+// sendControlMessage 将一条高优先级控制协议消息入队(信令专用通道)。
+func (c *Client) sendControlMessage(msg *protocol.Message) error {
+	select {
+	case c.controlCh <- sendMsg{Message: msg}:
+		return nil
+	case <-c.closeCh:
+		return fmt.Errorf("client closed")
 	}
 }
 
@@ -442,7 +474,7 @@ func (c *Client) handleMessage(msg protocol.Message) {
 			}
 		}
 		select {
-		case c.sendCh <- sendMsg{Message: &protocol.Message{
+		case c.controlCh <- sendMsg{Message: &protocol.Message{
 			Type:      protocol.MsgPong,
 			ID:        uuid.New().String(),
 			RequestID: msg.ID,
@@ -507,7 +539,7 @@ func (c *Client) Request(ctx context.Context, msgType protocol.MessageType, payl
 	}()
 
 	select {
-	case c.sendCh <- sendMsg{Message: msg}:
+	case c.controlCh <- sendMsg{Message: msg}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -533,7 +565,7 @@ func (c *Client) sendAndWait(ctx context.Context, msg *protocol.Message) (*proto
 	}()
 
 	select {
-	case c.sendCh <- sendMsg{Message: msg}:
+	case c.controlCh <- sendMsg{Message: msg}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}

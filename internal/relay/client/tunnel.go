@@ -42,8 +42,8 @@ const tunnelWriteTimeout = 60 * time.Second
 //     SOCKS 连接通道)承载双向字节泵。
 // 两表互斥(同一条隧道只会是一个端点),但按 streamID 独立、天然支持多隧道并行。
 
-// tunnelWriteQueue 每条入站隧道出站写队列深度。队列是每个隧道独立的,单个慢目标不会挤占别的隧道。
-const tunnelWriteQueue = 64
+// tunnelWriteQueue 每条入站隧道出站写队列深度。扩充至 512 (约 16MB 突发缓冲),适应流式恢复大块数据。
+const tunnelWriteQueue = 512
 
 // errTunnelBacklog 入站隧道出站队列满(目标消费太慢)时中止整条隧道的错误。fail-closed:
 // 不丢字节、不无限积压,而是拆除并通知,避免在 readLoop 里同步写造成 head-of-line 阻塞。
@@ -343,7 +343,7 @@ func (c *Client) tunnelOpen(ctx context.Context, executorID, target string, port
 		ts := &TunnelStream{
 			client:  c,
 			ID:      id,
-			dataCh:  make(chan []byte, 64),
+			dataCh:  make(chan []byte, 512),
 			errCh:   make(chan error, 1),
 			closeCh: make(chan struct{}),
 		}

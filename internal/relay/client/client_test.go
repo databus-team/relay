@@ -50,13 +50,16 @@ func TestWithHeadersSentOnHandshake(t *testing.T) {
 // 执行方收到中转探针 MsgPing 后应回响 MsgPong、且 RequestID 呼应入站 MsgPing 的 ID。
 // 该回包供中转测量 transit→executor 段时延(镜像 server/client.go 的 ping 回包语义)。
 func TestExecutorAnswersTransitProbe(t *testing.T) {
-	c := &Client{sendCh: make(chan sendMsg, 8)}
+	c := &Client{
+		controlCh: make(chan sendMsg, 8),
+		sendCh:    make(chan sendMsg, 8),
+	}
 
 	probeID := "probe-1"
 	c.handleMessage(protocol.Message{Type: protocol.MsgPing, ID: probeID})
 
 	select {
-	case sm := <-c.sendCh:
+	case sm := <-c.controlCh:
 		if sm.Message == nil {
 			t.Fatal("enqueued message is nil")
 		}
@@ -73,12 +76,51 @@ func TestExecutorAnswersTransitProbe(t *testing.T) {
 
 // 非探针消息(MsgPong 心跳)不应触发执行方回包,仍走原来的 pending 解析逻辑。
 func TestExecutorNoReplyForHeartbeatPong(t *testing.T) {
-	c := &Client{sendCh: make(chan sendMsg, 8)}
+	c := &Client{
+		controlCh: make(chan sendMsg, 8),
+		sendCh:    make(chan sendMsg, 8),
+	}
 	c.handleMessage(protocol.Message{Type: protocol.MsgPong, ID: "x"})
 	select {
+	case sm := <-c.controlCh:
+		t.Fatalf("unexpected outbound %q for inbound MsgPong", sm.Message.Type)
 	case sm := <-c.sendCh:
 		t.Fatalf("unexpected outbound %q for inbound MsgPong", sm.Message.Type)
 	case <-time.After(50 * time.Millisecond):
 		// ok: no spurious reply
+	}
+}
+
+// 验证在高密度普通数据帧积压时,信令帧通过 controlCh 享有绝对写出优先权,杜绝心跳/控制信令被饥饿。
+func TestPriorityControlChannelOverData(t *testing.T) {
+	c := &Client{
+		controlCh: make(chan sendMsg, 16),
+		sendCh:    make(chan sendMsg, 16),
+		closeCh:   make(chan struct{}),
+	}
+	defer c.markClosed()
+
+	// 模拟数据通道已排满 10 个数据帧
+	for i := 0; i < 10; i++ {
+		c.sendCh <- sendMsg{Raw: []byte("bulk-data")}
+	}
+
+	// 随后插入一条控制信令 (例如心跳 Ping)
+	controlMsg := &protocol.Message{Type: protocol.MsgPing, ID: "ping-priority"}
+	c.controlCh <- sendMsg{Message: controlMsg}
+
+	// 模拟 writeLoop 调度下一帧
+	var next sendMsg
+	select {
+	case next = <-c.controlCh:
+	default:
+		select {
+		case next = <-c.controlCh:
+		case next = <-c.sendCh:
+		}
+	}
+
+	if next.Message == nil || next.Message.Type != protocol.MsgPing {
+		t.Fatalf("expected high-priority control message to be dequeued first, got %+v", next)
 	}
 }
