@@ -540,7 +540,7 @@ func TestReadTunnelLogTail(t *testing.T) {
 	if err := os.WriteFile(logPath, []byte(b.String()), 0o644); err != nil {
 		t.Fatalf("write log: %v", err)
 	}
-	got, err := readTunnelLogTail(logPath, "eg-x", 3)
+	got, err := readTunnelLogTail(logPath, 3, func(line string) bool { return tunnelLogLineMatches(line, "eg-x") })
 	if err != nil {
 		t.Fatalf("readTunnelLogTail: %v", err)
 	}
@@ -564,7 +564,7 @@ func TestReadTunnelLogTail(t *testing.T) {
 	if fi, _ := os.Stat(bigPath); fi.Size() <= 64*1024 {
 		t.Fatalf("big log too small (%d bytes) to exercise window growth", fi.Size())
 	}
-	gotBig, err := readTunnelLogTail(bigPath, "eg-y", 2)
+	gotBig, err := readTunnelLogTail(bigPath, 2, func(line string) bool { return tunnelLogLineMatches(line, "eg-y") })
 	if err != nil {
 		t.Fatalf("readTunnelLogTail big: %v", err)
 	}
@@ -573,7 +573,89 @@ func TestReadTunnelLogTail(t *testing.T) {
 	}
 
 	// 3. 缺失文件 → 返回 os.IsNotExist 可识别的错误(供 showTunnelLogs 决定是否补提示)。
-	if _, err := readTunnelLogTail(filepath.Join(dir, "absent.log"), "eg-x", 3); !os.IsNotExist(err) {
+	if _, err := readTunnelLogTail(filepath.Join(dir, "absent.log"), 3, func(line string) bool { return tunnelLogLineMatches(line, "eg-x") }); !os.IsNotExist(err) {
 		t.Fatalf("missing file err = %v, want IsNotExist", err)
+	}
+}
+
+// TestForwardToPSRow 覆盖独立转发行的投影:身份是端口、NODE 列是 executor(出网点)、
+// PORTS 列是端口规格、Egress 置 executor 供出口探测复用。
+func TestForwardToPSRow(t *testing.T) {
+	started := time.Now().Add(-2 * time.Minute)
+	row := forwardToPSRow(forwardState{
+		Port:     7001,
+		Executor: "eg-node",
+		Spec:     PortForwardSpec{BindHost: "127.0.0.1", LocalPort: 7001, RemoteHost: "127.0.0.1", RemotePort: 7001},
+		Restart:  tunRestartAlways,
+		State:    "running",
+		Started:  started,
+	})
+	if row.Type != "forward" {
+		t.Errorf("Type = %q, want forward", row.Type)
+	}
+	if row.ID != "7001" || row.Node != "eg-node" || row.Egress != "eg-node" {
+		t.Errorf("unexpected identity fields: %+v", row)
+	}
+	if row.Status != "running" || row.Ports != "7001" { // 回环绑定经 spec.String() 展示为 "7001"
+		t.Errorf("unexpected status/ports: %+v", row)
+	}
+	if row.Exit != "-" {
+		t.Errorf("Exit = %q, want -", row.Exit)
+	}
+	if row.Command != "forward 7001" {
+		t.Errorf("Command = %q, want %q", row.Command, "forward 7001")
+	}
+	if row.Restart != tunRestartAlways {
+		t.Errorf("Restart = %q", row.Restart)
+	}
+	if !strings.HasSuffix(row.Created, "ago") {
+		t.Errorf("Created = %q, want relative time", row.Created)
+	}
+
+	stopped := forwardToPSRow(forwardState{Port: 7002, Executor: "eg-y", State: "stopped"})
+	if stopped.Created != "-" {
+		t.Errorf("zero Started Created = %q, want -", stopped.Created)
+	}
+	if stopped.Status != "stopped" {
+		t.Errorf("Status = %q, want stopped", stopped.Status)
+	}
+}
+
+// TestForwardLogLineMatches 覆盖 `[forward <port>]` 前缀匹配:必须连右括号一起匹配,防 7001 误吞 70012。
+func TestForwardLogLineMatches(t *testing.T) {
+	cases := []struct {
+		line string
+		port int
+		want bool
+	}{
+		{"[forward 7001] connect to 127.0.0.1:7001 via eg failed: dial timeout", 7001, true},
+		{"[forward 7001] restored (running)", 7001, true},
+		{"[forward 7002] restored (running)", 7001, false},
+		{"[forward 70012] restored (running)", 7001, false},
+		{"[Node] Port-forward holder listening", 7001, false},
+		{"", 7001, false},
+	}
+	for _, c := range cases {
+		if got := forwardLogLineMatches(c.line, c.port); got != c.want {
+			t.Errorf("forwardLogLineMatches(%q, %d) = %v, want %v", c.line, c.port, got, c.want)
+		}
+	}
+}
+
+// TestFilterForwards 覆盖 relay ps 的转发行过滤:按 executor 精确过滤,all=false 仅留 running。
+func TestFilterForwards(t *testing.T) {
+	states := []forwardState{
+		{Port: 7001, Executor: "eg-x", State: "running"},
+		{Port: 7002, Executor: "eg-x", State: "stopped"},
+		{Port: 7003, Executor: "eg-y", State: "running"},
+	}
+	if got := filterForwards(states, "", false); len(got) != 2 {
+		t.Errorf("default filter = %d rows, want 2 running", len(got))
+	}
+	if got := filterForwards(states, "eg-x", false); len(got) != 1 || got[0].Port != 7001 {
+		t.Errorf("executor eg-x filter = %+v, want just 7001", got)
+	}
+	if got := filterForwards(states, "", true); len(got) != 3 {
+		t.Errorf("all filter = %d rows, want 3", len(got))
 	}
 }

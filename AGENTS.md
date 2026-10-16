@@ -57,17 +57,18 @@ relay/
 |------|----------|-------|
 | All subcommands & dispatch | `cmd/relay/main.go` | kingpin wiring; one `run*()` per command |
 | `node` (hub + agent) | `cmd/relay/node.go` + `cmd/relay/server.go` | `runNode()` starts the hub role (`buildServerInstance`) and/or the agent role (watcher); `transitSelfUpgrade` is the injected swap closure |
-| `run` (alias `exec`) | `cmd/relay/main.go` → `runExec` | Creates both object kinds: a task (default) or, with `-t tunnel`, a node-held SOCKS5 tunnel |
+| `run` (alias `exec`) | `cmd/relay/main.go` → `runExec` | Creates one of three object kinds: a task (default), or with `-t tunnel` a node-held SOCKS5 tunnel, or with `-t forward` a node-held port-forward-only |
+| `run -t forward` wiring | `cmd/relay/forward.go` + `cmd/relay/forward_holder.go` | Port-forward-only is a **first-class node-held object** (mirror of tunnel): the local node holds the listener and pumps each conn via `handlePortForwardConn` → `TunnelOpenPortForward`; intent persisted to `~/.relay/forwards.json` (object format `{tasks, forwards}`) and replayed on node restart by `restart` policy |
 | Tunnels (SOCKS5) | `cmd/relay/tunnel.go` + `cmd/relay/tunnel_holder.go` | Created by `relay run -t tunnel`; CLI sends control (open/close/restart/list) over `~/.relay/tunnel.sock`; SOCKS5 handshake, egress executor via `-e`/`--executor` |
 | `status` | `cmd/relay/main.go` → `runStatus`/`printStatus` | Deployment-wide latency + version ledger |
 | `ws` (alias `workspaces`) | `runWorkspaces`/`resolveWatches` | List/JSON/verbose workspace table |
 | `sync` (`-e` target executor) | `runSync` | WS streaming to executor, or cmd-file fallback |
 | `push` (direct + `--no-jobs`/`--dest`) | `runPush` · `runLocalJobsForPush` | Direct-to-executor with jobs, or transport-only |
 | `exec` / `run` | `runExec` | Streaming via `ExecStreamBackend`; git diff sync **default-on** (`--no-sync` to skip, `-f` to force); `-d` (detach); `-t tunnel` creates a tunnel instead; 30s foreground cap |
-| `ps` | `runPs` | List managed tasks (RESTART policy, first-created CREATED) and node-held tunnels across nodes (a tunnel row's CREATED is its last bind) |
-| `logs` | `runLogs` | Tail / stream task or tunnel logs (`-f`, `--tail`) |
+| `ps` | `runPs` | List managed tasks (RESTART policy, first-created CREATED), node-held tunnels, and node-held port-forwards across nodes (a tunnel/forward row's CREATED is its last bind; TYPE=forward rows carry egress reachability like tunnels) |
+| `logs` | `runLogs` | Tail / stream task, tunnel, or forward logs (`-f`, `--tail`) |
 | `stop` | `runStop` | Terminate a task process group (and clear its restart policy) or close+forget a tunnel |
-| `start` / `restart` | `runStart` / `runRestart` | Root lifecycle verbs by name (task id or tunnel egress); `start` never creates and never restarts a running object |
+| `start` / `restart` | `runStart` / `runRestart` | Root lifecycle verbs by name (task id, tunnel egress, or forward port); `start` never creates and never restarts a running object |
 | `undo` | `cmd/relay/git_ops.go` | Restore remote workspace shadow snapshot |
 | `diff` | `cmd/relay/git_ops.go` | Compare local/remote Git drift & conflict warning |
 | `job run` | `runJobRun` | Run one config job locally |
@@ -182,14 +183,15 @@ CLI usage (key forms):
 relay node [run|start|stop|status|restart|upgrade]  # unified peer node daemon (hub + agent roles)
 relay run [-w <workspace> | --node <node-id>] [-p <port>] [--no-sync] [-f] [-d [--restart=always|no]] <cmd...> # direct run / exec (Docker-style -p; --restart/--no-restart requires -d)
 relay run -t|--type=tunnel -p <[host:]port> -e <egress> [--restart=always|no]  # create a node-held SOCKS5 tunnel (no command, no -d/-w)
+relay run -t|--type=forward -p <[bind:]local[:remote_host:remote_port]> -e <executor> [--restart=always|no]  # create a node-held port-forward-only (no command, no -d/-w); listen face kept by the local node, target dialed via the executor
 relay exec [-w <workspace> | --node <node-id>] [-p <port>] [--no-sync] [-f] [-d] <cmd...>  # git diff sync default-on; -d = detached (30s foreground cap)
 relay nodes [-u|--usage] [--json] [--prune-offline]   # cluster-wide peer nodes & topology state; shows known-offline nodes, --prune-offline drops them (alias: node ls, status)
 relay push [-w <workspace> | --node <node-id>] <file> [--no-jobs] [--dest <abs>]
-relay ps [--node <node-id>] [-a]                       # list tasks (TaskSupervisor) + node-held tunnels; RESTART policy column, CREATED = first-created (task) / last bind (tunnel)
-relay logs [--node <node-id>] <task-id|egress> [-f] [--tail N] # tail / stream task or tunnel logs
-relay stop [--node <node-id>] <task-id|egress>         # terminate task process tree (clears its restart policy) or close+forget a tunnel
-relay start [--node <node-id>] <task-id|egress>        # reopen an existing task/tunnel (never creates one)
-relay restart [--node <node-id>] <task-id|egress>      # stop the live instance (if any) then reopen it
+relay ps [--node <node-id>] [-a]                       # list tasks (TaskSupervisor) + node-held tunnels + port-forwards; TYPE=forward rows, STATUS carries egress reachability; RESTART column; CREATED = first-created (task) / last bind (tunnel|forward)
+relay logs [--node <node-id>] <task-id|egress|port> [-f] [--tail N] # tail / stream task, tunnel, or forward logs
+relay stop [--node <node-id>] <task-id|egress|port>    # terminate task process tree (clears its restart policy) or close+forget a tunnel/forward
+relay start [--node <node-id>] <task-id|egress|port>   # reopen an existing task/tunnel/forward (never creates one)
+relay restart [--node <node-id>] <task-id|egress|port> # stop the live instance (if any) then reopen it
 relay diff [--node <node-id>] [-w <workspace>]         # inspect drift & conflict warning
 relay undo [--node <node-id>] [-w <workspace>] [--list|--snapshot <ref>] # restore remote snapshot
 relay job run [-w <id>] <jobid> [file]
@@ -210,6 +212,11 @@ Pass `-c <config>` (default `~/.relay/config.yaml`) to share one config across e
 - **Node addressing ⊥ job routing.** Layering split: `executor_id` = an executor's node identity (its `backend.config.executor_id`), used for registration and as the routing key for exec/push/sync/tunnel/status; `watch`/`watch_dir` = a transit storage directory (id = a workspace id). `relay exec`/`push` accept either `-w <workspace>` (route to that workspace's bound executor) or `-e/--executor <executor_id>` (address a specific node directly, no workspace binding needed); a tunnel takes only `-e/--executor` (there is no workspace half). A running executor with no bound workspace (e.g. extranet) is still addressable via `--executor`, which is what the deploy script uses.
 - **Push direct + fallback.** On `relay push`, the relay backend uses `PushJobSender` to fan the file directly to the target executor through the transit (never the shared-dir → staged by the transit), and the executor runs its workspace jobs locally, streaming the job output back. `--no-jobs`/`--dest` uses `PushNoJobsSender` (transport-only). If no online executor is registered for that workspace (`executor: none`), the push **falls back** to staging the file on the transit watch dir (watch-pull) — this fallback is verified in `TestEndToEnd_PushJobNoExecutorFallback`.
 - **Tunnel `network_allow` fail-closed.** The **local `relay node` (agent role)** holds the SOCKS5 listener and pumps each CONNECT to the chosen executor via the transit; the tunnel is **created by `relay run -t tunnel`** and thereafter operated by the **root lifecycle verbs** (`relay start|restart|stop|logs <egress>`), which send open/close/restart control messages over `~/.relay/tunnel.sock`, while reads go through `relay ps` (TYPE `tunnel` rows, backed by the same socket's `list`; the row's STATUS also carries egress reachability from the cluster ledger, degrading to `unknown` when the transit can't be queried) and `relay logs <egress>`; the tunnel intent (egress/listen/restart) is persisted to `~/.relay/tunnels.json` for replay on node restart (`--restart=always|no`). The **executor** validates the destination against its `backend.config.network_allow` (host/IP/CIDR + optional `@port` list/range). Unlisted targets are rejected by default (fail-closed); an empty/absent `network_allow` denies all. Server gates the channel behind `server.tunnel_enabled` + `max_tunnels` (default 256). Non-loopback listen prints a warning (no auth on the tunnel itself).
+- **Port-forward-only is a first-class node-held object (mirror of tunnel).** `relay run -t|--type=forward -p <[bind:]local[:remote_host:remote_port]> -e <executor> [--restart]` creates a listener held by the local `relay node` (no command, no keep-alive task). It is intended to replace the `relay run -d -p ... 'echo alive && tail -f /dev/null'` hack, which can leave a **zombie forward**: when the keep-alive task's `timeout` expires the task goes `failed` but the registered listener stays (the holder replays `forwards.json` unconditionally and the task row vanishes from the default `relay ps`), so the port accepts then the tunnel to the (dead) remote target is immediately closed. The first-class forward avoids this because its liveness no longer depends on any task.
+  - **Identity = local_port** (decimal), addressing via the root verbs (`relay stop 7001`); `relay run -t forward` takes exactly one `-p`.
+  - **Two object kinds coexist in `forward_holder.go`**: task-bound forwards (`register`/`unregister`, grouped by `task_id`, shown only in a task row's PORTS column) and standalone forwards (`open`/`close`/`restart`/`list`, keyed by `byID map[int]`). They are **structurally separated**: `byTask` vs `byID`, sharing `byAddr` only as the conflict-detection domain. Consequence: a standalone forward is never projected into the `tasks` list (which would be skipped by restore's empty-`TaskID` branch and silently lost on node restart), and `opUnregister` (empty `task_id`) never touches it.
+  - **`forwards.json` migrated to an object format** `{tasks: []fwdIntent, forwards: []forwardState}`; reads stay compatible with the legacy top-level array (all treated as `tasks`), writes always the object format. A standalone `forwardState` embeds the full spec (bind/local/remote host+port) so restore can re-dial the tunnel; note a legacy binary's `[]fwdIntent` unmarshal of the object file fails → it skips all restores, so node + CLI must upgrade together.
+  - **Data plane is shared**: `handlePortForwardConn` → `TunnelOpenPortForward` (port-forward mode bypasses `network_allow`); each conn pumps local TCP ↔ TunnelStream. Status probe & logs mirror tunnels: TYPE=forward rows get egress reachability, `relay logs <port>` greps `[forward <port>]` prefixed lines from node.log.
 - **`nodes` 拓扑与资源发现 (轻量默认 + `--usage` 动态探测).** `relay nodes` (别名 `status`) 统一呈现全网拓扑、节点角色、平台架构、资源规格与网络 RTT：
   - **容器与 Pod 隔离感知**：针对 Hub 运行于 K8s Pod 场景，自动适配 cgroup v1/v2，精准获取容器配额（`cpu.max`/`cfs_quota_us` 与 `memory.max`/`limit_in_bytes`），避免误读宿主机物理资源，并追加 `[pod]` 标识；
   - **轻量低开销**：默认列仅显示静态 CPU 核心配额与内存限制（注册与本地秒级解析，零网络重负）；

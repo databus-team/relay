@@ -121,7 +121,7 @@ func StartPortForwardsForeground(ctx context.Context, rb *relaybackend.RelayBack
 				if err != nil {
 					return
 				}
-				go handlePortForwardConn(ctx, rb, targetExec, s, conn)
+				go handlePortForwardConn(ctx, rb, targetExec, s, conn, nil)
 			}
 		}(ln, spec)
 	}
@@ -129,12 +129,19 @@ func StartPortForwardsForeground(ctx context.Context, rb *relaybackend.RelayBack
 	return cleanup, nil
 }
 
-func handlePortForwardConn(ctx context.Context, rb *relaybackend.RelayBackend, targetExec string, spec *PortForwardSpec, conn net.Conn) {
+// handlePortForwardConn 泵一条本地端口连接:本地 TCP -> TunnelStream -> 远端目标。
+// logf 非 nil 时连接级错误经它路由(holder 传入带 [forward <port>] 前缀的日志器,供 relay logs
+// 过滤);nil 时按前台路径打到 stderr(见 StartPortForwardsForeground)。
+func handlePortForwardConn(ctx context.Context, rb *relaybackend.RelayBackend, targetExec string, spec *PortForwardSpec, conn net.Conn, logf func(format string, args ...any)) {
 	defer conn.Close()
 
 	stream, err := rb.TunnelOpenPortForward(ctx, targetExec, spec.RemoteHost, uint16(spec.RemotePort))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[port-forward error] connect to %s:%d via %s failed: %v\n", spec.RemoteHost, spec.RemotePort, targetExec, err)
+		if logf != nil {
+			logf("connect to %s:%d via %s failed: %v", spec.RemoteHost, spec.RemotePort, targetExec, err)
+		} else {
+			fmt.Fprintf(os.Stderr, "[port-forward error] connect to %s:%d via %s failed: %v\n", spec.RemoteHost, spec.RemotePort, targetExec, err)
+		}
 		return
 	}
 	defer stream.Close()

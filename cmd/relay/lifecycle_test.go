@@ -82,6 +82,7 @@ func TestResolveLifecycle(t *testing.T) {
 		wantNode        string
 		wantTask        bool
 		wantTunnel      bool
+		wantForward     bool
 		wantNodeRunning bool
 		wantUnreach     bool
 	}{
@@ -131,6 +132,39 @@ func TestResolveLifecycle(t *testing.T) {
 			deps:     lifecycleDeps{Target: "eg-a", NodeRunning: true, ListTasks: func() ([]backend.TaskInfo, error) { return []backend.TaskInfo{task}, nil }, Tunnels: noTun},
 			wantKind: lifecycleKindTask, wantNode: "eg-a", wantTask: true,
 		},
+		{
+			name:       "独立转发生命(端口为名)",
+			targetName: "7001",
+			deps: lifecycleDeps{NodeRunning: true, ListTasks: noTask, Tunnels: noTun,
+				Forwards: func() ([]forwardState, error) {
+					return []forwardState{{Port: 7001, Executor: "eg-f", State: "running"}}, nil
+				}},
+			wantKind: lifecycleKindForward, wantNode: "eg-f", wantForward: true, wantNodeRunning: true,
+		},
+		{
+			name:       "任务/隧道都无,转发命中(node 未运行也可解析)",
+			targetName: "7001",
+			deps: lifecycleDeps{NodeRunning: false, ListTasks: noTask, Tunnels: noTun,
+				Forwards: func() ([]forwardState, error) {
+					return []forwardState{{Port: 7001, Executor: "eg-f", State: "stopped"}}, nil
+				}},
+			wantKind: lifecycleKindForward, wantNode: "eg-f", wantForward: true, wantNodeRunning: false,
+		},
+		{
+			name:       "三向同名(任务 id == 隧道 egress == 转发端口)仍任务优先(R3)",
+			targetName: "7001",
+			deps: lifecycleDeps{NodeRunning: true,
+				ListTasks: func() ([]backend.TaskInfo, error) {
+					return []backend.TaskInfo{{ID: "7001", Node: "eg-task", Status: taskStatusRunning}}, nil
+				},
+				Tunnels: func() ([]tunnelState, error) {
+					return []tunnelState{{Egress: "7001", Listen: "127.0.0.1:9", State: "stopped"}}, nil
+				},
+				Forwards: func() ([]forwardState, error) {
+					return []forwardState{{Port: 7001, Executor: "eg-f", State: "running"}}, nil
+				}},
+			wantKind: lifecycleKindTask, wantNode: "eg-task",
+		},
 	}
 
 	for _, c := range cases {
@@ -149,8 +183,14 @@ func TestResolveLifecycle(t *testing.T) {
 			if c.wantTunnel && !(got.Kind == lifecycleKindTunnel && got.State.Egress == c.wantNode) {
 				t.Errorf("want tunnel egress %s, got %+v", c.wantNode, got)
 			}
+			if c.wantForward && !(got.Kind == lifecycleKindForward && got.Forward.Port == 7001) {
+				t.Errorf("want forward port 7001, got %+v", got)
+			}
 			if c.wantKind == lifecycleKindTunnel && got.NodeRunning != c.wantNodeRunning {
 				t.Errorf("NodeRunning = %v, want %v", got.NodeRunning, c.wantNodeRunning)
+			}
+			if c.wantKind == lifecycleKindForward && got.NodeRunning != c.wantNodeRunning {
+				t.Errorf("forward NodeRunning = %v, want %v", got.NodeRunning, c.wantNodeRunning)
 			}
 			if c.wantUnreach && got.Unreachable == "" {
 				t.Errorf("expected Unreachable set, got empty")

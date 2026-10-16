@@ -181,8 +181,8 @@ relay run --type=tunnel -p 0.0.0.0:1080 -e site-a --restart=always
 
 Forwards a command to the remote side for execution. Requires a backend that supports `Exec` (local, fs_mcp, relay). The `-w` flag sets the working directory to the watch's `local_dir`. When omitted, `-w` is inferred from the cwd when it can be; otherwise `run/exec` falls back to its no-workspace behavior. Use `--node / -e <id>` to address a specific node by its ID directly.
 - **`-p, --publish [host:][local:]remote`**: Forward local ports to the remote command (e.g. `-p 8080`, `-p 3000:8080`, or `-p 0.0.0.0:8080` to bind a non-loopback host), automatically tearing down the forwarders when the command exits. Temporary development port forwards do not require `network_allow` whitelist rules.
-- **`-t, --type task|tunnel`**: what `relay run` creates. Default `task` runs a command on the remote; `tunnel` creates a node-held SOCKS5 tunnel *instead* — exactly one `-p <[host:]port>` (no default, no remote half), the egress picked by `-e/--executor`, and no positional command. Task-only flags (`-d`, `--no-sync`, `-f`, `-w`) are rejected in tunnel mode rather than ignored. See the [tunnel section](#tunnel--local-socks5-egress-tunnel).
-- **`--restart always|no` / `--no-restart`**: the restart policy. For tasks it requires `-d` (a foreground run has no managed task to carry it) and is written to the task metadata; in tunnel mode it is written to the tunnel intent. In both cases the only recovery event is the next start of the owning daemon (executor for tasks, local node for tunnels).
+- **`-t, --type task|tunnel|forward`**: what `relay run` creates. Default `task` runs a command on the remote; `tunnel` creates a node-held SOCKS5 tunnel *instead*; `forward` creates a **node-held port-forward-only** *instead*. Both non-task modes take exactly one `-p` (`tunnel`: `[host:]port`, no remote half; `forward`: `[bind:]local[:remote_host:remote_port]`), pick the egress via `-e/--executor`, and take no positional command. Task-only flags (`-d`, `--no-sync`, `-f`, `-w`) are rejected in both non-task modes rather than ignored. See the [tunnel section](#tunnel--local-socks5-egress-tunnel) and [port-forward-only](#port-forward-only).
+- **`--restart always|no` / `--no-restart`**: the restart policy. For tasks it requires `-d` (a foreground run has no managed task to carry it) and is written to the task metadata; in tunnel/forward mode it is written to the intent. In all cases the only recovery event is the next start of the owning daemon (executor for tasks, local node for tunnels/forwards).
 - **Detach + publish (`` `relay run -d -p `...` ``)** keeps the local ports alive after the CLI exits via the local `relay node` daemon. The node runs as `agent` (omitting `node.roles` defaults to `agent`; an explicit `roles: [hub]` is rejected with a clear error); `relay run -d -p` auto-starts it if needed. The local control socket `~/.relay/forward.sock` accepts register/unregister from any local process (unauthenticated) — keep the machine trusted; it is not exposed over the network.
 - **Git sync (ON by default — opt out with `--no-sync`):** Automatically detects uncommitted local Git modifications and untracked files, packs an incremental diff payload, and applies it to the remote workspace before executing the command. Includes base commit drift validation and automatic remote shadow snapshot backup (`refs/relay/backups/*`). Note: it carries **only the local working-tree diff, never unpushed commits**, and its source is the workspace's `local_dir` — which must be a valid Git repo **on the CLI machine** (otherwise sync is silently skipped).
 - `-f, --force-remote`: Force a sync even when the local tree is clean (creates a shadow snapshot on the remote first, then overwrites remote state).
@@ -210,8 +210,9 @@ tunnel site-a                site-a running 127.0.0.1:1080 always  -    3m ago  
 Column widths come from the content, and the table adapts to the terminal: when the output is wider than
 the window it is narrowed (never wrapped) and over-long cells end in `...`. `--json` is lossless.
 
-Rows come in two kinds, distinguished by the `TYPE` column: `task` rows are remote detach tasks and
-`tunnel` rows are node-held tunnels (egress in `COMMAND`, listen address in `PORTS`).
+Rows come in three kinds, distinguished by the `TYPE` column: `task` rows are remote detach tasks,
+`tunnel` rows are node-held SOCKS5 tunnels (egress in `COMMAND`, listen address in `PORTS`), and
+`forward` rows are node-held port-forwards (identity is the local port, executor in `NODE`).
 
 - **`RESTART`** is the object's restart policy (`always`/`no`) — for a task the value recorded in its
   metadata by `relay run -d --restart=...`, for a tunnel the value in its intent.
@@ -238,6 +239,7 @@ Subscribes to live task output broadcast or retrieves persisted log entries from
 ```bash
 relay stop -e node-1 t-a1b2c3d4-1718000000   # task, by ID
 relay stop site-a                            # tunnel, by egress
+relay stop 7001                              # port-forward, by local port
 ```
 
 Stops a running task. The executor cleans up the entire process tree using process groups/signals on Unix or `taskkill /T /F` on Windows, leaving no orphaned server processes behind.
@@ -250,14 +252,16 @@ semantics: it closes the listener and **removes the intent**, so the tunnel is f
 ### start / restart — Reopen an Existing Task or Tunnel
 
 `relay run` creates objects; `start` and `restart` only act on objects that already exist. Both name the
-object the same way — a **task ID** or a **tunnel egress** — and both are refused if the name is unknown
+object the same way — a **task ID**, a **tunnel egress**, or a **forward port** — and all are refused if the name is unknown
 (with a pointer at how to create one). When a name matches a task and a tunnel at once, the task wins.
 
 ```bash
 relay start t-a1b2c3d4-1718000000   # re-run a stopped/exited task under the same ID
 relay start site-a                  # reopen a stopped node-held tunnel on its recorded listen address
+relay start 7001                    # reopen a stopped node-held port-forward on its recorded port
 relay restart t-a1b2c3d4-1718000000 # same, but stop the live instance first
 relay restart site-a                # same, for a tunnel
+relay restart 7001                  # same, for a forward
 ```
 
 - **`start` never creates.** If nothing has that name, it errors instead of building one — use `relay run`
@@ -671,6 +675,37 @@ network_allow:
 network_allow:
   - "172.16.0.0/12"
 ```
+
+### port-forward-only — Node-Held TCP Port Forward
+
+Creates a TCP port forward whose listener is held by the **local `relay node`** daemon — no command, no
+detach task, no keep-alive process. It is the intended way to publish a port to a remote executor without
+the keep-alive hack below.
+
+```bash
+relay run -t forward -p 7001:7001 -e extranet --restart=always
+# forward 7001 started: 127.0.0.1:7001 -> 127.0.0.1:7001 via extranet (restart=always)
+
+relay ps          # TYPE=forward row, identity=port, executor in NODE, STATUS carries egress latency
+relay logs 7001   # tail the forward's [forward 7001]-prefixed lines in node.log
+relay stop 7001   # close the listener and forget the intent (docker rm semantics)
+relay start 7001  # reopen on the recorded spec (may auto-start the local node)
+```
+
+`-p` takes the same [host:][local:]remote spec as `relay run -d -p`. Because the liveness is owned by the
+local node (not a task), the forward survives as long as the node runs and is replayed on node restart
+according to `--restart=always|no`; intent lives in `~/.relay/forwards.json` and control goes over
+`~/.relay/forward.sock`. It is the clean replacement for:
+
+```bash
+# the keep-alive hack: a dummy task that pins the forward, dies when its timeout expires, and leaves a
+# zombie listener (port accepts then the tunnel to the dead target fails) that `relay ps` won't show
+relay run -d -p 7001:7001 -e extranet 'echo forward-alive && timeout 86400 tail -f /dev/null'
+```
+
+Data-plane behaviour is identical to `relay run -d -p` (port-forward mode bypasses `network_allow`); only
+the lifecycle differs. `relay run -t forward` takes exactly one `-p` and rejects task-only flags `-d`,
+`--no-sync`, `-f`, and `-w`.
 
 ## Relay Backend Configuration
 

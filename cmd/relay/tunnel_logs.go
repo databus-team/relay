@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"os/user"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -30,9 +31,14 @@ func tunnelLogLineMatches(line, egress string) bool {
 	return strings.Contains(line, "[tunnel "+egress+"]")
 }
 
-// readTunnelLogTail 有界读取 node 日志中属于 egress 的最后至多 tailLines 行:从文件末尾按窗口
+// forwardLogLineMatches 判断一行日志是否属于指定端口的独立转发。
+func forwardLogLineMatches(line string, port int) bool {
+	return strings.Contains(line, "[forward "+strconv.Itoa(port)+"]")
+}
+
+// readTunnelLogTail 有界读取 node 日志中匹配 matcher 的最后至多 tailLines 行:从文件末尾按窗口
 // 回退读取,命中不足时窗口翻倍(上限为文件大小)。node.log 无轮转、无上限增长,故避免整文件扫描。
-func readTunnelLogTail(logPath, egress string, tailLines int) ([]string, error) {
+func readTunnelLogTail(logPath string, tailLines int, matches func(line string) bool) ([]string, error) {
 	f, err := os.Open(logPath)
 	if err != nil {
 		return nil, err
@@ -71,7 +77,7 @@ func readTunnelLogTail(logPath, egress string, tailLines int) ([]string, error) 
 		}
 		var matched []string
 		for _, line := range strings.Split(text, "\n") {
-			if line != "" && tunnelLogLineMatches(line, egress) {
+			if line != "" && matches(line) {
 				matched = append(matched, line)
 			}
 		}
@@ -94,7 +100,7 @@ func showTunnelLogs(egress string, follow bool, tailLines int) {
 		tailLines = 100
 	}
 	logPath := daemon.LogFile("node")
-	lines, err := readTunnelLogTail(logPath, egress, tailLines)
+	lines, err := readTunnelLogTail(logPath, tailLines, func(line string) bool { return tunnelLogLineMatches(line, egress) })
 	if err != nil {
 		if os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "node log %s not found (the node may be running in the foreground; its tunnel logs go to stderr).\n", shortenPath(logPath))
@@ -108,13 +114,38 @@ func showTunnelLogs(egress string, follow bool, tailLines int) {
 	_ = w.Flush()
 
 	if follow {
-		followTunnelLog(logPath, egress)
+		followTunnelLog(logPath, func(line string) bool { return tunnelLogLineMatches(line, egress) })
 	}
 }
 
-// followTunnelLog 轮询 node 日志新增内容,只打印属于 egress 的行,直到收到 SIGINT/SIGTERM。
+// showForwardLogs 把 `relay logs <port>` 落到 node 日志上,只呈现该独立转发的行。
+// 调用方须先经 resolveLifecycle 确认身份且本机 node 在运行(镜像 showTunnelLogs)。
+func showForwardLogs(port int, follow bool, tailLines int) {
+	if tailLines <= 0 {
+		tailLines = 100
+	}
+	logPath := daemon.LogFile("node")
+	lines, err := readTunnelLogTail(logPath, tailLines, func(line string) bool { return forwardLogLineMatches(line, port) })
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "node log %s not found (the node may be running in the foreground; its forward logs go to stderr).\n", shortenPath(logPath))
+		}
+		return
+	}
+	w := bufio.NewWriter(os.Stdout)
+	for _, l := range lines {
+		fmt.Fprintln(w, l)
+	}
+	_ = w.Flush()
+
+	if follow {
+		followTunnelLog(logPath, func(line string) bool { return forwardLogLineMatches(line, port) })
+	}
+}
+
+// followTunnelLog 轮询 node 日志新增内容,只打印匹配 matcher 的行,直到收到 SIGINT/SIGTERM。
 // 打开一次并持有 fd,每 tick 仅 Stat + 续读;仅在出错或日志被截断时重新定位。
-func followTunnelLog(logPath, egress string) {
+func followTunnelLog(logPath string, matches func(line string) bool) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -175,7 +206,7 @@ func followTunnelLog(logPath, egress string) {
 				}
 				line := pending[:idx]
 				pending = pending[idx+1:]
-				if tunnelLogLineMatches(line, egress) {
+				if matches(line) {
 					fmt.Println(line)
 				}
 			}
