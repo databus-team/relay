@@ -781,14 +781,18 @@ func (b *RelayBackend) handleInboundExec(sess *client.ExecSession) {
 			_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: "supervisor not available"})
 			return
 		}
-		task, err := sup.StartTaskWithPolicy(sess.Cmd(), targetDir, sess.Ports(), sess.Restart(), nil)
+		task, reused, err := sup.EnsureTaskWithPolicy(sess.Cmd(), targetDir, sess.Ports(), sess.Restart(), nil)
 		if err != nil {
 			log.Printf("[exec -d] start task failed: %v", err)
 			_ = sess.Write(false, fmt.Sprintf("start background task failed: %v\n", err))
 			_ = sess.Done(protocol.ExecResponse{ExitCode: 1, Stderr: err.Error()})
 			return
 		}
-		log.Printf("[exec -d] task started: id=%s pid=%d (watch=%s, ports=%v, restart=%s)", task.Meta().ID, task.Meta().PID, sess.ExecutorID(), task.Meta().Ports, task.Meta().Restart)
+		action := "started"
+		if reused {
+			action = "reused"
+		}
+		log.Printf("[exec -d] task %s: id=%s pid=%d (watch=%s, ports=%v, restart=%s)", action, task.Meta().ID, task.Meta().PID, sess.ExecutorID(), task.Meta().Ports, task.Meta().Restart)
 		// 任务 ID 以带标记的单行回写,CLI 端据此前缀精确捕获,避免与任务自身的 stdout 混淆。
 		_ = sess.Write(true, fmt.Sprintf("%s%s\n", protocol.ForwardTaskIDMarker, task.Meta().ID))
 		_ = sess.Done(protocol.ExecResponse{

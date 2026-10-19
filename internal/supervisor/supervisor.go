@@ -221,7 +221,93 @@ func (s *Supervisor) StartTaskWithPorts(cmdStr, cwd string, ports []portfwd.Spec
 func (s *Supervisor) StartTaskWithPolicy(cmdStr, cwd string, ports []portfwd.Spec, restart string, env []string) (*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.startTaskLocked(cmdStr, cwd, ports, restart, env)
+}
 
+// EnsureTaskWithPolicy 是 StartTaskWithPolicy 的幂等版本:命令、工作目录与端口规格都相同的
+// 任务已存在时沿用原 task id,不再创建第二个实例。已有记录但已停止/退出的任务按原 id 重新
+// 拉起;reused 报告本次是否复用了既有任务。restart 策略以本次请求为准。
+// 身份只由 cmd+cwd+ports 决定(执行方不比较 env):同一组端口换个书写顺序或省略默认主机,
+// 仍视为同一任务。
+func (s *Supervisor) EnsureTaskWithPolicy(cmdStr, cwd string, ports []portfwd.Spec, restart string, env []string) (*Task, bool, error) {
+	s.mu.Lock()
+	var match *Task
+	for _, t := range s.tasks {
+		if taskMatchesSpec(t.Meta(), cmdStr, cwd, ports) {
+			match = t
+			break
+		}
+	}
+	if match == nil {
+		defer s.mu.Unlock()
+		task, err := s.startTaskLocked(cmdStr, cwd, ports, restart, env)
+		return task, false, err
+	}
+	s.mu.Unlock()
+
+	// 策略先落地再决定是否重拉:RestartTask 安装新实例时会读取最新策略。
+	match.setRestartPolicy(restart)
+	meta := match.Meta()
+	if meta.Status == StatusRunning {
+		return match, true, nil
+	}
+
+	task, err := s.RestartTask(meta.ID)
+	if err != nil {
+		// 并发的 ensure 可能已先完成重启:目标 id 现在在跑就把那一次的结果交回去。
+		s.mu.RLock()
+		cur, ok := s.tasks[meta.ID]
+		s.mu.RUnlock()
+		if ok && cur.Meta().Status == StatusRunning {
+			return cur, true, nil
+		}
+		return nil, true, err
+	}
+	return task, true, nil
+}
+
+// taskMatchesSpec 判断既有任务是否与本次 detach 请求等价。命令与工作目录按字面比较;
+// 端口按规格集合比较(与顺序无关,空主机补默认值)。
+func taskMatchesSpec(meta TaskMeta, cmd, cwd string, ports []portfwd.Spec) bool {
+	if meta.Cmd != cmd || meta.Cwd != cwd {
+		return false
+	}
+	return samePortSpecs(meta.Ports, ports)
+}
+
+func samePortSpecs(a, b []portfwd.Spec) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	ka, kb := canonicalPortKeys(a), canonicalPortKeys(b)
+	sort.Strings(ka)
+	sort.Strings(kb)
+	for i := range ka {
+		if ka[i] != kb[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func canonicalPortKeys(specs []portfwd.Spec) []string {
+	keys := make([]string, 0, len(specs))
+	for _, sp := range specs {
+		bind := sp.BindHost
+		if bind == "" {
+			bind = portfwd.DefaultBind
+		}
+		remote := sp.RemoteHost
+		if remote == "" {
+			remote = portfwd.DefaultBind
+		}
+		keys = append(keys, fmt.Sprintf("%s:%d>%s:%d", bind, sp.LocalPort, remote, sp.RemotePort))
+	}
+	return keys
+}
+
+// startTaskLocked 在已持有 s.mu 时创建并启动一个后台任务。
+func (s *Supervisor) startTaskLocked(cmdStr, cwd string, ports []portfwd.Spec, restart string, env []string) (*Task, error) {
 	id := generateTaskID()
 	taskDir := filepath.Join(s.baseDir, id)
 	if err := os.MkdirAll(taskDir, 0o755); err != nil {

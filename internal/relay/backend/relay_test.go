@@ -844,6 +844,22 @@ func TestEndToEnd_TaskSupervisor(t *testing.T) {
 		t.Fatalf("invalid taskID output: %q", taskIDRaw)
 	}
 
+	// 3b. 相同命令+端口再次 detach 必须复用同一任务(幂等),不能产生第二个实例。
+	var reuseOut strings.Builder
+	exit, err = gb.ExecStreamWithPorts(ctx, "node-1", "printf 'task_step_1\n'; sleep 0.3; printf 'task_step_2\n'; sleep 5", "", 10, nil, true, taskPorts, "", func(c bk.ExecChunk) {
+		reuseOut.WriteString(c.Data)
+	})
+	if err != nil {
+		t.Fatalf("second exec detach failed: %v", err)
+	}
+	if exit != 0 {
+		t.Fatalf("second detach exit code: %d", exit)
+	}
+	reuseID := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(reuseOut.String()), protocol.ForwardTaskIDMarker))
+	if reuseID != taskID {
+		t.Fatalf("second detach created task %s, want reuse of %s", reuseID, taskID)
+	}
+
 	// 4. 查询任务列表 (ps)
 	tasks, err := tb.TaskList(ctx, "node-1", false)
 	if err != nil {

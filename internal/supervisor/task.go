@@ -102,8 +102,9 @@ func (t *Task) markSuperseded() {
 	t.mu.Unlock()
 }
 
-// setRestartPolicy 更新并持久化任务的 restart 策略。仅由显式的入站 relay stop 路径调用
-// (StopTaskAndClearPolicy);执行方优雅停机走 StopAll,绝不触碰策略(R7/KD5)。
+// setRestartPolicy 更新并持久化任务的 restart 策略。由显式的入站 relay stop 路径
+// (StopTaskAndClearPolicy)与幂等 ensure 路径(EnsureTaskWithPolicy)调用;执行方优雅停机
+// 走 StopAll,绝不触碰策略(R7/KD5)。
 func (t *Task) setRestartPolicy(policy string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
