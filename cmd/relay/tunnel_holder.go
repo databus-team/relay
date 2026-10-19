@@ -156,11 +156,7 @@ func newTunnelHolder(ctx context.Context, rb *relaybackend.RelayBackend, sockPat
 // Run 监听 unix socket 并处理控制消息,启动时先恢复持久化的隧道意图,直到构造时的 ctx 取消或 Accept 出错。
 // 返回时 socket 已清理。
 func (h *tunnelHolder) Run() error {
-	_ = os.Remove(h.sockPath)
-	if dir := filepath.Dir(h.sockPath); dir != "." {
-		_ = os.MkdirAll(dir, 0o755)
-	}
-	ln, err := net.Listen("unix", h.sockPath)
+	ln, err := listenHolderSocket(h.sockPath)
 	if err != nil {
 		return fmt.Errorf("listen tunnel control socket %s: %w", h.sockPath, err)
 	}

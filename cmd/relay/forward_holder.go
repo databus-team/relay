@@ -165,11 +165,7 @@ func newForwardHolder(ctx context.Context, rb *relaybackend.RelayBackend, sockPa
 }
 
 func (h *forwardHolder) Run() error {
-	_ = os.Remove(h.sockPath)
-	if dir := filepath.Dir(h.sockPath); dir != "." {
-		_ = os.MkdirAll(dir, 0o755)
-	}
-	ln, err := net.Listen("unix", h.sockPath)
+	ln, err := listenHolderSocket(h.sockPath)
 	if err != nil {
 		return fmt.Errorf("listen forward control socket %s: %w", h.sockPath, err)
 	}

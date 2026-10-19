@@ -41,3 +41,6 @@ func kill(pid int) {
 	detach(cmd) // 同上,避免无控制台上下文弹窗
 	_ = cmd.Run()
 }
+
+// forceKill 在 Windows 上没有更软的退路:taskkill 已带 /F。
+func forceKill(pid int) { kill(pid) }

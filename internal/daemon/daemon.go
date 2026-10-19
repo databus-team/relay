@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func baseDir() string {
@@ -103,6 +104,9 @@ func Get(pidFile string) StatusInfo {
 // Start 以当前可执行文件、给定参数(args 含子命令,如 ["node","run"])启动一个
 // detached 子进程,stdout/sderr 重定向到 logFile,pid 写入 pidFile。返回子进程 pid。
 func Start(selfArgs []string, logFile, pidFile string) (int, error) {
+	if st := Get(pidFile); st.Running {
+		return 0, fmt.Errorf("already running (pid %d)", st.Pid)
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return 0, err
@@ -189,6 +193,8 @@ func ReplaceBinaryWithKeep(dst, src string) error {
 }
 
 // Stop 读取 pid 文件,若存活则终止并移除 pid 文件;未运行返回错误。
+// 必须等进程真正退出再返回:调用方(restart/upgrade)会立刻拉起新进程,而旧进程退出时
+// 的 defer os.Remove(sock) 若晚于新进程绑定,会把新进程的控制 socket 一并摘掉。
 func Stop(pidFile string) error {
 	st := Get(pidFile)
 	if st.Err != nil {
@@ -199,5 +205,25 @@ func Stop(pidFile string) error {
 		return fmt.Errorf("not running")
 	}
 	kill(st.Pid)
+	if waitExit(st.Pid, 5*time.Second) {
+		return nil
+	}
+	forceKill(st.Pid)
+	if !waitExit(st.Pid, 2*time.Second) {
+		return fmt.Errorf("pid %d did not exit after force kill", st.Pid)
+	}
 	return nil
+}
+
+func waitExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if !alive(pid) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }

@@ -285,21 +285,32 @@ func daemonStart(name string) error {
 
 // daemonStartArgs 以 instance 为 pid/log 文件标识,用给定 args(含子命令,如 ["tunnel","run",...])
 // detached 启动一个 daemon。多实例(如隧道)与单实例(server/watch)共用此核心,仅文件标识不同。
+// 检查与启动必须在实例锁内完成:并发调用各自读到「未运行」就会拉起重复进程。
 func daemonStartArgs(instance string, args []string) error {
 	pidFile, logFile := daemon.PidFile(instance), daemon.LogFile(instance)
-	st := daemon.Get(pidFile)
-	if st.Err != nil {
-		return st.Err
-	}
-	if st.Running {
-		fmt.Printf("%s already running (pid %d)\n", instance, st.Pid)
+	var started int
+	err := daemon.WithStartLock(instance, func() error {
+		st := daemon.Get(pidFile)
+		if st.Err != nil {
+			return st.Err
+		}
+		if st.Running {
+			fmt.Printf("%s already running (pid %d)\n", instance, st.Pid)
+			return nil
+		}
+		pid, err := daemon.Start(args, logFile, pidFile)
+		if err != nil {
+			return fmt.Errorf("daemon start %s: %w", instance, err)
+		}
+		started = pid
 		return nil
-	}
-	pid, err := daemon.Start(args, logFile, pidFile)
+	})
 	if err != nil {
-		return fmt.Errorf("daemon start %s: %w", instance, err)
+		return err
 	}
-	fmt.Printf("%s started (pid %d)\nlog: %s\n", instance, pid, logFile)
+	if started != 0 {
+		fmt.Printf("%s started (pid %d)\nlog: %s\n", instance, started, logFile)
+	}
 	return nil
 }
 
@@ -318,13 +329,21 @@ func daemonRestart(name string) {
 }
 
 // daemonRestartArgs 与 daemonRestart 相同,但按实例标识 + 自定义 args 重启(供多实例隧道复用)。
+// 停+启同处一锁,避免与并发的 daemonStartArgs 交错出两个进程。
 func daemonRestartArgs(instance string, args []string) {
 	pidFile, logFile := daemon.PidFile(instance), daemon.LogFile(instance)
-	st := daemon.Get(pidFile)
-	if st.Err == nil && st.Running {
-		_ = daemon.Stop(pidFile)
-	}
-	pid, err := daemon.Start(args, logFile, pidFile)
+	var pid int
+	err := daemon.WithStartLock(instance, func() error {
+		if st := daemon.Get(pidFile); st.Err == nil && st.Running {
+			_ = daemon.Stop(pidFile)
+		}
+		p, err := daemon.Start(args, logFile, pidFile)
+		if err != nil {
+			return err
+		}
+		pid = p
+		return nil
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return

@@ -17,7 +17,12 @@ func alive(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
 }
 
-// kill 终止进程。Stop 不强等:SIGTERM 对 relay 的 signal.Notify 生效,足以优雅退出。
+// kill 发送 SIGTERM;relay 的 signal.Notify 会走优雅退出。
 func kill(pid int) {
 	_ = syscall.Kill(pid, syscall.SIGTERM)
+}
+
+// forceKill 是 SIGTERM 超时后的兜底。
+func forceKill(pid int) {
+	_ = syscall.Kill(pid, syscall.SIGKILL)
 }

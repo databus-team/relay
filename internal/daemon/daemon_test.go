@@ -72,6 +72,18 @@ func TestReplaceBinaryRejectsDir(t *testing.T) {
 	}
 }
 
+// Start 必须拒绝存活 pid 文件,避免绕过锁的调用方重复拉起进程。
+func TestStartRefusesLivePid(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "x.pid")
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Start([]string{"run"}, filepath.Join(dir, "x.log"), pidFile); err == nil {
+		t.Fatal("expected Start to refuse a live pid")
+	}
+}
+
 // U3-T1: 替换前已生成 `<exe>.prev`(含旧版本构建)。
 func TestReplaceBinaryWithKeep_CreatesPrev(t *testing.T) {
 	dir := t.TempDir()
