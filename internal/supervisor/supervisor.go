@@ -232,10 +232,14 @@ func (s *Supervisor) StartTaskWithPolicy(cmdStr, cwd string, ports []portfwd.Spe
 func (s *Supervisor) EnsureTaskWithPolicy(cmdStr, cwd string, ports []portfwd.Spec, restart string, env []string) (*Task, bool, error) {
 	s.mu.Lock()
 	var match *Task
+	var matchMeta TaskMeta
 	for _, t := range s.tasks {
-		if taskMatchesSpec(t.Meta(), cmdStr, cwd, ports) {
-			match = t
-			break
+		meta := t.Meta()
+		if !taskMatchesSpec(meta, cmdStr, cwd, ports) {
+			continue
+		}
+		if match == nil || preferTask(meta, matchMeta) {
+			match, matchMeta = t, meta
 		}
 	}
 	if match == nil {
@@ -247,16 +251,15 @@ func (s *Supervisor) EnsureTaskWithPolicy(cmdStr, cwd string, ports []portfwd.Sp
 
 	// 策略先落地再决定是否重拉:RestartTask 安装新实例时会读取最新策略。
 	match.setRestartPolicy(restart)
-	meta := match.Meta()
-	if meta.Status == StatusRunning {
+	if matchMeta.Status == StatusRunning {
 		return match, true, nil
 	}
 
-	task, err := s.RestartTask(meta.ID)
+	task, err := s.RestartTask(matchMeta.ID)
 	if err != nil {
 		// 并发的 ensure 可能已先完成重启:目标 id 现在在跑就把那一次的结果交回去。
 		s.mu.RLock()
-		cur, ok := s.tasks[meta.ID]
+		cur, ok := s.tasks[matchMeta.ID]
 		s.mu.RUnlock()
 		if ok && cur.Meta().Status == StatusRunning {
 			return cur, true, nil
@@ -264,6 +267,21 @@ func (s *Supervisor) EnsureTaskWithPolicy(cmdStr, cwd string, ports []portfwd.Sp
 		return nil, true, err
 	}
 	return task, true, nil
+}
+
+// preferTask 在多条同规格的历史记录里选一条稳定的代表:运行中的优先——绝不为一条已停止的
+// 重复记录重启,把正在服务的那条晾在一边;同状态内取创建时间最新的一条,再以 id 兜底,
+// 保证多次调用的选择一致(旧实现按 map 遍历顺序取第一条,重复记录存在时会随机挑中)。
+func preferTask(cand, cur TaskMeta) bool {
+	candRunning := cand.Status == StatusRunning
+	curRunning := cur.Status == StatusRunning
+	if candRunning != curRunning {
+		return candRunning
+	}
+	if !cand.CreatedAt.Equal(cur.CreatedAt) {
+		return cand.CreatedAt.After(cur.CreatedAt)
+	}
+	return cand.ID > cur.ID
 }
 
 // taskMatchesSpec 判断既有任务是否与本次 detach 请求等价。命令与工作目录按字面比较;

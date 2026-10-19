@@ -72,6 +72,42 @@ func TestEnsureTaskWithPolicyRestartsStopped(t *testing.T) {
 	}
 }
 
+// 存在多条同规格记录时,ensure 必须复用运行中的那条:不能为已停止的重复记录重启,
+// 把正在服务的实例晾在一边(旧实现按 map 顺序取第一条,存在重复记录时会随机选错)。
+func TestEnsureTaskWithPolicyPrefersRunningDuplicate(t *testing.T) {
+	sup, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("new supervisor: %v", err)
+	}
+	t.Cleanup(sup.StopAll)
+
+	stopped, err := sup.StartTaskWithPolicy("sleep 10", "", nil, RestartAlways, nil)
+	if err != nil {
+		t.Fatalf("start stopped duplicate: %v", err)
+	}
+	if err := sup.StopTask(stopped.Meta().ID); err != nil {
+		t.Fatalf("stop duplicate: %v", err)
+	}
+	running, err := sup.StartTaskWithPolicy("sleep 10", "", nil, RestartAlways, nil)
+	if err != nil {
+		t.Fatalf("start running duplicate: %v", err)
+	}
+
+	got, reused, err := sup.EnsureTaskWithPolicy("sleep 10", "", nil, RestartAlways, nil)
+	if err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if !reused {
+		t.Fatal("ensure should reuse an existing task")
+	}
+	if got.Meta().ID != running.Meta().ID {
+		t.Fatalf("ensure chose %s, want the running duplicate %s", got.Meta().ID, running.Meta().ID)
+	}
+	if status := stopped.Meta().Status; status != StatusStopped {
+		t.Fatalf("stopped duplicate changed to %s; ensure must not restart it", status)
+	}
+}
+
 // 身份只认 cmd+cwd+ports:端口集合或工作目录不同则新建;端口顺序与省略默认主机不影响匹配。
 func TestEnsureTaskWithPolicyIdentity(t *testing.T) {
 	sup, err := New(t.TempDir())
