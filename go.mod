@@ -23,4 +23,4 @@ require (
 	golang.org/x/oauth2 v0.35.0 // indirect
 )
 
-require github.com/klauspost/compress v1.18.6
+require github.com/klauspost/compress v1.18.7
