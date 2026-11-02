@@ -344,3 +344,184 @@ func NormalizeWindowsPath(p string) string {
 func isAlpha(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
+
+// HubEndpoint 定义一个中转 Hub 的连接与认证端点。
+type HubEndpoint struct {
+	URL     string            `yaml:"url" mapstructure:"url"`
+	Token   string            `yaml:"token,omitempty" mapstructure:"token"`
+	Headers map[string]string `yaml:"headers,omitempty" mapstructure:"headers"`
+}
+
+// ParseHubEndpoints 从 backend.config 的字典中提取并规整化 Hub 端点列表。
+// 优先采用 `hubs` 对象列表，其次兼容 `urls` 列表，最后回退至单一 `url`。
+// 未显式指定 token 或 headers 的条目会自动继承外层全局的 token 与 headers。
+func ParseHubEndpoints(params map[string]interface{}) ([]HubEndpoint, error) {
+	if params == nil {
+		return nil, errors.New("no backend config provided")
+	}
+
+	var globalToken string
+	if t, ok := params["token"].(string); ok {
+		globalToken = t
+	}
+
+	globalHeaders := make(map[string]string)
+	if rawH, ok := params["headers"].(map[string]interface{}); ok {
+		for k, v := range rawH {
+			if s, ok := v.(string); ok {
+				globalHeaders[k] = s
+			}
+		}
+	} else if rawStrH, ok := params["headers"].(map[string]string); ok {
+		for k, v := range rawStrH {
+			globalHeaders[k] = v
+		}
+	}
+
+	cloneHeaders := func(override map[string]string) map[string]string {
+		out := make(map[string]string, len(globalHeaders)+len(override))
+		for k, v := range globalHeaders {
+			out[k] = v
+		}
+		for k, v := range override {
+			out[k] = v
+		}
+		return out
+	}
+
+	var endpoints []HubEndpoint
+
+	// 1. 尝试解析 hubs
+	if rawHubs, ok := params["hubs"]; ok && rawHubs != nil {
+		switch list := rawHubs.(type) {
+		case []interface{}:
+			for _, item := range list {
+				switch elem := item.(type) {
+				case map[string]interface{}:
+					u, _ := elem["url"].(string)
+					u = strings.TrimSpace(u)
+					if u == "" {
+						continue
+					}
+					t, _ := elem["token"].(string)
+					if t == "" {
+						t = globalToken
+					}
+					itemHeaders := make(map[string]string)
+					if rawH, ok := elem["headers"].(map[string]interface{}); ok {
+						for k, v := range rawH {
+							if s, ok := v.(string); ok {
+								itemHeaders[k] = s
+							}
+						}
+					} else if rawStrH, ok := elem["headers"].(map[string]string); ok {
+						for k, v := range rawStrH {
+							itemHeaders[k] = v
+						}
+					}
+					endpoints = append(endpoints, HubEndpoint{
+						URL:     u,
+						Token:   t,
+						Headers: cloneHeaders(itemHeaders),
+					})
+				case string:
+					elem = strings.TrimSpace(elem)
+					if elem != "" {
+						endpoints = append(endpoints, HubEndpoint{
+							URL:     elem,
+							Token:   globalToken,
+							Headers: cloneHeaders(nil),
+						})
+					}
+				}
+			}
+		case []map[string]interface{}:
+			for _, elem := range list {
+				u, _ := elem["url"].(string)
+				u = strings.TrimSpace(u)
+				if u == "" {
+					continue
+				}
+				t, _ := elem["token"].(string)
+				if t == "" {
+					t = globalToken
+				}
+				itemHeaders := make(map[string]string)
+				if rawH, ok := elem["headers"].(map[string]interface{}); ok {
+					for k, v := range rawH {
+						if s, ok := v.(string); ok {
+							itemHeaders[k] = s
+						}
+					}
+				}
+				endpoints = append(endpoints, HubEndpoint{
+					URL:     u,
+					Token:   t,
+					Headers: cloneHeaders(itemHeaders),
+				})
+			}
+		case []HubEndpoint:
+			for _, ep := range list {
+				if strings.TrimSpace(ep.URL) != "" {
+					if ep.Token == "" {
+						ep.Token = globalToken
+					}
+					ep.Headers = cloneHeaders(ep.Headers)
+					endpoints = append(endpoints, ep)
+				}
+			}
+		}
+	}
+
+	// 2. 若无有效 hubs，尝试解析 urls
+	if len(endpoints) == 0 {
+		if rawURLs, ok := params["urls"]; ok && rawURLs != nil {
+			switch list := rawURLs.(type) {
+			case []interface{}:
+				for _, item := range list {
+					if s, ok := item.(string); ok {
+						s = strings.TrimSpace(s)
+						if s != "" {
+							endpoints = append(endpoints, HubEndpoint{
+								URL:     s,
+								Token:   globalToken,
+								Headers: cloneHeaders(nil),
+							})
+						}
+					}
+				}
+			case []string:
+				for _, s := range list {
+					s = strings.TrimSpace(s)
+					if s != "" {
+						endpoints = append(endpoints, HubEndpoint{
+							URL:     s,
+							Token:   globalToken,
+							Headers: cloneHeaders(nil),
+						})
+					}
+				}
+			}
+		}
+	}
+
+	// 3. 若无有效 urls，尝试解析单一 url
+	if len(endpoints) == 0 {
+		if u, ok := params["url"].(string); ok {
+			u = strings.TrimSpace(u)
+			if u != "" {
+				endpoints = append(endpoints, HubEndpoint{
+					URL:     u,
+					Token:   globalToken,
+					Headers: cloneHeaders(nil),
+				})
+			}
+		}
+	}
+
+	if len(endpoints) == 0 {
+		return nil, errors.New("no valid hub url configured in backend.config")
+	}
+
+	return endpoints, nil
+}

@@ -2576,8 +2576,17 @@ func runNodes() {
 		transitRole = "hub, agent"
 	}
 
+	transitID := "hub (transit)"
+	if eps := rb.Endpoints(); len(eps) > 1 {
+		if rb.ActiveURL() == eps[0].URL {
+			transitID = "hub (primary)"
+		} else {
+			transitID = "hub (standby)"
+		}
+	}
+
 	nodes = append(nodes, PeerNodeItem{
-		ID:         "hub (transit)",
+		ID:         transitID,
 		Role:       transitRole,
 		Status:     "Ready",
 		Platform:   transitPlatform,
@@ -2650,6 +2659,14 @@ func runNodes() {
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(nodes)
 		return
+	}
+
+	if eps := rb.Endpoints(); len(eps) > 1 {
+		roleLabel := "primary"
+		if rb.ActiveURL() != eps[0].URL {
+			roleLabel = "standby failover"
+		}
+		fmt.Printf("Active Hub: %s (%s, %d configured)\n", rb.ActiveURL(), roleLabel, len(eps))
 	}
 
 	// 文本表格输出 (类似 kubectl get nodes):整表一次渲染,列宽随终端宽度自适应,绝不换行。

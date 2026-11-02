@@ -33,11 +33,24 @@ server:
 backend:
   type: relay
   config:
+    # 单 Hub 配置 (向后兼容):
     url: ${RELAY_SERVER_URL}          # ws://host:port/relay or wss://...
     token: ${RELAY_TOKEN}
     # headers:                          # 可选:WebSocket 握手携带的 HTTP 头(中转前置鉴权)
     #   Cookie: "code-server-session=..."
     #   X-Api-Key: ${RELAY_API_KEY}
+
+    # 多 Hub 主备热备配置 (Active-Standby Failover，优先推荐):
+    # 支持每个 Hub 独立配置专属 URL、Token 与 HTTP Headers(网关鉴权/Cookie/APIKey)。未指定的字段自动继承外层默认值。
+    # 主 Hub 宕机时自动秒级快速探测并漂移至备 Hub，漂移后粘性保持。
+    # hubs:
+    #   - url: "ws://hub-idc.internal:8443/relay"
+    #   - url: "wss://hub-cloud.example.com/relay"
+    #     token: "${STANDBY_TOKEN}"
+    #     headers:
+    #       Cookie: "session_token=..."
+    #       X-Gateway-Key: "${GATEWAY_KEY}"
+
     executor_id: web-app-patches          # 此执行方的节点身份(executor_id);被 relay exec/push/... 按此路由
     watch_dir: .                       # remote watch directory (relative to server's watch dir)
     command_dir: /tmp/relay-commands   # shared command directory for hot-reload

@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -14,9 +15,28 @@ var (
 	poolMu sync.RWMutex
 )
 
-// GetOrConnect 获取(或新建并连接)一个客户端。opts 里可带 WithHeaders 等选项。
-func GetOrConnect(ctx context.Context, url, token, id string, opts ...Option) (*Client, error) {
-	key := url + "|" + token + "|" + id + "|" + headersKey(getHeader(opts))
+func endpointsKey(eps []Endpoint) string {
+	var b strings.Builder
+	for i, ep := range eps {
+		if i > 0 {
+			b.WriteString(";;")
+		}
+		b.WriteString(ep.URL)
+		b.WriteString("|")
+		b.WriteString(ep.Token)
+		b.WriteString("|")
+		b.WriteString(headersKey(ep.Headers))
+	}
+	return b.String()
+}
+
+// GetOrConnectEndpoints 获取(或新建并连接)具有多 Hub 候选端点的客户端。
+func GetOrConnectEndpoints(ctx context.Context, endpoints []Endpoint, id string, opts ...Option) (*Client, error) {
+	if len(endpoints) == 0 {
+		return nil, errors.New("cannot connect: no endpoints provided")
+	}
+
+	key := endpointsKey(endpoints) + "|" + id + "|" + headersKey(getHeader(opts))
 
 	poolMu.RLock()
 	c, ok := pool[key]
@@ -37,7 +57,7 @@ func GetOrConnect(ctx context.Context, url, token, id string, opts ...Option) (*
 		c.Disconnect()
 	}
 
-	c, err := New(url, token, id, opts...)
+	c, err := NewWithEndpoints(endpoints, id, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("create client: %w", err)
 	}
@@ -48,6 +68,12 @@ func GetOrConnect(ctx context.Context, url, token, id string, opts ...Option) (*
 
 	pool[key] = c
 	return c, nil
+}
+
+// GetOrConnect 获取(或新建并连接)一个单端点客户端。opts 里可带 WithHeaders 等选项。
+func GetOrConnect(ctx context.Context, url, token, id string, opts ...Option) (*Client, error) {
+	h := getHeader(opts)
+	return GetOrConnectEndpoints(ctx, []Endpoint{{URL: url, Token: token, Headers: h}}, id, opts...)
 }
 
 // getHeader 提取 opts 中的 WithHeaders 头(以参与池键)。

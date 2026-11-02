@@ -46,6 +46,9 @@ type RelayBackend struct {
 	// 但成功提示按需降级为 debug,避免刷屏)。
 	regMu     sync.Mutex
 	regLogged bool
+
+	subscribed bool
+	subMu      sync.Mutex
 }
 
 // 执行方共享处理器(进程级):多个 RelayBackend 实例会共享同一 pooled client,
@@ -150,6 +153,26 @@ func NewRelayBackend(params map[string]interface{}) (backend.FileTransferBackend
 		}
 	}
 
+	hubEndpoints, err := config.ParseHubEndpoints(params)
+	if err != nil {
+		return nil, fmt.Errorf("parse hub endpoints: %w", err)
+	}
+	var clientEndpoints []client.Endpoint
+	for _, ep := range hubEndpoints {
+		var h http.Header
+		if len(ep.Headers) > 0 {
+			h = make(http.Header, len(ep.Headers))
+			for k, v := range ep.Headers {
+				h.Set(k, v)
+			}
+		}
+		clientEndpoints = append(clientEndpoints, client.Endpoint{
+			URL:     ep.URL,
+			Token:   ep.Token,
+			Headers: h,
+		})
+	}
+
 	var opts []client.Option
 	if len(cfg.Headers) > 0 {
 		h := make(http.Header, len(cfg.Headers))
@@ -159,9 +182,13 @@ func NewRelayBackend(params map[string]interface{}) (backend.FileTransferBackend
 		opts = append(opts, client.WithHeaders(h))
 	}
 
-	c, err := client.GetOrConnect(context.Background(), cfg.URL, cfg.Token, cfg.ExecutorID, opts...)
+	c, err := client.GetOrConnectEndpoints(context.Background(), clientEndpoints, cfg.ExecutorID, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("create client: %w", err)
+	}
+
+	if cfg.URL == "" {
+		cfg.URL = c.ActiveURL()
 	}
 
 	b := &RelayBackend{
@@ -504,8 +531,26 @@ func (b *RelayBackend) enableExecutor() {
 	b.client.SetTaskLogsHandler(func(sess *client.TaskLogsSession) { b.handleInboundTaskLogs(sess) })
 	b.client.SetGitStatusHandler(func(sess *client.GitStatusSession) { b.handleInboundGitStatus(sess) })
 	b.client.SetGitUndoHandler(func(sess *client.GitUndoSession) { b.handleInboundGitUndo(sess) })
-	b.client.SetOnReconnect(b.registerExecutor)
+	b.client.SetOnReconnect(b.onReconnect)
 	b.registerExecutor()
+}
+
+func (b *RelayBackend) onReconnect() {
+	b.registerExecutor()
+	b.subMu.Lock()
+	sub := b.subscribed
+	targetWatch := b.watchDir
+	if targetWatch == "" {
+		targetWatch = b.executorID
+	}
+	b.subMu.Unlock()
+	if sub && targetWatch != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := b.client.Subscribe(ctx, targetWatch); err != nil {
+			logx.Debugf("[relay] re-subscribe %s on failover: %v", targetWatch, err)
+		}
+		cancel()
+	}
 }
 
 // handleInboundConfigSync 执行方收到流式 config-sync:解码、校验、原子落盘到自身
@@ -1206,7 +1251,27 @@ func (b *RelayBackend) SubscribeEvents(ctx context.Context) error {
 		}
 	}
 
+	b.subMu.Lock()
+	b.subscribed = true
+	b.subMu.Unlock()
+
 	go b.forwardEvents()
+	return nil
+}
+
+// ActiveURL 返回底层连接当前连接的 Hub 地址。
+func (b *RelayBackend) ActiveURL() string {
+	if b.client != nil {
+		return b.client.ActiveURL()
+	}
+	return ""
+}
+
+// Endpoints 返回配置的全部候选 Hub 列表。
+func (b *RelayBackend) Endpoints() []client.Endpoint {
+	if b.client != nil {
+		return b.client.Endpoints()
+	}
 	return nil
 }
 

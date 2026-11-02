@@ -53,6 +53,12 @@ func (c *Client) reconnectLoop(ctx context.Context) {
 
 		if err := c.establish(ctx); err != nil {
 			log.Printf("[relay] reconnect failed: %v", err)
+			c.endpointMu.Lock()
+			if len(c.endpoints) > 1 {
+				c.activeIdx = (c.activeIdx + 1) % len(c.endpoints)
+			}
+			c.endpointMu.Unlock()
+
 			retries++
 			delay *= 2
 			if delay > c.reconnectCfg.MaxDelay {
@@ -61,7 +67,7 @@ func (c *Client) reconnectLoop(ctx context.Context) {
 			continue
 		}
 
-		log.Printf("[relay] reconnected successfully")
+		log.Printf("[relay] reconnected successfully to hub: %s", c.ActiveURL())
 		// establish 已串行化承担 readLoop/heartbeat 的按连接重启,且 writeLoop 用 writeOnce
 		// 保证终身只一条(重复 Connect/重连绝不会叠起两个写者并发写同一 conn 导致 panic)。
 		c.fireOnReconnect()

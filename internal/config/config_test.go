@@ -301,3 +301,137 @@ func unmarshalMap(t *testing.T, b []byte) map[string]interface{} {
 	}
 	return m
 }
+
+func TestParseHubEndpoints(t *testing.T) {
+	t.Run("single url with global token and headers", func(t *testing.T) {
+		params := map[string]interface{}{
+			"url":   "ws://127.0.0.1:8443/relay",
+			"token": "tok123",
+			"headers": map[string]interface{}{
+				"Cookie": "sid=xyz",
+			},
+		}
+		eps, err := ParseHubEndpoints(params)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(eps) != 1 {
+			t.Fatalf("expected 1 endpoint, got %d", len(eps))
+		}
+		if eps[0].URL != "ws://127.0.0.1:8443/relay" || eps[0].Token != "tok123" || eps[0].Headers["Cookie"] != "sid=xyz" {
+			t.Errorf("unexpected endpoint: %+v", eps[0])
+		}
+	})
+
+	t.Run("urls list inherits global credentials", func(t *testing.T) {
+		params := map[string]interface{}{
+			"urls": []interface{}{
+				"ws://hub1:8443/relay",
+				"wss://hub2:8443/relay",
+			},
+			"token": "shared-tok",
+			"headers": map[string]string{
+				"X-Custom": "val",
+			},
+		}
+		eps, err := ParseHubEndpoints(params)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(eps) != 2 {
+			t.Fatalf("expected 2 endpoints, got %d", len(eps))
+		}
+		for i, ep := range eps {
+			if ep.Token != "shared-tok" {
+				t.Errorf("[%d] token = %s, want shared-tok", i, ep.Token)
+			}
+			if ep.Headers["X-Custom"] != "val" {
+				t.Errorf("[%d] headers = %v", i, ep.Headers)
+			}
+		}
+		if eps[0].URL != "ws://hub1:8443/relay" || eps[1].URL != "wss://hub2:8443/relay" {
+			t.Errorf("urls mismatch: %+v", eps)
+		}
+	})
+
+	t.Run("full hubs list with per-hub override and inheritance", func(t *testing.T) {
+		params := map[string]interface{}{
+			"token": "global-tok",
+			"headers": map[string]interface{}{
+				"Global-Header": "g-val",
+				"Override-Me":   "old",
+			},
+			"hubs": []interface{}{
+				map[string]interface{}{
+					"url": "ws://internal-hub:8443/relay",
+				},
+				map[string]interface{}{
+					"url":   "wss://cloud-hub:8443/relay",
+					"token": "cloud-tok-specific",
+					"headers": map[string]interface{}{
+						"Override-Me": "new",
+						"X-Cloud-Key": "key999",
+					},
+				},
+			},
+		}
+		eps, err := ParseHubEndpoints(params)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(eps) != 2 {
+			t.Fatalf("expected 2 endpoints, got %d", len(eps))
+		}
+
+		// ep 0: inherits all
+		if eps[0].URL != "ws://internal-hub:8443/relay" {
+			t.Errorf("ep0 url mismatch: %s", eps[0].URL)
+		}
+		if eps[0].Token != "global-tok" {
+			t.Errorf("ep0 token mismatch: %s", eps[0].Token)
+		}
+		if eps[0].Headers["Global-Header"] != "g-val" || eps[0].Headers["Override-Me"] != "old" {
+			t.Errorf("ep0 headers mismatch: %v", eps[0].Headers)
+		}
+
+		// ep 1: overrides token and headers, but preserves non-overridden global header
+		if eps[1].URL != "wss://cloud-hub:8443/relay" {
+			t.Errorf("ep1 url mismatch: %s", eps[1].URL)
+		}
+		if eps[1].Token != "cloud-tok-specific" {
+			t.Errorf("ep1 token mismatch: %s", eps[1].Token)
+		}
+		if eps[1].Headers["Global-Header"] != "g-val" {
+			t.Errorf("ep1 should inherit Global-Header: %v", eps[1].Headers)
+		}
+		if eps[1].Headers["Override-Me"] != "new" {
+			t.Errorf("ep1 Override-Me want 'new', got '%s'", eps[1].Headers["Override-Me"])
+		}
+		if eps[1].Headers["X-Cloud-Key"] != "key999" {
+			t.Errorf("ep1 X-Cloud-Key want 'key999', got '%s'", eps[1].Headers["X-Cloud-Key"])
+		}
+	})
+
+	t.Run("precedence hubs over urls and url", func(t *testing.T) {
+		params := map[string]interface{}{
+			"url":  "ws://fallback:8443",
+			"urls": []interface{}{"ws://urls-hub:8443"},
+			"hubs": []interface{}{
+				map[string]interface{}{"url": "ws://winner-hubs:8443"},
+			},
+		}
+		eps, err := ParseHubEndpoints(params)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(eps) != 1 || eps[0].URL != "ws://winner-hubs:8443" {
+			t.Errorf("expected winner-hubs, got: %+v", eps)
+		}
+	})
+
+	t.Run("empty config returns error", func(t *testing.T) {
+		if _, err := ParseHubEndpoints(map[string]interface{}{}); err == nil {
+			t.Errorf("expected error for empty config")
+		}
+	})
+}

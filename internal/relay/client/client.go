@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"runtime"
@@ -18,7 +19,18 @@ import (
 	"github.com/user/relay/internal/sysinfo"
 )
 
+// Endpoint 定义一个中转 Hub 的连接地址与凭证。
+type Endpoint struct {
+	URL     string
+	Token   string
+	Headers http.Header
+}
+
 type Client struct {
+	endpoints  []Endpoint
+	activeIdx  int
+	endpointMu sync.RWMutex
+
 	url       string
 	token     string
 	id        string
@@ -88,10 +100,8 @@ func WithHeaders(h http.Header) Option {
 	return func(c *Client) { c.headers = h }
 }
 
-func New(url, token, id string, opts ...Option) (*Client, error) {
+func newClientBase(id string, opts ...Option) *Client {
 	c := &Client{
-		url:           url,
-		token:         token,
 		id:            id,
 		controlCh:     make(chan sendMsg, 256),
 		sendCh:        make(chan sendMsg, 512),
@@ -110,7 +120,70 @@ func New(url, token, id string, opts ...Option) (*Client, error) {
 	for _, o := range opts {
 		o(c)
 	}
+	return c
+}
+
+func New(url, token, id string, opts ...Option) (*Client, error) {
+	c := newClientBase(id, opts...)
+	c.url = url
+	c.token = token
+	if url != "" {
+		c.endpoints = []Endpoint{{
+			URL:     url,
+			Token:   token,
+			Headers: c.headers,
+		}}
+	}
 	return c, nil
+}
+
+// NewWithEndpoints 创建具有多个候选 Hub 端点的客户端(支持主备热备与独立鉴权)。
+func NewWithEndpoints(endpoints []Endpoint, id string, opts ...Option) (*Client, error) {
+	if len(endpoints) == 0 {
+		return nil, errors.New("endpoints list cannot be empty")
+	}
+	c := newClientBase(id, opts...)
+	c.endpoints = make([]Endpoint, len(endpoints))
+	copy(c.endpoints, endpoints)
+
+	c.url = endpoints[0].URL
+	c.token = endpoints[0].Token
+	if len(endpoints[0].Headers) > 0 {
+		c.headers = endpoints[0].Headers.Clone()
+	}
+	return c, nil
+}
+
+// Endpoints 返回配置的所有 Hub 候选端点列表的拷贝。
+func (c *Client) Endpoints() []Endpoint {
+	c.endpointMu.RLock()
+	defer c.endpointMu.RUnlock()
+	out := make([]Endpoint, len(c.endpoints))
+	copy(out, c.endpoints)
+	return out
+}
+
+// ActiveEndpoint 返回当前已连接(或当前探测)的 Hub 端点。
+func (c *Client) ActiveEndpoint() Endpoint {
+	c.endpointMu.RLock()
+	defer c.endpointMu.RUnlock()
+	if len(c.endpoints) == 0 {
+		return Endpoint{URL: c.url, Token: c.token, Headers: c.headers}
+	}
+	return c.endpoints[c.activeIdx]
+}
+
+// ActiveURL 返回当前活跃连接的 Hub WebSocket URL。
+func (c *Client) ActiveURL() string {
+	c.endpointMu.RLock()
+	defer c.endpointMu.RUnlock()
+	if c.url != "" {
+		return c.url
+	}
+	if len(c.endpoints) > 0 {
+		return c.endpoints[c.activeIdx].URL
+	}
+	return ""
 }
 
 func (c *Client) Connect(ctx context.Context) error {
@@ -120,10 +193,8 @@ func (c *Client) Connect(ctx context.Context) error {
 	return nil
 }
 
-// establish 完成一次拨号并把连接接入收发循环。Connect 与 reconnectLoop 都经它建立连接,
-// 靠 connectMu 互斥:同一时刻只进行一次建立,避免并发 Connect/重连产生两条 readLoop 读
-// 同一 conn、或重叠拨号。writeLoop 用 writeOnce 终身只启一条——重复 Connect/重连绝不叠起
-// 写者(两个 goroutine 并发 WriteJSON 到同一 *websocket.Conn 会 panic)。
+// establish 完成一次拨号并把连接接入收发循环。Connect 与 reconnectLoop 都经它建立连接。
+// 多 Hub 场景下支持按序快速探测，单节点 3 秒超时，成功后粘性保持。
 func (c *Client) establish(ctx context.Context) error {
 	c.connectMu.Lock()
 	defer c.connectMu.Unlock()
@@ -132,24 +203,75 @@ func (c *Client) establish(ctx context.Context) error {
 		return nil // 已在线(可能刚由并发重连建立),无需重复拨号
 	}
 
-	if err := c.dial(ctx); err != nil {
-		return err
+	c.endpointMu.RLock()
+	eps := c.endpoints
+	startIdx := c.activeIdx
+	c.endpointMu.RUnlock()
+
+	if len(eps) == 0 {
+		eps = []Endpoint{{URL: c.url, Token: c.token, Headers: c.headers}}
+		startIdx = 0
 	}
 
-	c.connected.Store(true)
-	c.writeOnce.Do(func() { go c.writeLoop() })
-	go c.readLoop()
-	go c.startHeartbeat(ctx)
-	return nil
+	var dialErrors []string
+	for i := 0; i < len(eps); i++ {
+		idx := (startIdx + i) % len(eps)
+		ep := eps[idx]
+
+		dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		err := c.dialEndpoint(dialCtx, ep)
+		cancel()
+
+		if err == nil {
+			c.endpointMu.Lock()
+			c.activeIdx = idx
+			c.url = ep.URL
+			c.token = ep.Token
+			if ep.Headers != nil {
+				c.headers = ep.Headers.Clone()
+			}
+			c.endpointMu.Unlock()
+
+			c.connected.Store(true)
+			c.writeOnce.Do(func() { go c.writeLoop() })
+			go c.readLoop()
+			go c.startHeartbeat(ctx)
+			return nil
+		}
+
+		dialErrors = append(dialErrors, fmt.Sprintf("[%s]: %v", ep.URL, err))
+	}
+
+	if len(dialErrors) == 1 {
+		return fmt.Errorf("dial: %s", dialErrors[0])
+	}
+	return fmt.Errorf("failed to connect to any hub: %s", strings.Join(dialErrors, "; "))
 }
 
 func (c *Client) dial(ctx context.Context) error {
+	return c.dialEndpoint(ctx, c.ActiveEndpoint())
+}
+
+func (c *Client) dialEndpoint(ctx context.Context, ep Endpoint) error {
+	targetURL := ep.URL
+	if targetURL == "" {
+		targetURL = c.url
+	}
+	targetToken := ep.Token
+	if targetToken == "" {
+		targetToken = c.token
+	}
+	targetHeaders := ep.Headers
+	if targetHeaders == nil {
+		targetHeaders = c.headers
+	}
+
 	dialer := websocket.Dialer{
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: strings.Contains(c.url, "127.0.0.1") || strings.Contains(c.url, "localhost"),
+			InsecureSkipVerify: strings.Contains(targetURL, "127.0.0.1") || strings.Contains(targetURL, "localhost"),
 		},
 	}
-	conn, httpResp, err := dialer.DialContext(ctx, c.url, c.headers)
+	conn, httpResp, err := dialer.DialContext(ctx, targetURL, targetHeaders)
 	if err != nil {
 		if httpResp != nil {
 			return fmt.Errorf("dial: %w (upstream HTTP %s)", err, httpResp.Status)
@@ -162,7 +284,7 @@ func (c *Client) dial(ctx context.Context) error {
 		ID:   uuid.New().String(),
 		Payload: protocol.ConnectRequest{
 			ClientID:  uuid.New().String(),
-			Token:     c.token,
+			Token:     targetToken,
 			Version:   1,
 			Subscribe: []string{c.id},
 		},
